@@ -1787,6 +1787,7 @@ def generate_educational_content(
         final_mcq_prompt = build_mcq_prompt_v2(
             transcript=mcq_transcript,
             ocr_context=ocr_context,
+            video_title=video_title,  # ← ADD THIS
             num_questions=config.max_questions,
             chapters=formatted_chapters,
             global_summary=global_summary, 
