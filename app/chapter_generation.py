@@ -975,7 +975,7 @@ def generate_chapters_debug(
             CONTEXT_BUDGET = 128_000
             max_transcript_tokens = max(0, CONTEXT_BUDGET - template_tokens)
             transcript_for_prompt = truncate_text_by_tokens(raw_asr_text, max_transcript_tokens)
-            full_prompt = build_prompt_body(transcript_for_prompt, int(duration), ocr_context)
+            full_prompt = build_prompt_body(transcript_for_prompt, int(duration), ocr_context, video_title)
 
             with open(run_dir / "full_prompt.txt", "w", encoding="utf-8") as f:
                 f.write(full_prompt)
