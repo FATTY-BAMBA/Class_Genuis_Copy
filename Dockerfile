@@ -39,8 +39,8 @@ WORKDIR /build
 # Copy dependency lists
 COPY requirements.txt constraints.txt /build/
 
-# Remove conflicting packages from requirements
-RUN grep -v "ctranslate2\|faster-whisper\|tokenizers\|transformers\|numpy" requirements.txt > requirements_filtered.txt || cp requirements.txt requirements_filtered.txt
+# Remove conflicting packages from requirements (including lanms-neo which fails to build)
+RUN grep -v "ctranslate2\|faster-whisper\|tokenizers\|transformers\|numpy\|lanms-neo" requirements.txt > requirements_filtered.txt || cp requirements.txt requirements_filtered.txt
 
 # Install core dependencies
 RUN python -m pip install --no-cache-dir \
@@ -61,7 +61,7 @@ RUN python -m pip install \
     torchaudio==2.2.2+cu118 \
     --extra-index-url https://download.pytorch.org/whl/cu118
 
-# Install other requirements (without numpy since we already have it)
+# Install other requirements (without numpy and lanms-neo since we already have numpy and lanms-neo fails)
 RUN python -m pip install --no-cache-dir -r requirements_filtered.txt
 
 # Install Polygon3
