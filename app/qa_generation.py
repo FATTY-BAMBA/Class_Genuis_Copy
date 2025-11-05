@@ -1751,6 +1751,7 @@ def generate_educational_content(
             # Generate topics prompt
             topics_prompt = build_topics_summary_prompt(
                 transcript=topics_transcript,
+                video_title=video_title,
                 context=topics_context
             )
             logger.info(f"Topics extraction prompt approx tokens: {count_tokens_llama(topics_prompt):,}")
