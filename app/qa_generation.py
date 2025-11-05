@@ -1929,6 +1929,7 @@ def process_text_for_qa_and_notes(
     raw_asr_text: str = "",
     audio_segments: Optional[List[Dict]] = None,
     ocr_segments: Optional[List[Dict]] = None,
+    video_title: Optional[str] = None,  # ← ADD THIS
     num_questions: int = 10,
     num_pages: int = 3,
     id: str = "",
@@ -1967,6 +1968,7 @@ def process_text_for_qa_and_notes(
             raw_asr_text=asr_text_for_prompt,   # ← ASR-first (raw string)
             ocr_segments=ocr_segments,          # ← simple OCR (list or string)
             video_id=id or "video",
+            video_title=video_title,  # ← ADD THIS
             run_dir=None,
             progress_callback=None,
             shuffle_options=False,
