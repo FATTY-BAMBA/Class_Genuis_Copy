@@ -952,6 +952,7 @@ def generate_chapters_debug(
                 raw_asr_text=raw_asr_text,
                 duration=duration,
                 ocr_context=ocr_context,
+                video_title=video_title,  # ADD THIS
                 client=client,
                 config=config,
                 progress_callback=progress_callback
