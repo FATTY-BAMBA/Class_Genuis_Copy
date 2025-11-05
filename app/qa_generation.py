@@ -578,6 +578,7 @@ def build_mcq_prompt_v2(
     transcript: str,
     *,
     ocr_context: str = "",
+    video_title: Optional[str] = None,  # ← ADD THIS PARAMETER
     num_questions: int = 10,
     chapters: Optional[List[Dict]] = None,
     global_summary: str = "",
@@ -599,6 +600,11 @@ def build_mcq_prompt_v2(
             title = c.get("title") or ""
             if ts or title:
                 chap_lines.append(f"- {ts}：{title}")
+    video_title_context = ""
+    if video_title:
+        # Strip common video extensions
+        clean_title = re.sub(r'\.(mp4|avi|mov|mkv|webm|flv|m4v)$', '', video_title, flags=re.IGNORECASE)
+        video_title_context = f"📚 此影片檔名為：「{clean_title}」，請參考檔名資訊設計相關題目。\n\n"
                 
     global_ctx = []
     if global_summary.strip():
@@ -654,7 +660,7 @@ def build_mcq_prompt_v2(
     
     # --- KEY ENHANCEMENT: Revised Prompt (WITH ADDITIONS FOR TAGS AND COURSE_TYPE) --- 
     prompt = f"""
-你是一位資深的教學設計專家，負責為「{global_summary.splitlines()[0] if global_summary else "各種科目"}」課程設計高品質的多選題（MCQ）。請嚴格依照下列規則出題，並**僅**輸出 JSON。
+{video_title_context}你是一位資深的教學設計專家，負責為「{global_summary.splitlines()[0] if global_summary else "各種科目"}」課程設計高品質的多選題（MCQ）。請嚴格依照下列規則出題，並**僅**輸出 JSON。
 
 ### 核心原則
 - **問題必須基於對逐字稿的整體理解**，而非孤立的單句。首先分析整段文本的 5-8 個核心主題與教學目標，再據此設計題目。
