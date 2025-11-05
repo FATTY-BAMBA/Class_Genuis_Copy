@@ -855,6 +855,7 @@ def generate_chapters_debug(
     ocr_segments: List[Dict],
     duration: float,
     video_id: str,
+    video_title: Optional[str] = None,  # ADD THIS
     run_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[str, int], None]] = None,
     *,
