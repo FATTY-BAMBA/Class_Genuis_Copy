@@ -650,6 +650,7 @@ def hierarchical_multipass_generation(
     raw_asr_text: str,
     duration: float,
     ocr_context: str,
+    video_title: Optional[str],  # ADD THIS
     client: Any,
     config: ChapterConfig,
     progress_callback: Optional[Callable[[str, int], None]] = None
@@ -662,7 +663,11 @@ def hierarchical_multipass_generation(
     # PASS 1: Course Structure Analysis (10% of budget)
     if progress_callback:
         progress_callback("analyzing_course_structure", 40)
-    
+    video_info = ""
+    if video_title:
+        clean_title = re.sub(r'\.(mp4|avi|mov|mkv|webm|flv|m4v)$', '', video_title, flags=re.IGNORECASE)
+        video_info = f"課程檔名：{clean_title}\n"
+        
     structure_prompt = f"""
 作為資深教學設計專家，分析這個{sec_to_hms(int(duration))}教學影片的整體架構：
 
