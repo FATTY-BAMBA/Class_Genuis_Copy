@@ -737,8 +737,9 @@ def generate_qa_and_notes(processing_result, video_info, raw_asr_text):
     try:
         # Get the raw EducationalContentResult object
         qa_result_obj = process_text_for_qa_and_notes(
-            raw_asr_text=raw_asr_text,     # ← ASR-first prompt source
+            raw_asr_text=raw_asr_text,     # ← ASR-first prompt sourcex
             ocr_segments=ocr_segments,     # ← pass OCR as list (adapter will flatten)
+            video_title=video_info.get("OriginalFilename"),
             num_questions=10,
             num_pages=3,
             id=video_info["Id"],
@@ -1052,6 +1053,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
         chaptering_result = generate_chapters(
             raw_asr_text=raw_asr_text,   # raw ASR string
             ocr_segments=ocr_filtered,   # OCR segments (chapterer formats as needed)
+            video_title=video_info.get("OriginalFilename"),
             duration=duration,
             video_id=video_info["Id"],
             run_dir=Path(run_dir)        # chapterer writes its debug/outputs here
