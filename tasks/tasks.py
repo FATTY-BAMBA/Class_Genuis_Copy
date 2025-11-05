@@ -1056,6 +1056,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             video_title=video_info.get("OriginalFilename"),
             duration=duration,
             video_id=video_info["Id"],
+            video_title=video_info.get("OriginalFilename"),
             run_dir=Path(run_dir)        # chapterer writes its debug/outputs here
         )
 
