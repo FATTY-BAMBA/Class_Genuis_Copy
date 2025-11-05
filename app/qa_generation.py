@@ -1623,6 +1623,7 @@ def generate_educational_content(
     raw_asr_text: str,
     ocr_segments: Union[List[Dict], str],
     video_id: str,
+    video_title: Optional[str] = None,  # ← ADD THIS HERE
     run_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[str, int], None]] = None,
     *,
