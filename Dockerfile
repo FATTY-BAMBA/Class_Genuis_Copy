@@ -40,7 +40,7 @@ WORKDIR /build
 COPY requirements.txt constraints.txt /build/
 
 # Remove conflicting packages from requirements (including lanms-neo which fails to build)
-RUN grep -v "ctranslate2\|faster-whisper\|tokenizers\|transformers\|numpy\|lanms-neo" requirements.txt > requirements_filtered.txt || cp requirements.txt requirements_filtered.txt
+RUN grep -v "ctranslate2\|faster-whisper\|tokenizers\|transformers\|numpy\|lanms-neo\|Polygon3" requirements.txt > requirements_filtered.txt || cp requirements.txt requirements_filtered.txt
 
 # Install core dependencies
 RUN python -m pip install --no-cache-dir \
