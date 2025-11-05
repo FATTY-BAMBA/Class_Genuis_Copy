@@ -1070,6 +1070,7 @@ def generate_chapters(
     ocr_segments: List[Dict],
     duration: float,
     video_id: str,
+    video_title: Optional[str] = None,
     run_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[str, int], None]] = None,
     *,
