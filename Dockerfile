@@ -109,19 +109,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # The runtime image already has cuDNN and CUDA libraries
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        software-properties-common && \
-    add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && \
+        software-properties-common \
+        wget \
+        gnupg \
+        lsb-release && \
+    wget -O /tmp/python.tar.xz "https://github.com/indygreg/python-build-standalone/releases/download/20230507/cpython-3.10.11+20230507-x86_64-unknown-linux-gnu-install_only.tar.gz" && \
+    tar -xf /tmp/python.tar.xz -C /usr/local --strip-components=1 && \
+    rm /tmp/python.tar.xz && \
     apt-get install -y --no-install-recommends \
-        python3.10 python3.10-distutils \
         ffmpeg redis-server redis-tools \
         libsndfile1 libgl1 libgomp1 libglib2.0-0 \
         libsm6 libxext6 libxrender1 libcairo2 \
         curl aria2 netcat-openbsd procps net-tools lsof \
         patchelf && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
-    ln -sf /usr/bin/python3.10 /usr/bin/python3 && \
+    ln -sf /usr/local/bin/python3.10 /usr/bin/python3 && \
     ln -sf /usr/bin/python3 /usr/bin/python && \
+    /usr/local/bin/python3.10 -m ensurepip && \
+    /usr/local/bin/python3.10 -m pip install --upgrade pip && \
     ldconfig && \
     rm -rf /var/lib/apt/lists/*
 
