@@ -1842,6 +1842,7 @@ def generate_educational_content(
         notes_prompt = build_lecture_notes_prompt_v2(
             transcript=notes_transcript,
             ocr_context=ocr_context,
+            video_title=video_title,  # ← ADD THIS
             num_pages=config.max_notes_pages,
             chapters=formatted_chapters,
             topics=topics_list,
