@@ -348,6 +348,7 @@ def validate_traditional_conversion() -> bool:
 
 # ==================== PROMPT BUILDERS (Topics and Summary, ASR-first) ====================
 def build_topics_summary_prompt(transcript: str, 
+                                video_title: Optional[str] = None,  # ADD THIS
                                 context: Optional[Dict[str, str]] = None) -> str:
     """
     Build prompt for LLM to extract meaningful topics and global summary from ASR transcript.
@@ -367,13 +368,22 @@ def build_topics_summary_prompt(transcript: str,
 # 課程背景資訊
 {chr(10).join(context_items)}
 """
-    
+    video_title_info = ""
+    if video_title:
+        clean_title = re.sub(r'\.(mp4|avi|mov|mkv|webm|flv|m4v)$', '', video_title, flags=re.IGNORECASE)
+        video_title_info = f"""
+# 課程檔名
+原始檔名：{clean_title}
+請參考檔名理解課程的主題範圍和重點。
+"""
+
     prompt = f"""
 # 角色定位
 你是一位資深的課程分析專家，專精於教學設計和知識結構化。你的任務是分析講座逐字稿，
 提取核心主題並生成高質量的課程摘要。
 
 {context_info}
+{video_title_info}
 
 # 分析指令
 
