@@ -18,14 +18,15 @@ RUN apt-get update && \
         build-essential cmake git curl ca-certificates wget \
         libcairo2-dev libjpeg-dev libgif-dev pkg-config \
         libopenblas-dev libssl-dev patchelf \
-        gnupg lsb-release && \
+        gnupg lsb-release \
+        g++ gcc python3-dev libpython3-dev && \
     wget -O /tmp/python.tar.xz "https://github.com/indygreg/python-build-standalone/releases/download/20230507/cpython-3.10.11+20230507-x86_64-unknown-linux-gnu-install_only.tar.gz" && \
     tar -xf /tmp/python.tar.xz -C /usr/local --strip-components=1 && \
     rm /tmp/python.tar.xz && \
     ln -sf /usr/local/bin/python3.10 /usr/bin/python3 && \
     ln -sf /usr/bin/python3 /usr/bin/python && \
     /usr/local/bin/python3.10 -m ensurepip && \
-    /usr/local/bin/python3.10 -m pip install --upgrade pip && \
+    /usr/local/bin/python3.10 -m pip install --upgrade pip setuptools wheel && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
@@ -39,7 +40,7 @@ WORKDIR /build
 # Copy dependency lists
 COPY requirements.txt constraints.txt /build/
 
-# Remove conflicting packages from requirements (including lanms-neo which fails to build)
+# Remove conflicting packages and problematic C++ extensions from requirements
 RUN grep -v "ctranslate2\|faster-whisper\|tokenizers\|transformers\|numpy\|lanms-neo\|Polygon3" requirements.txt > requirements_filtered.txt || cp requirements.txt requirements_filtered.txt
 
 # Install core dependencies
@@ -61,14 +62,13 @@ RUN python -m pip install \
     torchaudio==2.2.2+cu118 \
     --extra-index-url https://download.pytorch.org/whl/cu118
 
-# Install other requirements (without numpy and lanms-neo since we already have numpy and lanms-neo fails)
+# Install other requirements (without conflicting packages)
 RUN python -m pip install --no-cache-dir -r requirements_filtered.txt
 
-# Install Polygon3
-#RUN python -m pip install --no-cache-dir "Polygon3==3.0.9.1"
-
-# Install compatible versions for whisper
+# Install compatible versions for whisper (with pre-built wheels preference)
 RUN python -m pip install --no-cache-dir \
+    --prefer-binary \
+    --extra-index-url https://download.pytorch.org/whl/cu118 \
     faster-whisper==0.10.1 \
     ctranslate2==3.24.0 \
     transformers==4.36.2
