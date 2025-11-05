@@ -508,6 +508,7 @@ def build_prompt_body(
     transcript: str,
     duration_sec: int,
     ocr_context: str = "",
+    video_title: Optional[str] = None,  # ADD THIS
 ) -> str:
     duration_hms = sec_to_hms(int(duration_sec))
     min_gap_sec, (t_low, t_high), max_caps = chapter_policy(int(duration_sec))
@@ -522,11 +523,23 @@ def build_prompt_body(
     
     first_ts = timestamps[0] if timestamps else "00:00:00"
     last_ts = timestamps[-1] if timestamps else duration_hms
+
+    video_title_context = ""
+    if video_title:
+        # Strip common video extensions
+        clean_title = re.sub(r'\.(mp4|avi|mov|mkv|webm|flv|m4v)$', '', video_title, flags=re.IGNORECASE)
+        video_title_context = f"""
+        
+# 📚 課程檔案資訊
+檔名：{clean_title}
+請參考檔名理解課程主題、章節編號、涵蓋內容等重要資訊，並據此設計章節結構。
+"""
     
     prompt = f"""
 # 教育章節設計專家 - 時間戳記精準對應版
 你是資深線上課程設計專家，負責將教學影片轉化為專業教育章節結構。
 
+{video_title_context}
 # 🚨 最重要的規則 - 時間戳記必須精準對應
 **逐字稿實際時間範圍：{first_ts} 到 {last_ts}**
 
