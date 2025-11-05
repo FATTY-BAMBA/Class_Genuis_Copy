@@ -65,7 +65,7 @@ RUN python -m pip install \
 RUN python -m pip install --no-cache-dir -r requirements_filtered.txt
 
 # Install Polygon3
-RUN python -m pip install --no-cache-dir "Polygon3==3.0.9.1"
+#RUN python -m pip install --no-cache-dir "Polygon3==3.0.9.1"
 
 # Install compatible versions for whisper
 RUN python -m pip install --no-cache-dir \
