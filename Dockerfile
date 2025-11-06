@@ -70,8 +70,7 @@ RUN python -m pip install --no-cache-dir \
 RUN python -m pip install --no-cache-dir easyocr==1.7.1
 
 # Verify EasyOCR installation
-RUN python -c "import easyocr; print('✅ EasyOCR version:', easyocr.__version__)" && \
-    python -c "reader = easyocr.Reader(['en', 'ch_sim'], gpu=True); print('✅ EasyOCR initialized successfully')"
+RUN python -c "import easyocr; print('✅ EasyOCR installed:', easyocr.__version__)"
 
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python - <<'PY'
