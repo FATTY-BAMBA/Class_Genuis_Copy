@@ -66,14 +66,12 @@ RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 RUN python -m pip install --no-cache-dir \
     "transformers==4.36.2" -c /app/constraints.txt
 
-# Paddle + OCR - CPU-only 2.5.2 (compatible with cuDNN 8, stable)
-RUN python -m pip install --no-cache-dir paddlepaddle==2.5.2 && \
-    python -m pip install --no-cache-dir paddleocr==2.7.0 visualdl==2.5.3
+# EasyOCR - stable alternative to PaddleOCR with good Chinese support
+RUN python -m pip install --no-cache-dir easyocr==1.7.1
 
-# CRITICAL: Verify PaddlePaddle installation (catches silent failures)
-RUN python -c "import paddle; print('✅ Paddle version:', paddle.__version__)" && \
-    python -c "import paddleocr; print('✅ PaddleOCR imported successfully')" && \
-    python -c "from paddleocr import PaddleOCR; print('✅ PaddleOCR class OK')"
+# Verify EasyOCR installation
+RUN python -c "import easyocr; print('✅ EasyOCR version:', easyocr.__version__)" && \
+    python -c "reader = easyocr.Reader(['en', 'ch_sim'], gpu=True); print('✅ EasyOCR initialized successfully')"
 
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python - <<'PY'
