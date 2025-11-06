@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 # =========================================================
 # Base: PyTorch 2.2.2 + CUDA 11.8 + cuDNN 8 (Docker Hub)
+# Using -devel variant for packages that need compilation (pycairo, etc.)
 # =========================================================
-FROM pytorch/pytorch:2.2.2-cuda11.8-cudnn8-runtime
+FROM pytorch/pytorch:2.2.2-cuda11.8-cudnn8-devel
 
 # -------------------- Environment --------------------
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -41,30 +42,29 @@ COPY requirements.txt constraints.txt /app/
 # Then your source
 COPY . .
 
-# -------------------- Python deps (ALL with --only-binary) --------------------
+# -------------------- Python deps --------------------
 # Keep NumPy 1.x FIRST to avoid accidental upgrades to 2.x
-RUN python -m pip install --no-cache-dir --only-binary=:all: numpy==1.26.4
+RUN python -m pip install --no-cache-dir numpy==1.26.4
 
 # Your project requirements (Torch already in base, so keep torch* commented in requirements.txt)
-RUN python -m pip install --no-cache-dir --only-binary=:all: \
+RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt
 
 # Whisper stack
-RUN python -m pip install --no-cache-dir --only-binary=:all: \
+RUN python -m pip install --no-cache-dir \
     ctranslate2==3.24.0 faster-whisper==0.10.1
 
-# Tokenizers from wheels only (avoid Rust toolchain), then Transformers
-RUN python -m pip install --no-cache-dir --only-binary=:all: \
-    "tokenizers>=0.14,<0.15"
+# Tokenizers (devel image has build tools if needed), then Transformers
+RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
-RUN python -m pip install --no-cache-dir --only-binary=:all: \
+RUN python -m pip install --no-cache-dir \
     "transformers==4.36.2" -c /app/constraints.txt
 
 # Paddle + OCR (+ VisualDL)
-RUN python -m pip install --no-cache-dir --only-binary=:all: \
+RUN python -m pip install --no-cache-dir \
       -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html \
       paddlepaddle-gpu==2.5.1 && \
-    python -m pip install --no-cache-dir --only-binary=:all: \
+    python -m pip install --no-cache-dir \
       paddleocr==2.7.0 visualdl==2.5.3 -c /app/constraints.txt
 
 # -------------------- Optional: legacy numpy.int shim --------------------
