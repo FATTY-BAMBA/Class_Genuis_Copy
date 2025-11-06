@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/workspace/models \
     WHISPER_CACHE=/workspace/models \
     CTRANSLATE2_CACHE=/workspace/models \
-    TOKENIZERS_PARALLELISM=false \    
+    TOKENIZERS_PARALLELISM=false \
     OMP_NUM_THREADS=1 \
     GLOG_minloglevel=2 \
     GLOG_logtostderr=0 \
@@ -66,12 +66,12 @@ RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 RUN python -m pip install --no-cache-dir \
     "transformers==4.36.2" -c /app/constraints.txt
 
-# Paddle + OCR (+ VisualDL)
+# Paddle + OCR (+ VisualDL) - without constraints to allow Pillow>=10.0.0
 RUN python -m pip install --no-cache-dir \
       -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html \
       paddlepaddle-gpu==2.5.1 && \
     python -m pip install --no-cache-dir \
-      paddleocr==2.7.0 visualdl==2.5.3 -c /app/constraints.txt
+      paddleocr==2.7.0 visualdl==2.5.3
 
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python - <<'PY'
