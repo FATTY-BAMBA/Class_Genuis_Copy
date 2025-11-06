@@ -21,12 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     FLAGS_fraction_of_gpu_memory_to_use=0.9
 
 # -------------------- System deps --------------------
-# Install OpenSSL 1.1 from Ubuntu 20.04 repos (needed for PaddlePaddle 2.5.1)
-RUN apt-get update && apt-get install -y --no-install-recommends wget && \
-    wget http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb && \
-    dpkg -i libssl1.1_1.1.1f-1ubuntu2_amd64.deb && \
-    rm libssl1.1_1.1.1f-1ubuntu2_amd64.deb && \
-    apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
       # Build tools for packages that need compilation
       pkg-config libcairo2-dev \
       # FFmpeg development headers for ctranslate2/faster-whisper
@@ -71,12 +66,9 @@ RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 RUN python -m pip install --no-cache-dir \
     "transformers==4.36.2" -c /app/constraints.txt
 
-# Paddle + OCR (+ VisualDL) - without constraints to allow Pillow>=10.0.0
-RUN python -m pip install --no-cache-dir \
-      -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html \
-      paddlepaddle-gpu==2.5.1 && \
-    python -m pip install --no-cache-dir \
-      paddleocr==2.7.0 visualdl==2.5.3
+# Paddle + OCR - CPU-only (stable, no libssl issues, only ~1min slower)
+RUN python -m pip install --no-cache-dir paddlepaddle==2.6.2 && \
+    python -m pip install --no-cache-dir paddleocr==2.7.0 visualdl==2.5.3
 
 # CRITICAL: Verify PaddlePaddle installation (catches silent failures)
 RUN python -c "import paddle; print('✅ Paddle version:', paddle.__version__)" && \
