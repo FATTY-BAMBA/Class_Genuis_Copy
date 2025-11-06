@@ -24,6 +24,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       # Build tools for packages that need compilation
       pkg-config libcairo2-dev \
+      # FFmpeg development headers for ctranslate2/faster-whisper
+      libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+      libavfilter-dev libswscale-dev libswresample-dev \
       # Runtime dependencies
       ffmpeg redis-server redis-tools \
       libsndfile1 libgl1 libgomp1 libglib2.0-0 \
