@@ -1,5 +1,4 @@
 # syntax=docker/dockerfile:1
-
 # =========================================================
 # Base: PyTorch 2.2.2 + CUDA 11.8 + cuDNN 8 (Docker Hub)
 # =========================================================
@@ -20,7 +19,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GLOG_logtostderr=0 \
     FLAGS_fraction_of_gpu_memory_to_use=0.9
 
-# -------------------- System deps (NO Python here) --------------------
+# -------------------- System deps (NO Python build tools) --------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg redis-server redis-tools \
       libsndfile1 libgl1 libgomp1 libglib2.0-0 \
@@ -35,30 +34,38 @@ RUN python -m pip install --upgrade pip==24.0 setuptools wheel
 
 # -------------------- Workdir & app files --------------------
 WORKDIR /app
+
 # Copy dependency files first for layer caching
 COPY requirements.txt constraints.txt /app/
+
 # Then your source
 COPY . .
 
-# -------------------- Python deps --------------------
+# -------------------- Python deps (ALL with --only-binary) --------------------
 # Keep NumPy 1.x FIRST to avoid accidental upgrades to 2.x
-RUN python -m pip install --no-cache-dir numpy==1.26.4
+RUN python -m pip install --no-cache-dir --only-binary=:all: numpy==1.26.4
 
 # Your project requirements (Torch already in base, so keep torch* commented in requirements.txt)
-RUN python -m pip install --no-cache-dir -r /app/requirements.txt -c /app/constraints.txt
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
+    -r /app/requirements.txt -c /app/constraints.txt
 
 # Whisper stack
-RUN python -m pip install --no-cache-dir ctranslate2==3.24.0 faster-whisper==0.10.1
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
+    ctranslate2==3.24.0 faster-whisper==0.10.1
 
 # Tokenizers from wheels only (avoid Rust toolchain), then Transformers
-RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15" --only-binary=:all:
-RUN python -m pip install --no-cache-dir "transformers==4.36.2" -c /app/constraints.txt
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
+    "tokenizers>=0.14,<0.15"
+
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
+    "transformers==4.36.2" -c /app/constraints.txt
 
 # Paddle + OCR (+ VisualDL)
-RUN python -m pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
       -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html \
       paddlepaddle-gpu==2.5.1 && \
-    python -m pip install --no-cache-dir paddleocr==2.7.0 visualdl==2.5.3 -c /app/constraints.txt
+    python -m pip install --no-cache-dir --only-binary=:all: \
+      paddleocr==2.7.0 visualdl==2.5.3 -c /app/constraints.txt
 
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python - <<'PY'
@@ -73,10 +80,12 @@ RUN useradd -ms /bin/bash appuser && \
     mkdir -p /app/uploads /app/segments /workspace/logs /workspace/models /workspace/uploads && \
     chown -R appuser:appuser /app /workspace && \
     chmod +x /app/start.sh
+
 USER appuser
 
 # -------------------- Ports, healthcheck, entrypoint --------------------
 EXPOSE 5000 8888
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
   CMD curl -f http://localhost:5000/healthz || exit 1
 
