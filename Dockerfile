@@ -73,6 +73,11 @@ RUN python -m pip install --no-cache-dir \
     python -m pip install --no-cache-dir \
       paddleocr==2.7.0 visualdl==2.5.3
 
+# CRITICAL: Verify PaddlePaddle installation (catches silent failures)
+RUN python -c "import paddle; print('✅ Paddle version:', paddle.__version__)" && \
+    python -c "import paddleocr; print('✅ PaddleOCR imported successfully')" && \
+    python -c "from paddleocr import PaddleOCR; print('✅ PaddleOCR class OK')"
+
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python - <<'PY'
 import sys, pathlib
