@@ -56,8 +56,8 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt
 
-# Whisper stack
-RUN python -m pip install --no-cache-dir \
+# Whisper stack (use pre-built wheels to avoid PyAV/Cython compilation issues)
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
     ctranslate2==3.24.0 faster-whisper==0.10.1
 
 # Tokenizers (devel image has build tools if needed), then Transformers
