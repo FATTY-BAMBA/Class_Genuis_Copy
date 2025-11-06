@@ -66,8 +66,8 @@ RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 RUN python -m pip install --no-cache-dir \
     "transformers==4.36.2" -c /app/constraints.txt
 
-# Paddle + OCR - CPU-only (stable, no libssl issues, only ~1min slower)
-RUN python -m pip install --no-cache-dir paddlepaddle==2.6.2 && \
+# Paddle + OCR - CPU-only 2.5.2 (compatible with cuDNN 8, stable)
+RUN python -m pip install --no-cache-dir paddlepaddle==2.5.2 && \
     python -m pip install --no-cache-dir paddleocr==2.7.0 visualdl==2.5.3
 
 # CRITICAL: Verify PaddlePaddle installation (catches silent failures)
