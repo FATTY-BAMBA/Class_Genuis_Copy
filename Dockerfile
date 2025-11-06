@@ -56,12 +56,9 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt
 
-# FALLBACK: Constrain Cython to 0.29.x for PyAV 10.x compatibility
-RUN python -m pip install --no-cache-dir "Cython<3.0"
-
-# Whisper stack (PyAV 10.x will compile with Cython 0.29.x)
+# Whisper stack (use newer faster-whisper that supports modern PyAV with wheels)
 RUN python -m pip install --no-cache-dir \
-    ctranslate2==3.24.0 faster-whisper==0.10.1
+    ctranslate2==3.24.0 faster-whisper==1.0.3
 
 # Tokenizers (devel image has build tools if needed), then Transformers
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
