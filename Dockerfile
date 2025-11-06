@@ -21,7 +21,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     FLAGS_fraction_of_gpu_memory_to_use=0.9
 
 # -------------------- System deps --------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install OpenSSL 1.1 from Ubuntu 20.04 repos (needed for PaddlePaddle 2.5.1)
+RUN apt-get update && apt-get install -y --no-install-recommends wget && \
+    wget http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb && \
+    dpkg -i libssl1.1_1.1.1f-1ubuntu2_amd64.deb && \
+    rm libssl1.1_1.1.1f-1ubuntu2_amd64.deb && \
+    apt-get install -y --no-install-recommends \
       # Build tools for packages that need compilation
       pkg-config libcairo2-dev \
       # FFmpeg development headers for ctranslate2/faster-whisper
@@ -32,8 +37,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libsndfile1 libgl1 libgomp1 libglib2.0-0 \
       libsm6 libxext6 libxrender1 libcairo2 \
       curl aria2 netcat-openbsd procps net-tools lsof patchelf \
-      # OpenSSL 1.1 for PaddlePaddle compatibility
-      libssl1.1 \
       # tiny safety net if any wheel expects system BLAS:
       libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
