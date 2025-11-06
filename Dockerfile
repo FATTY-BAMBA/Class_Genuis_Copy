@@ -20,8 +20,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GLOG_logtostderr=0 \
     FLAGS_fraction_of_gpu_memory_to_use=0.9
 
-# -------------------- System deps (NO Python build tools) --------------------
+# -------------------- System deps --------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
+      # Build tools for packages that need compilation
+      pkg-config libcairo2-dev \
+      # Runtime dependencies
       ffmpeg redis-server redis-tools \
       libsndfile1 libgl1 libgomp1 libglib2.0-0 \
       libsm6 libxext6 libxrender1 libcairo2 \
