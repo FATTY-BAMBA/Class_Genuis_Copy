@@ -60,17 +60,20 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt
 
-# -------------------- Whisper stack (CUDA 11.8 compatible) --------------------
-# Install Cython < 3.0 first to prevent PyAV compilation errors
-RUN python -m pip install --no-cache-dir "Cython<3.0"
+# -------------------- Whisper stack (CUDA 11.8, without PyAV) --------------------
+# Install old Cython for compatibility
+RUN python -m pip install --no-cache-dir Cython==0.29.36
 
-# Install PyAV
-RUN python -m pip install --no-cache-dir av==11.0.0
+# Install ctranslate2 (has pre-built wheels)
+RUN python -m pip install --no-cache-dir ctranslate2==3.24.0
 
-# Install ctranslate2 and faster-whisper (CUDA 11.8 versions)
+# Install faster-whisper WITHOUT dependencies to skip PyAV
+RUN python -m pip install --no-cache-dir --no-deps faster-whisper==0.10.1
+
+# Add back only the required dependencies (skip av/PyAV which causes compilation issues)
 RUN python -m pip install --no-cache-dir \
-    ctranslate2==3.24.0 \
-    faster-whisper==0.10.1
+    onnxruntime \
+    "huggingface-hub>=0.13"
 
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
