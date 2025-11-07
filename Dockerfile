@@ -60,20 +60,16 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt
 
-# -------------------- Whisper stack (CUDA 11.8, without PyAV) --------------------
-# Install old Cython for compatibility
-RUN python -m pip install --no-cache-dir Cython==0.29.36
+# -------------------- Whisper stack (CUDA 11.8, install PyAV from wheel) --------------------
+# CRITICAL: Install PyAV from pre-built wheel ONLY (no source compilation)
+# The --only-binary flag forces pip to use wheels and fail if it tries to compile
+RUN python -m pip install --no-cache-dir --only-binary=:all: av==12.3.0
 
 # Install ctranslate2 (has pre-built wheels)
 RUN python -m pip install --no-cache-dir ctranslate2==3.24.0
 
-# Install faster-whisper WITHOUT dependencies to skip PyAV
-RUN python -m pip install --no-cache-dir --no-deps faster-whisper==0.10.1
-
-# Add back only the required dependencies (skip av/PyAV which causes compilation issues)
-RUN python -m pip install --no-cache-dir \
-    onnxruntime \
-    "huggingface-hub>=0.13"
+# Now install faster-whisper normally (PyAV is already satisfied)
+RUN python -m pip install --no-cache-dir faster-whisper==0.10.1
 
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
@@ -85,6 +81,7 @@ RUN python -m pip install --no-cache-dir easyocr==1.7.1
 
 # Verify installations
 RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
+    python -c "import av; print('✅ PyAV:', av.__version__)" && \
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
     python -c "import faster_whisper; print('✅ faster-whisper:', faster_whisper.__version__)"
 
@@ -103,6 +100,11 @@ RUN useradd -ms /bin/bash appuser && \
 
 USER appuser
 
+# -------------------- Ports, healthcheck, entrypoint --------------------
 EXPOSE 5000 8888
+
+# Health check disabled to prevent restarts during long processing
+#HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+#  CMD curl -f http://localhost:5000/healthz || exit 1
 
 CMD ["./start.sh"]
