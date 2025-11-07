@@ -4,14 +4,14 @@
 # =========================================================
 FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
-# -------------------- Install Python 3.10 --------------------
+# -------------------- Install Python 3.11 --------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3.10-dev python3-pip \
+    python3.11 python3.11-dev python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Make python3.10 the default
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+# Make python3.11 the default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
 # -------------------- Environment --------------------
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -56,24 +56,23 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt || true
 
-# -------------------- Install PyTorch 2.3.1 (CUDA 11.8) --------------------
-# PyTorch 2.3 officially supports CUDA 11.8 + cuDNN 8.7.0.84
+# -------------------- Install PyTorch 2.1.2 (CUDA 11.8) - PROVEN CONFIG --------------------
+# This exact version is verified to work with EasyOCR + CUDA 11.8 + cuDNN 8.7
 RUN pip3 install --no-cache-dir --force-reinstall \
-    torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 \
+    torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 \
     --index-url https://download.pytorch.org/whl/cu118
 
 # -------------------- Whisper stack (CUDA 11.8 + cuDNN 8) --------------------
-# Install PyAV with pre-built wheel FIRST
+# Install PyAV with pre-built wheel
 RUN python -m pip install --no-cache-dir --only-binary=:all: av==12.3.0
 
-# Install ctranslate2 3.24.0 (for CUDA 11 + cuDNN 8 as per faster-whisper docs)
+# Install ctranslate2 3.24.0 (for CUDA 11 + cuDNN 8)
 RUN python -m pip install --no-cache-dir ctranslate2==3.24.0
 
-# Install faster-whisper 0.10.1 WITHOUT dependencies (--no-deps) to skip PyAV 10 compilation
-# We already have PyAV 12.3.0 installed which works fine
+# Install faster-whisper 0.10.1 WITHOUT dependencies
 RUN python -m pip install --no-cache-dir --no-deps faster-whisper==0.10.1
 
-# Add back only the required dependencies (skip av since we have 12.3.0)
+# Add back required dependencies
 RUN python -m pip install --no-cache-dir \
     onnxruntime \
     "huggingface-hub>=0.13"
@@ -83,7 +82,8 @@ RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 RUN python -m pip install --no-cache-dir \
     "transformers==4.36.2" -c /app/constraints.txt
 
-# EasyOCR
+# -------------------- EasyOCR (GPU, with proven PyTorch 2.1.2) --------------------
+# Now that we have compatible PyTorch 2.1.2, install EasyOCR normally
 RUN python -m pip install --no-cache-dir easyocr==1.7.1
 
 # Verify installations
