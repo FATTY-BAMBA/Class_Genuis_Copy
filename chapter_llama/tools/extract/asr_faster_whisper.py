@@ -110,6 +110,14 @@ class ASRProcessor:
         vad_logger = logging.getLogger("faster_whisper")
         handler = _VADLogCapture()
         vad_logger.addHandler(handler)
+
+        import sys
+        print("=" * 60, flush=True)
+        print("🔄 WHISPER: Starting transcription...", flush=True)
+        print("⏳ WHISPER: Loading large-v2 model (this takes 30-60 seconds)...", flush=True)
+        print("=" * 60, flush=True)
+        sys.stdout.flush()
+
         try:
             segments, info = self.model.transcribe(
                 str(audio_path),
