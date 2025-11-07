@@ -82,13 +82,12 @@ RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', t
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
     python -c "import faster_whisper; print('✅ faster-whisper:', faster_whisper.__version__)"
 
-# -------------------- Optional: legacy numpy.int shim --------------------
-RUN python - <<'PY'
-import sys, pathlib
-site = pathlib.Path(next(p for p in sys.path if p.endswith("site-packages")))
-(site/'numpy_patch.py').write_text("import numpy as np; np.int = int if not hasattr(np, 'int') else np.int")
-with (site/'sitecustomize.py').open('a') as f: f.write("\ntry: import numpy_patch\nexcept: pass\n")
-PY
+# -------------------- Optional: legacy numpy.int shim (FIXED) --------------------
+RUN python -c "import sys, pathlib, site; \
+    site_dir = pathlib.Path(site.getsitepackages()[0]); \
+    (site_dir/'numpy_patch.py').write_text('import numpy as np; np.int = int if not hasattr(np, \"int\") else np.int'); \
+    sitecustomize = site_dir/'sitecustomize.py'; \
+    sitecustomize.write_text((sitecustomize.read_text() if sitecustomize.exists() else '') + '\ntry: import numpy_patch\nexcept: pass\n')"
 
 # -------------------- Non-root user & dirs --------------------
 RUN useradd -ms /bin/bash appuser && \
