@@ -63,14 +63,20 @@ RUN pip3 install --no-cache-dir --force-reinstall \
     --index-url https://download.pytorch.org/whl/cu118
 
 # -------------------- Whisper stack (CUDA 11.8 + cuDNN 8) --------------------
-# Install PyAV with pre-built wheel
+# Install PyAV with pre-built wheel FIRST
 RUN python -m pip install --no-cache-dir --only-binary=:all: av==12.3.0
 
-# CRITICAL: For CUDA 11 + cuDNN 8, use ctranslate2 3.24.0 (per faster-whisper docs)
+# Install ctranslate2 3.24.0 (for CUDA 11 + cuDNN 8 as per faster-whisper docs)
 RUN python -m pip install --no-cache-dir ctranslate2==3.24.0
 
-# Install faster-whisper 0.10.1 (compatible with ctranslate2 3.24.0)
-RUN python -m pip install --no-cache-dir faster-whisper==0.10.1
+# Install faster-whisper 0.10.1 WITHOUT dependencies (--no-deps) to skip PyAV 10 compilation
+# We already have PyAV 12.3.0 installed which works fine
+RUN python -m pip install --no-cache-dir --no-deps faster-whisper==0.10.1
+
+# Add back only the required dependencies (skip av since we have 12.3.0)
+RUN python -m pip install --no-cache-dir \
+    onnxruntime \
+    "huggingface-hub>=0.13"
 
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
