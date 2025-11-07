@@ -1,17 +1,8 @@
 # syntax=docker/dockerfile:1
 # =========================================================
-# Base: NVIDIA CUDA 11.8 + cuDNN 8
+# Base: PyTorch Official Image (comes with CUDA + cuDNN pre-configured)
 # =========================================================
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
-
-# -------------------- Install Python 3.10 --------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3.10-dev python3-pip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Make python3.10 the default
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-devel
 
 # -------------------- Environment --------------------
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -49,28 +40,21 @@ WORKDIR /app
 COPY requirements.txt constraints.txt /app/
 COPY . .
 
-# -------------------- Python deps (install requirements FIRST, without torch) --------------------
+# -------------------- Python deps --------------------
 RUN python -m pip install --no-cache-dir numpy==1.26.4
 
-# Install requirements.txt (excluding torch if present - it will be installed separately below)
+# Install requirements (torch already in base image)
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt || true
 
-# -------------------- Install PyTorch 2.0.1 (CUDA 11.8) - MUST BE AFTER requirements.txt --------------------
-# This ensures the correct CUDA 11.8 version is installed and not overridden
-RUN pip3 install --no-cache-dir --force-reinstall \
-    torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
-    --index-url https://download.pytorch.org/whl/cu118
-
-# -------------------- Whisper stack (CUDA 11.8, newer versions with pre-built wheels) --------------------
-# Install PyAV 12.3 with pre-built wheel (ONLY binary, no compilation)
+# -------------------- Whisper stack --------------------
+# Install PyAV with pre-built wheel
 RUN python -m pip install --no-cache-dir --only-binary=:all: av==12.3.0
 
-# Install ctranslate2 (CUDA 11.8 compatible)
-RUN python -m pip install --no-cache-dir ctranslate2==3.24.0
-
-# Install faster-whisper 1.0.0 which works with PyAV 12.x and has pre-built wheels
-RUN python -m pip install --no-cache-dir faster-whisper==1.0.0
+# Install ctranslate2 and faster-whisper
+RUN python -m pip install --no-cache-dir \
+    ctranslate2==3.24.0 \
+    faster-whisper==1.0.0
 
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
@@ -80,7 +64,7 @@ RUN python -m pip install --no-cache-dir \
 # EasyOCR
 RUN python -m pip install --no-cache-dir easyocr==1.7.1
 
-# Verify installations - CRITICAL CHECK
+# Verify installations
 RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
     python -c "import av; print('✅ PyAV:', av.__version__)" && \
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
@@ -101,11 +85,6 @@ RUN useradd -ms /bin/bash appuser && \
 
 USER appuser
 
-# -------------------- Ports, healthcheck, entrypoint --------------------
 EXPOSE 5000 8888
-
-# Health check disabled to prevent restarts during long processing
-#HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-#  CMD curl -f http://localhost:5000/healthz || exit 1
 
 CMD ["./start.sh"]
