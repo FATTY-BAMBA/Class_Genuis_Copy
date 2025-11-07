@@ -60,16 +60,15 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt
 
-# -------------------- Whisper stack (CUDA 11.8, install PyAV from wheel) --------------------
-# CRITICAL: Install PyAV from pre-built wheel ONLY (no source compilation)
-# The --only-binary flag forces pip to use wheels and fail if it tries to compile
+# -------------------- Whisper stack (CUDA 11.8, newer versions with pre-built wheels) --------------------
+# Install PyAV 12.3 with pre-built wheel (ONLY binary, no compilation)
 RUN python -m pip install --no-cache-dir --only-binary=:all: av==12.3.0
 
-# Install ctranslate2 (has pre-built wheels)
+# Install ctranslate2 (CUDA 11.8 compatible)
 RUN python -m pip install --no-cache-dir ctranslate2==3.24.0
 
-# Now install faster-whisper normally (PyAV is already satisfied)
-RUN python -m pip install --no-cache-dir faster-whisper==0.10.1
+# Install faster-whisper 1.0.0 which works with PyAV 12.x and has pre-built wheels
+RUN python -m pip install --no-cache-dir faster-whisper==1.0.0
 
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
