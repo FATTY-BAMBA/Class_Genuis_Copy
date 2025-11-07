@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
 
-# -------------------- Install PyTorch 2.0.1 (compatible with CUDA 11.8 + cuDNN 8) --------------------
+# -------------------- Install PyTorch 2.0.1 (CUDA 11.8) --------------------
 RUN pip3 install --no-cache-dir \
     torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
     --index-url https://download.pytorch.org/whl/cu118
@@ -60,14 +60,17 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt
 
-# -------------------- Whisper stack (NEWER versions with pre-built wheels) --------------------
-# Install PyAV with pre-built wheel first
-RUN python -m pip install --no-cache-dir av==12.0.0
+# -------------------- Whisper stack (CUDA 11.8 compatible) --------------------
+# Install Cython < 3.0 first to prevent PyAV compilation errors
+RUN python -m pip install --no-cache-dir "Cython<3.0"
 
-# Then ctranslate2 and faster-whisper
+# Install PyAV
+RUN python -m pip install --no-cache-dir av==11.0.0
+
+# Install ctranslate2 and faster-whisper (CUDA 11.8 versions)
 RUN python -m pip install --no-cache-dir \
-    ctranslate2==4.0.0 \
-    faster-whisper==1.0.0
+    ctranslate2==3.24.0 \
+    faster-whisper==0.10.1
 
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
@@ -82,7 +85,7 @@ RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', t
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
     python -c "import faster_whisper; print('✅ faster-whisper:', faster_whisper.__version__)"
 
-# -------------------- Optional: legacy numpy.int shim (FIXED) --------------------
+# -------------------- Optional: legacy numpy.int shim --------------------
 RUN python -c "import sys, pathlib, site; \
     site_dir = pathlib.Path(site.getsitepackages()[0]); \
     (site_dir/'numpy_patch.py').write_text('import numpy as np; np.int = int if not hasattr(np, \"int\") else np.int'); \
