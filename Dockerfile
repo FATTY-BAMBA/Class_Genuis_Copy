@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 # =========================================================
-# Base: PyTorch 2.2.2 + CUDA 11.8 + cuDNN 8 (Docker Hub)
+# Base: PyTorch 2.3.0 + CUDA 12.1 + cuDNN 9 (FIXED!)
 # Using -devel variant for packages that need compilation (pycairo, etc.)
 # =========================================================
-FROM pytorch/pytorch:2.2.2-cuda11.8-cudnn8-devel
+FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn9-devel
 
 # -------------------- Environment --------------------
 ENV DEBIAN_FRONTEND=noninteractive \
