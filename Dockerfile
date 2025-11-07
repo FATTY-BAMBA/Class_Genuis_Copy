@@ -1,9 +1,22 @@
 # syntax=docker/dockerfile:1
 # =========================================================
-# Base: PyTorch 2.3.0 + CUDA 12.1 + cuDNN 9 (FIXED!)
-# Using -devel variant for packages that need compilation (pycairo, etc.)
+# Base: NVIDIA CUDA 12.1 + cuDNN 9 (most compatible)
 # =========================================================
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn9-devel
+FROM nvidia/cuda:12.1.0-cudnn9-devel-ubuntu22.04
+
+# -------------------- Install Python 3.10 --------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3.10-dev python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.10 the default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+# Install PyTorch with CUDA 12.1 support
+RUN pip3 install --no-cache-dir \
+    torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 \
+    --index-url https://download.pytorch.org/whl/cu121
 
 # -------------------- Environment --------------------
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -36,7 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin pip for reproducibility
+# Upgrade pip
 RUN python -m pip install --upgrade pip==24.0 setuptools wheel
 
 # -------------------- Workdir & app files --------------------
@@ -52,25 +65,26 @@ COPY . .
 # Keep NumPy 1.x FIRST to avoid accidental upgrades to 2.x
 RUN python -m pip install --no-cache-dir numpy==1.26.4
 
-# Your project requirements (Torch already in base, so keep torch* commented in requirements.txt)
+# Your project requirements
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt
 
-# Whisper stack (modern versions with PyAV 12+ wheels, no compilation needed)
+# Whisper stack
 RUN python -m pip install --no-cache-dir \
     ctranslate2==4.5.0 faster-whisper==1.0.3
 
-# Tokenizers (devel image has build tools if needed), then Transformers
+# Tokenizers then Transformers
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
 RUN python -m pip install --no-cache-dir \
     "transformers==4.36.2" -c /app/constraints.txt
 
-# EasyOCR - stable alternative to PaddleOCR with good Chinese support
+# EasyOCR
 RUN python -m pip install --no-cache-dir easyocr==1.7.1
 
-# Verify EasyOCR installation
-RUN python -c "import easyocr; print('✅ EasyOCR installed:', easyocr.__version__)"
+# Verify installations
+RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)" && \
+    python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)"
 
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python - <<'PY'
@@ -90,8 +104,5 @@ USER appuser
 
 # -------------------- Ports, healthcheck, entrypoint --------------------
 EXPOSE 5000 8888
-
-#HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-#   CMD curl -f http://localhost:5000/healthz || exit 1
 
 CMD ["./start.sh"]
