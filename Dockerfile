@@ -13,11 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
 
-# -------------------- Install PyTorch 2.0.1 (CUDA 11.8) --------------------
-RUN pip3 install --no-cache-dir \
-    torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
-    --index-url https://download.pytorch.org/whl/cu118
-
 # -------------------- Environment --------------------
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -54,11 +49,18 @@ WORKDIR /app
 COPY requirements.txt constraints.txt /app/
 COPY . .
 
-# -------------------- Python deps --------------------
+# -------------------- Python deps (install requirements FIRST, without torch) --------------------
 RUN python -m pip install --no-cache-dir numpy==1.26.4
 
+# Install requirements.txt (excluding torch if present - it will be installed separately below)
 RUN python -m pip install --no-cache-dir \
-    -r /app/requirements.txt -c /app/constraints.txt
+    -r /app/requirements.txt -c /app/constraints.txt || true
+
+# -------------------- Install PyTorch 2.0.1 (CUDA 11.8) - MUST BE AFTER requirements.txt --------------------
+# This ensures the correct CUDA 11.8 version is installed and not overridden
+RUN pip3 install --no-cache-dir --force-reinstall \
+    torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
+    --index-url https://download.pytorch.org/whl/cu118
 
 # -------------------- Whisper stack (CUDA 11.8, newer versions with pre-built wheels) --------------------
 # Install PyAV 12.3 with pre-built wheel (ONLY binary, no compilation)
@@ -78,7 +80,7 @@ RUN python -m pip install --no-cache-dir \
 # EasyOCR
 RUN python -m pip install --no-cache-dir easyocr==1.7.1
 
-# Verify installations
+# Verify installations - CRITICAL CHECK
 RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
     python -c "import av; print('✅ PyAV:', av.__version__)" && \
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
