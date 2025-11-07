@@ -92,6 +92,6 @@ USER appuser
 EXPOSE 5000 8888
 
 #HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-  ＃CMD curl -f http://localhost:5000/healthz || exit 1
+#   CMD curl -f http://localhost:5000/healthz || exit 1
 
 CMD ["./start.sh"]
