@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
 
-# -------------------- Install PyTorch 2.0.1 (compatible with cuDNN 8 + CUDA 11.8) --------------------
+# -------------------- Install PyTorch 2.0.1 (compatible with CUDA 11.8 + cuDNN 8) --------------------
 RUN pip3 install --no-cache-dir \
     torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
     --index-url https://download.pytorch.org/whl/cu118
@@ -60,9 +60,14 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt
 
-# Whisper stack (compatible versions for cuDNN 8)
+# -------------------- Whisper stack (NEWER versions with pre-built wheels) --------------------
+# Install PyAV with pre-built wheel first
+RUN python -m pip install --no-cache-dir av==12.0.0
+
+# Then ctranslate2 and faster-whisper
 RUN python -m pip install --no-cache-dir \
-    ctranslate2==3.24.0 faster-whisper==0.10.1
+    ctranslate2==4.0.0 \
+    faster-whisper==1.0.0
 
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
