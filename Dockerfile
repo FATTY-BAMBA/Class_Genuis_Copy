@@ -95,7 +95,7 @@ RUN python -c "import sys, pathlib, site; \
 # -------------------- Non-root user & dirs --------------------
 RUN useradd -ms /bin/bash appuser && \
     mkdir -p /app/uploads /app/segments /workspace/logs /workspace/models /workspace/uploads && \
-    chown -R appuser:appuser /app /workspace && \ss
+    chown -R appuser:appuser /app /workspace && \
     chmod +x /app/start.sh
 
 USER appuser
