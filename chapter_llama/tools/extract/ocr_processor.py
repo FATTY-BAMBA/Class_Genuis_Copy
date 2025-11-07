@@ -10,7 +10,7 @@ from typing import List, Tuple, Iterable, Dict, Optional
 import cv2
 import numpy as np
 from difflib import SequenceMatcher
-from paddleocr import PaddleOCR
+import easyocr  # Changed from paddleocr
 
 # ---------------- Env knobs (all optional) ----------------
 # Balanced for accuracy without big slowdown
@@ -18,7 +18,7 @@ _OCR_FPS             = float(os.getenv("OCR_FPS", "3.0"))
 _OCR_DOWNSCALE_W     = int(os.getenv("OCR_DOWNSCALE_W", "960"))      # less aggressive than 640
 _OCR_CONF            = float(os.getenv("OCR_CONF", "0.75"))          # base threshold
 _OCR_BATCH           = int(os.getenv("OCR_BATCH", "16"))
-_OCR_LANGS           = os.getenv("OCR_LANGS", "chinese_cht,en").split(",")
+_OCR_LANGS           = os.getenv("OCR_LANGS", "ch_tra,en").split(",")  # ch_tra for Traditional, ch_sim for Simplified
 _OCR_GPU             = os.getenv("OCR_GPU", "true").lower() == "true"
 _OCR_MAX_FRAMES      = int(os.getenv("OCR_MAX_FRAMES", "50"))
 _OCR_LOG_EVERY_N     = int(os.getenv("OCR_LOG_EVERY_N", "50"))
@@ -37,11 +37,6 @@ _X_GAP_RATIO         = float(os.getenv("OCR_X_GAP_RATIO", "0.02"))   # gap to in
 # Temporal fuzzy dedup (0..1); higher = stricter dedup
 _DEDUP_CUTOFF        = float(os.getenv("OCR_DEDUP_CUTOFF", "0.93"))
 _DEDUP_MAX_MEMORY    = int(os.getenv("OCR_DEDUP_MAX_MEMORY", "5000"))  # cap global seen lines
-
-# PaddleOCR specific settings
-_OCR_DET_MODEL_DIR   = os.getenv("OCR_DET_MODEL_DIR", None)
-_OCR_REC_MODEL_DIR   = os.getenv("OCR_REC_MODEL_DIR", None)
-_OCR_CLS_MODEL_DIR   = os.getenv("OCR_CLS_MODEL_DIR", None)
 
 # Small tech lexicon to gently fix common Latin terms (cheap & safe)
 _TECH_TERMS = {
@@ -282,41 +277,19 @@ def _clean_lines_topic_agnostic(lines: List[str]) -> List[str]:
 # ---------------- Main class ----------------
 class OCRProcessor:
     """
-    OCR processor tuned for mixed Chinese + English slides/screens without big slowdown.
+    OCR processor using EasyOCR for mixed Chinese + English slides/screens.
     Produces line-preserving, de-duplicated text per time window.
     """
 
     def __init__(self):
         t0 = time.time()
-        print("🔄 初始化 PaddleOCR Readers ...")
+        print("🔄 初始化 EasyOCR Reader ...")
 
-        # Primary (Chinese Traditional) — handles detection + mixed Han text well
-        self.ocr_zh = PaddleOCR(
-            use_angle_cls=True,           # enable for robustness on headings/skew
-            lang='chinese_cht',
-            use_gpu=_OCR_GPU,
-            det_db_thresh=0.3,
-            det_db_box_thresh=0.5,
-            det_db_unclip_ratio=1.6,
-            rec_batch_num=_OCR_BATCH,
-            det_model_dir=_OCR_DET_MODEL_DIR,
-            rec_model_dir=_OCR_REC_MODEL_DIR,
-            cls_model_dir=_OCR_CLS_MODEL_DIR,
-            show_log=False
-        )
-
-        # Optional English specialist for selective re-checks on Latin text
-        self.ocr_en = None
-        if 'en' in _OCR_LANGS:
-            self.ocr_en = PaddleOCR(
-                use_angle_cls=True,
-                lang='en',
-                use_gpu=_OCR_GPU,
-                rec_batch_num=_OCR_BATCH,
-                show_log=False
-            )
-
-        print(f"✅ PaddleOCR ready (gpu={_OCR_GPU}) in {time.time() - t0:.1f}s")
+        # Initialize EasyOCR with languages from environment
+        # Default: Traditional Chinese + English
+        self.reader = easyocr.Reader(_OCR_LANGS, gpu=_OCR_GPU)
+        
+        print(f"✅ EasyOCR ready (gpu={_OCR_GPU}, langs={_OCR_LANGS}) in {time.time() - t0:.1f}s")
 
     # ----------- Public (compat) single-window API -----------
     def get_text_from_segment(self, video_path: Path, start_sec: int, end_sec: int) -> str:
@@ -369,7 +342,7 @@ class OCRProcessor:
                 frames = self._extract_frames_optimized(cap, s, e, fps=fps, downscale_w=downscale_w)
 
                 # 1) tokens with geometry/conf
-                tokens = self._run_ocr_paddle(frames)  # List[Dict]
+                tokens = self._run_ocr_easyocr(frames)  # List[Dict]
                 if not tokens:
                     results.append({"start": s, "end": e, "texts": []})
                     continue
@@ -385,8 +358,6 @@ class OCRProcessor:
                 lines = _clean_lines_topic_agnostic(lines)
 
                 # 4) fuzzy temporal de-dup (across windows) — hardened
-                # Optional assertion for debugging stray non-strings:
-                # assert all(isinstance(x, str) for x in lines), "Non-string value in OCR lines"
                 lines, global_seen_lines = _temporal_dedup(global_seen_lines, lines, cutoff=_DEDUP_CUTOFF)
 
                 results.append({"start": s, "end": e, "texts": lines})
@@ -446,11 +417,10 @@ class OCRProcessor:
 
         return frames
 
-    # ----------- PaddleOCR Processing (structured) -----------
-    def _run_ocr_paddle(self, frames: List[np.ndarray]) -> List[Dict]:
+    # ----------- EasyOCR Processing (structured) -----------
+    def _run_ocr_easyocr(self, frames: List[np.ndarray]) -> List[Dict]:
         """
-        Process frames using PaddleOCR, with selective English re-check
-        on Latin-looking, low-confidence lines (crop-only).
+        Process frames using EasyOCR.
 
         Returns token dicts:
           {"text": str, "conf": float, "box": [(x,y)...], "w": int, "h": int}
@@ -461,73 +431,56 @@ class OCRProcessor:
 
         for frame in frames:
             try:
-                res = self.ocr_zh.ocr(frame, cls=True)  # full pass (det+rec)
-                if not isinstance(res, list) or not res:
+                # EasyOCR returns: [(bbox, text, confidence), ...]
+                # bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                results = self.reader.readtext(frame)
+                
+                if not results:
                     continue
 
                 H, W = frame.shape[:2]
-                for per_frame in res:
-                    if not isinstance(per_frame, list) or not per_frame:
-                        continue
 
-                    for line in per_frame:
-                        if not line or len(line) < 2:
-                            continue
-
-                        poly = line[0]
-                        text_info = line[1]
-                        if not text_info or len(text_info) < 2:
-                            continue
-
-                        txt, conf = text_info
-                        try:
-                            best_txt, best_conf = str(txt), float(conf)
-                        except Exception:
+                for bbox, txt, conf in results:
+                    try:
+                        txt = str(txt).strip()
+                        conf = float(conf)
+                        
+                        if not txt:
                             continue
 
                         # Optional ROI filter: drop right sidebar area
-                        if isinstance(poly, (list, tuple)) and len(poly) >= 4 and _ROI_X_MAX < 0.999:
+                        if _ROI_X_MAX < 0.999:
                             try:
-                                xs = [p[0] for p in poly]
+                                xs = [p[0] for p in bbox]
                                 cx = sum(xs) / len(xs)
                                 if (cx / max(1.0, W)) > _ROI_X_MAX:
                                     continue
                             except Exception:
                                 pass
 
-                        # If it looks Latin and confidence is "meh", try English model on the crop only
-                        if self.ocr_en and _ascii_ratio(best_txt) >= 0.6 and best_conf < 0.85:
-                            crop = _crop_from_poly(frame, poly, pad=3)
-                            if crop.size > 0:
-                                res_en = self.ocr_en.ocr(crop, cls=True)
-                                # res_en => [ [ [box, (txt, conf)], ... ] ]
-                                if isinstance(res_en, list) and res_en and isinstance(res_en[0], list) and res_en[0]:
-                                    _, (txt_en, conf_en) = res_en[0][0]
-                                    try:
-                                        conf_en = float(conf_en)
-                                        if conf_en > best_conf:
-                                            best_txt, best_conf = str(txt_en), conf_en
-                                    except Exception:
-                                        pass
-
                         # Dynamic thresholds
-                        is_latin = _ascii_ratio(best_txt) >= 0.7
-                        keep = (best_conf >= 0.85) if is_latin else (
-                            best_conf >= _OCR_CONF or
-                            (best_conf >= 0.70 and _cjk_count(best_txt) >= 16)
+                        is_latin = _ascii_ratio(txt) >= 0.7
+                        keep = (conf >= 0.85) if is_latin else (
+                            conf >= _OCR_CONF or
+                            (conf >= 0.70 and _cjk_count(txt) >= 16)
                         )
+                        
                         if keep:
                             # Normalize trivial typos (Latin)
-                            best_txt = _postfix_terms([best_txt])[0]
+                            txt = _postfix_terms([txt])[0]
                             out.append({
-                                "text": best_txt,
-                                "conf": best_conf,
-                                "box": poly,
+                                "text": txt,
+                                "conf": conf,
+                                "box": bbox,
                                 "w": W, "h": H
                             })
 
+                    except Exception as e:
+                        print(f"⚠️ OCR token processing error: {e}")
+                        continue
+
             except Exception as e:
-                print(f"⚠️ OCR processing error: {e}")
+                print(f"⚠️ OCR frame processing error: {e}")
                 continue
 
         return out
@@ -625,7 +578,7 @@ class OCRProcessor:
 
     def _run_ocr(self, frames: List[np.ndarray]) -> List[str]:
         """Original method kept for compatibility (now line-level)"""
-        tokens = self._run_ocr_paddle(frames)
+        tokens = self._run_ocr_easyocr(frames)
         lines = self._group_tokens_into_lines(tokens, y_tol_ratio=_Y_TOL_RATIO, x_gap_ratio=_X_GAP_RATIO)
         lines = _postfix_terms(_unique_filtered_texts(lines))
         return lines
