@@ -50,13 +50,10 @@ COPY requirements.txt constraints.txt /app/
 COPY . .
 
 # -------------------- Python deps --------------------
-# CRITICAL: Pin NumPy to 1.x for PyTorch 2.1.2 compatibility (NumPy 2.x will crash)
-RUN python -m pip install --no-cache-dir "numpy>=1.24,<2.0"
-
 # Install Redis Python client (required by Flask app and Celery)
 RUN python -m pip install --no-cache-dir redis
 
-# Install requirements (PyTorch will be installed separately)
+# Install requirements (PyTorch and NumPy will be installed separately after)
 RUN python -m pip install --no-cache-dir \
     -r /app/requirements.txt -c /app/constraints.txt || true
 
@@ -65,6 +62,9 @@ RUN python -m pip install --no-cache-dir \
 RUN pip3 install --no-cache-dir --force-reinstall \
     torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 \
     --index-url https://download.pytorch.org/whl/cu118
+
+# CRITICAL: Force NumPy 1.26.4 AFTER PyTorch to lock it down (prevent any upgrades to 2.x)
+RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
 # -------------------- Whisper stack (CUDA 11.8 + cuDNN 8) --------------------
 # Install PyAV with pre-built wheel
