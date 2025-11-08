@@ -50,7 +50,11 @@ COPY requirements.txt constraints.txt /app/
 COPY . .
 
 # -------------------- Python deps --------------------
-RUN python -m pip install --no-cache-dir numpy==1.26.4
+# CRITICAL: Pin NumPy to 1.x for PyTorch 2.1.2 compatibility (NumPy 2.x will crash)
+RUN python -m pip install --no-cache-dir "numpy>=1.24,<2.0"
+
+# Install Redis Python client (required by Flask app and Celery)
+RUN python -m pip install --no-cache-dir redis
 
 # Install requirements (PyTorch will be installed separately)
 RUN python -m pip install --no-cache-dir \
