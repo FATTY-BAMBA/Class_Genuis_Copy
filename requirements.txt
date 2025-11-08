@@ -1,10 +1,10 @@
 # ==============================================================================
-# PyTorch GPU wheels (CUDA 11.8) – MUST stay at the top for Dockerfile stage-1
+# PyTorch GPU wheels (CUDA 11.8) – CRITICAL: 2.1.2 for EasyOCR + cuDNN 8.7 compatibility
 # ==============================================================================
 --extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.2.2
-torchvision==0.17.2
-torchaudio==2.2.2
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
 
 # ==================== CORE FRAMEWORKS ====================
 Flask==2.3.3
@@ -18,12 +18,14 @@ pydantic>=2.0.0
 # ==================== AI / NLP ====================
 openai==1.55.3
 azure-ai-inference
+
 # These will be installed separately in Dockerfile to manage dependencies
 # faster-whisper==0.10.1
 # ctranslate2==3.24.0
 # transformers and tokenizers will be auto-resolved by faster-whisper
 # transformers==4.19.4
 # tokenizers==0.15.2
+
 sentencepiece>=0.2.0,<0.3
 torchmetrics>=1.4.0
 lightning>=2.4.0
@@ -55,6 +57,7 @@ rapidfuzz==3.13.0
 visualdl==2.5.3
 
 # ==================== UTILITIES ====================
+# CRITICAL: NumPy 1.26.4 is required for PyTorch 2.1.2 (will crash with NumPy 2.x)
 numpy==1.26.4
 protobuf>=3.20.0,<4
 llvmlite==0.43.0
