@@ -28,7 +28,7 @@ azure-ai-inference
 
 sentencepiece>=0.2.0,<0.3
 torchmetrics>=1.4.0
-lightning>=2.4.0
+lightning>=2.2.0 
 peft>=0.17.1
 optimum>=1.21.0
 evaluate>=0.4.1
