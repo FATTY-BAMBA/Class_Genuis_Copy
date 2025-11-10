@@ -90,6 +90,9 @@ RUN python -m pip install --no-cache-dir \
 # Now that we have compatible PyTorch 2.1.2, install EasyOCR normally
 RUN python -m pip install --no-cache-dir easyocr==1.7.1
 
+# CRITICAL: EasyOCR upgrades numpy to 2.x, force it back to 1.26.4
+RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
+
 # Verify installations
 RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
     python -c "import av; print('✅ PyAV:', av.__version__)" && \
