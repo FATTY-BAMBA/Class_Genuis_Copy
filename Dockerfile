@@ -53,18 +53,26 @@ COPY . .
 # Install Redis Python client and async-timeout (required by redis-py)
 RUN python -m pip install --no-cache-dir redis async-timeout
 
-# Install requirements (PyTorch and NumPy will be installed separately after)
-RUN python -m pip install --no-cache-dir \
-    -r /app/requirements.txt -c /app/constraints.txt || true
-
-# -------------------- Install PyTorch 2.1.2 (CUDA 11.8) - PROVEN CONFIG --------------------
+# -------------------- Install PyTorch 2.1.2 (CUDA 11.8) - MUST BE FIRST --------------------
 # This exact version is verified to work with EasyOCR + CUDA 11.8 + cuDNN 8.7
 RUN pip3 install --no-cache-dir --force-reinstall \
     torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# CRITICAL: Force NumPy 1.26.4 AFTER PyTorch to lock it down (prevent any upgrades to 2.x)
+# CRITICAL: Force NumPy 1.26.4 AFTER PyTorch to lock it down
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
+
+# -------------------- Core App Dependencies (Flask, etc) --------------------
+RUN python -m pip install --no-cache-dir \
+    Flask==2.3.3 \
+    gunicorn==23.0.0 \
+    python-dotenv==1.0.1 \
+    requests==2.32.3 \
+    pycairo \
+    opencc-python-reimplemented==0.1.7 \
+    "pydantic>=2.0.0" \
+    "openai==1.55.3" \
+    "azure-ai-inference"
 
 # -------------------- Whisper stack (CUDA 11.8 + cuDNN 8) --------------------
 # Install PyAV with pre-built wheel
@@ -76,29 +84,67 @@ RUN python -m pip install --no-cache-dir ctranslate2==3.24.0
 # Install faster-whisper 0.10.1 WITHOUT dependencies
 RUN python -m pip install --no-cache-dir --no-deps faster-whisper==0.10.1
 
-# Add back required dependencies
+# Add back required dependencies for faster-whisper
 RUN python -m pip install --no-cache-dir \
     onnxruntime \
     "huggingface-hub>=0.13"
 
 RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
 
-RUN python -m pip install --no-cache-dir \
-    "transformers==4.36.2" -c /app/constraints.txt
+RUN python -m pip install --no-cache-dir "transformers==4.36.2"
 
 # -------------------- EasyOCR (GPU, with proven PyTorch 2.1.2) --------------------
-# Now that we have compatible PyTorch 2.1.2, install EasyOCR normally
+# Now that we have compatible PyTorch 2.1.2, install EasyOCR
 RUN python -m pip install --no-cache-dir easyocr==1.7.1
 
 # CRITICAL: EasyOCR upgrades numpy to 2.x, force it back to 1.26.4
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
-# Verify installations
+# -------------------- Additional dependencies from requirements.txt --------------------
+# Install remaining packages (skip torch, numpy, and packages already installed)
+RUN python -m pip install --no-cache-dir \
+    "sentencepiece<0.3,>=0.2.0" \
+    "torchmetrics>=1.4.0" \
+    "lightning>=2.2.0" \
+    "peft>=0.17.1" \
+    "optimum>=1.21.0" \
+    "evaluate>=0.4.1" \
+    "gradio>=4.29.0" \
+    "loralib>=0.1.2" \
+    Cython==0.29.36 \
+    "google-generativeai==0.8.3" \
+    "hf_transfer>=0.1.5" \
+    "opencv-python-headless==4.7.0.72" \
+    Pillow==9.5.0 \
+    attrdict==2.0.1 \
+    "beautifulsoup4==4.13.4" \
+    "fire==0.7.1" \
+    "fonttools==4.51.0" \
+    "imgaug==0.4.0" \
+    "lmdb==1.7.3" \
+    "openpyxl==3.1.5" \
+    "pdf2docx==0.5.8" \
+    "premailer==3.10.0" \
+    "PyMuPDF==1.19.0" \
+    "rapidfuzz==3.13.0" \
+    "visualdl==2.5.3" \
+    "protobuf<4,>=3.20.0" \
+    "llvmlite==0.43.0" \
+    "numba==0.60.0" \
+    "tqdm==4.67.1" \
+    "scipy==1.10.1" || true
+
+# Final NumPy lock (ensure 1.26.4 after all installs)
+RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
+
+# -------------------- Verify installations --------------------
 RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
+    python -c "import numpy; print('✅ NumPy:', numpy.__version__)" && \
     python -c "import av; print('✅ PyAV:', av.__version__)" && \
     python -c "import ctranslate2; print('✅ ctranslate2:', ctranslate2.__version__)" && \
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
-    python -c "import faster_whisper; print('✅ faster-whisper:', faster_whisper.__version__)"
+    python -c "import faster_whisper; print('✅ faster-whisper:', faster_whisper.__version__)" && \
+    python -c "import flask; print('✅ Flask:', flask.__version__)"
 
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python -c "import sys, pathlib, site; \
