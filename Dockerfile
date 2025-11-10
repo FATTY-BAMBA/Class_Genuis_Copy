@@ -50,8 +50,8 @@ COPY requirements.txt constraints.txt /app/
 COPY . .
 
 # -------------------- Python deps --------------------
-# Install Redis Python client (required by Flask app and Celery)
-RUN python -m pip install --no-cache-dir redis
+# Install Redis Python client and async-timeout (required by redis-py)
+RUN python -m pip install --no-cache-dir redis async-timeout
 
 # Install requirements (PyTorch and NumPy will be installed separately after)
 RUN python -m pip install --no-cache-dir \
