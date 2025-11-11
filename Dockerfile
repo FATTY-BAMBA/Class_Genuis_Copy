@@ -64,6 +64,7 @@ RUN python -m pip install --no-cache-dir \
     celery \
     redis \
     async-timeout \
+    tenacity \
     python-dotenv==1.0.1 \
     requests==2.32.3 \
     pycairo \
@@ -134,6 +135,7 @@ RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', t
     python -c "import numpy; print('✅ NumPy:', numpy.__version__)" && \
     python -c "import flask; print('✅ Flask:', flask.__version__)" && \
     python -c "import celery; print('✅ Celery:', celery.__version__)" && \
+    python -c "import tenacity; print('✅ Tenacity:', tenacity.__version__)" && \
     python -c "import av; print('✅ PyAV:', av.__version__)" && \
     python -c "import ctranslate2; print('✅ ctranslate2:', ctranslate2.__version__)" && \
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
