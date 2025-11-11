@@ -117,7 +117,7 @@ RUN python -m pip install --no-cache-dir \
     openpyxl==3.1.5 \
     pdf2docx==0.5.8 \
     premailer==3.10.0 \
-    PyMuPDF==1.19.0 \
+    "PyMuPDF>=1.23.0" \
     rapidfuzz==3.13.0 \
     visualdl==2.5.3 \
     "protobuf<4,>=3.20.0" \
