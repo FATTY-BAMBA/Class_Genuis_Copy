@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+
 # Optional Azure AI Inference imports (only if used)
 try:
     from azure.ai.inference import ChatCompletionsClient
@@ -1280,12 +1281,19 @@ def generate_chapters_debug(
         if progress_callback:
             progress_callback("completed", 100)
 
-        return (raw_llm_text, parsed_raw_clean_trad, chapters_final)
+        # Return 4-tuple: (raw_text, parsed_chapters, final_chapters, metadata)
+        return (raw_llm_text, parsed_raw_clean_trad, chapters_final, metadata)  # ← FIXED!
 
     except Exception as e:
         logger.error(f"Chapter generation failed: {e}", exc_info=True)
         fallback = ensure_traditional_chapters(create_time_based_fallback(int(duration)))
-        return ("", {}, fallback)
+        # Return fallback with empty metadata
+        fallback_metadata = {
+            'generation_method': 'time_based_fallback',
+            'educational_quality_score': 0.0,
+            'course_summary': {}
+        }
+        return ("", {}, fallback, fallback_metadata)  # ← FIXED!
         
 # ─────────────────────────
 # MAIN FUNCTIONS
@@ -1310,24 +1318,29 @@ def generate_chapters(
     progress_callback: Optional[Callable[[str, int], None]] = None,
     *,
     ocr_context_override: Optional[str] = None,
-    # NEW: Add the same parameter here for consistency
-    force_generation_method: Optional[str] = None,  # 'hierarchical' or 'single_pass'
-) -> Dict[str, str]:
+    force_generation_method: Optional[str] = None,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:  # ← FIXED: Return tuple
     """
-    Backward-compatible wrapper returning only the FINAL balanced chapters.
-    If you want raw model output as well, call `generate_chapters_debug` instead.
+    Generate chapters and return (chapters_dict, metadata).
+    
+    For backward compatibility with old code that expects just chapters dict,
+    you can use: chapters, _ = generate_chapters(...)
+    
+    Returns:
+        Tuple of (chapters_dict, metadata)
     """
-    _raw_text, _parsed_raw, final_chapters = generate_chapters_debug(
+    _raw_text, _parsed_raw, final_chapters, metadata = generate_chapters_debug(  # ← FIXED: Unpack 4 values
         raw_asr_text=raw_asr_text,
         ocr_segments=ocr_segments,
         duration=duration,
         video_id=video_id,
+        video_title=video_title,  # ← Make sure this is passed
         run_dir=run_dir,
         progress_callback=progress_callback,
         ocr_context_override=ocr_context_override,
-        force_generation_method=force_generation_method  # Pass through the new parameter
+        force_generation_method=force_generation_method
     )
-    return final_chapters
+    return final_chapters, metadata  # ← FIXED: Return tuple
 
 # ─────────────────────────
 # CLI
