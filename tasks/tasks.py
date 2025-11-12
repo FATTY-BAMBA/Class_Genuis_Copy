@@ -716,10 +716,16 @@ def combine_for_prompt(audio_segments, ocr_segments) -> str:
 # ==================== Celery Tasks (named to match task_routes) ====================
 
 @celery.task(name="tasks.generate_qa_and_notes")
-def generate_qa_and_notes(processing_result, video_info, raw_asr_text):
+def generate_qa_and_notes(
+    processing_result, 
+    video_info, 
+    raw_asr_text,
+    chapters_dict=None,           # ← ADD THIS
+    hierarchical_metadata=None    # ← ADD THIS
+):
     """
     Generate Q&A and notes using *raw ASR* (ASR-first) + simple OCR context,
-    matching the policy used by chapter generation.
+    with optional chapter metadata for enhanced quality.
     """
     from app.qa_generation import process_text_for_qa_and_notes, result_to_legacy_client_format
 
@@ -731,15 +737,24 @@ def generate_qa_and_notes(processing_result, video_info, raw_asr_text):
     ocr_segments = processing_result.get("ocr_segments_filtered", processing_result.get("ocr_segments", []))
     method = processing_result.get("method", "unknown")
 
+    # ← ADD LOGGING FOR METADATA
+    if hierarchical_metadata:
+        logger.info("✅ Received hierarchical_metadata from chapter generation")
+        logger.info(f"   • Educational quality score: {hierarchical_metadata.get('educational_quality_score', 0):.2f}")
+    else:
+        logger.warning("⚠️  No hierarchical_metadata provided - using limited context")
+    
     logger.info("📚 Generating Q&A (ASR-first; chapters come from video_chaptering)")
     logger.info(f"📊 Input: raw_asr_len={len(raw_asr_text)}, ocr_segments={len(ocr_segments)}")
 
     try:
         # Get the raw EducationalContentResult object
         qa_result_obj = process_text_for_qa_and_notes(
-            raw_asr_text=raw_asr_text,     # ← ASR-first prompt sourcex
-            ocr_segments=ocr_segments,     # ← pass OCR as list (adapter will flatten)
+            raw_asr_text=raw_asr_text,
+            ocr_segments=ocr_segments,
             video_title=video_info.get("OriginalFilename"),
+            chapters=chapters_dict,                    # ← ADD THIS LINE
+            hierarchical_metadata=hierarchical_metadata,  # ← ADD THIS LINE
             num_questions=10,
             num_pages=3,
             id=video_info["Id"],
@@ -1051,18 +1066,37 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
               # -----------------------------------------------------------------------
 
         chaptering_result = generate_chapters(
-            raw_asr_text=raw_asr_text,   # raw ASR string
-            ocr_segments=ocr_filtered,   # OCR segments (chapterer formats as needed)
+            raw_asr_text=raw_asr_text,
+            ocr_segments=ocr_filtered,
             video_title=video_info.get("OriginalFilename"),
             duration=duration,
             video_id=video_info["Id"],
-            #video_title=video_info.get("OriginalFilename"),
-            run_dir=Path(run_dir)        # chapterer writes its debug/outputs here
+            run_dir=Path(run_dir)
         )
+        
+        # ← ADD THIS: Extract chapters and metadata from chaptering_result
+        logger.info("📊 Extracting chapter metadata for Q&A generation...")
+        
+        # chaptering_result structure: (chapters_dict, metadata)
+        if isinstance(chaptering_result, tuple) and len(chaptering_result) == 2:
+            chapters_dict, chapter_metadata = chaptering_result
+            logger.info(f"✅ Received {len(chapters_dict)} chapters and metadata")
+            logger.info(f"   • Metadata keys: {list(chapter_metadata.keys())}")
+        else:
+            # Fallback for old format (just dict of chapters)
+            chapters_dict = chaptering_result if isinstance(chaptering_result, dict) else {}
+            chapter_metadata = None
+            logger.warning("⚠️  Chapter generation returned old format (no metadata)")
 
         # ---- Q&A + notes ----
         logger.info("📚 Generating Q&A and lecture notes (ASR-first)...")
-        qa_result = generate_qa_and_notes(processing_result, video_info, raw_asr_text)
+        qa_result = generate_qa_and_notes(
+            processing_result, 
+            video_info, 
+            raw_asr_text,
+            chapters_dict=chapters_dict,           # ← ADD THIS
+            hierarchical_metadata=chapter_metadata  # ← ADD THIS
+        )
 
         if qa_result:
             total_processing_time = time.time() - processing_start_time
@@ -1108,15 +1142,33 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 logger.warning("⚠️ Failed writing combined_text_for_gpt.txt: %s", _e)
 
             # Get chapters from the chaptering result and merge into final payload
-            chapters = chaptering_result  # Get actual chapters from chaptering
-            if not chapters:
-                logger.warning("⚠️ No chapters returned by chapter generation; using empty list")
-                chapters = {}
-            # Merge chapters into the final payload
-            qa_result["chapters"] = chapters
+            # ============ MERGE CHAPTERS INTO FINAL PAYLOAD ============
+            # Use chapters_dict that was already extracted earlier (line ~800)
+            if not chapters_dict:
+                logger.warning("⚠️ No chapters returned; using empty dict")
+                chapters_dict = {}
+            
+            qa_result["chapters"] = chapters_dict
+            
+            # Optional: Add metadata summary for analytics/debugging
+            if chapter_metadata:
+                qa_result["chapter_metadata"] = {
+                    "generation_method": chapter_metadata.get("generation_method"),
+                    "educational_quality_score": chapter_metadata.get("educational_quality_score"),
+                    "strategy": chapter_metadata.get("strategy"),
+                    "token_usage": chapter_metadata.get("token_usage")
+                }
+                logger.info(f"📊 Added chapter metadata to payload (quality: {chapter_metadata.get('educational_quality_score', 0):.2f})")
 
+            # Save chapters separately
             with open(os.path.join(run_dir, "chapters.json"), "w", encoding="utf-8") as f:
-                json.dump(chapters, f, indent=2, ensure_ascii=False)
+                json.dump(chapters_dict, f, indent=2, ensure_ascii=False)
+            
+            # Save metadata separately for debugging
+            if chapter_metadata:
+                with open(os.path.join(run_dir, "chapter_metadata.json"), "w", encoding="utf-8") as f:
+                    json.dump(chapter_metadata, f, indent=2, ensure_ascii=False)
+                logger.info(f"💾 Saved chapter metadata to: {run_dir}/chapter_metadata.json")
 
             output_path = os.path.join(run_dir, "qa_and_notes.json")
             with open(output_path, "w", encoding="utf-8") as f:
