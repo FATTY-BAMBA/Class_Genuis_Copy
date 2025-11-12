@@ -542,6 +542,76 @@ def parse_topics_summary_response(response_text: str) -> tuple[List[Dict], str, 
     logger.info(f"Parsed {len(topics)} topics, summary: {len(global_summary)} chars, {len(key_takeaways)} takeaways")
     return topics, global_summary, key_takeaways
 
+def parse_modules_to_topics(modules_analysis: str) -> List[Dict]:
+    """
+    Parse modules_analysis from chapter generation into topics format.
+    
+    Args:
+        modules_analysis: Text like "模塊1：基礎工具操作 ~ 00:00-00:25 ~ 介面、工具 ~ 理論+演示"
+    
+    Returns:
+        List of topic dicts compatible with topics_list format
+    """
+    topics = []
+    
+    if not modules_analysis or not modules_analysis.strip():
+        return topics
+    
+    # Parse each line
+    lines = modules_analysis.strip().split('\n')
+    
+    for i, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith('#') or line.startswith('-'):
+            continue
+        
+        # Try to parse format: "模塊名稱 ~ 時間範圍 ~ 核心學習點 ~ 教學方法"
+        parts = [p.strip() for p in line.split('~')]
+        
+        if len(parts) >= 3:
+            module_name = parts[0]
+            time_range = parts[1] if len(parts) > 1 else ""
+            learning_points = parts[2] if len(parts) > 2 else ""
+            teaching_method = parts[3] if len(parts) > 3 else ""
+            
+            # Clean module name (remove "模塊1：" prefix if present)
+            module_name = re.sub(r'^模塊\d+[：:]\s*', '', module_name)
+            
+            # Extract keywords from learning points
+            keywords = [kw.strip() for kw in learning_points.split('、') if kw.strip()][:5]
+            
+            # Build summary
+            summary_parts = []
+            if learning_points:
+                summary_parts.append(learning_points)
+            if teaching_method:
+                summary_parts.append(f"教學方式：{teaching_method}")
+            summary = '，'.join(summary_parts)
+            
+            topics.append({
+                "id": str(i).zfill(2),
+                "title": module_name,
+                "summary": summary,
+                "keywords": keywords,
+                "time_range": time_range  # Extra info for context
+            })
+    
+    # If parsing failed, try simpler format
+    if not topics:
+        for i, line in enumerate(lines, 1):
+            line = line.strip()
+            if line and not line.startswith('#') and not line.startswith('-'):
+                # Use the whole line as title
+                topics.append({
+                    "id": str(i).zfill(2),
+                    "title": line[:100],  # Limit length
+                    "summary": "從章節模塊提取的教學主題",
+                    "keywords": []
+                })
+    
+    logger.info(f"Parsed {len(topics)} topics from modules_analysis")
+    return topics
+    
 def validate_topics_output(data: Dict) -> tuple[bool, List[str]]:
     """
     Validate the structure of parsed topics/summary data.
@@ -632,10 +702,23 @@ def build_mcq_prompt_v2(
                 f"- 難度級別：{course_summary.get('difficulty', '')}"
             ])
         
+        # Add structure analysis (PASS 1 insights)
+        structure_analysis = hierarchical_metadata.get('structure_analysis', '')
+        if structure_analysis:
+            # Extract key points from structure (limit length)
+            structure_summary = structure_analysis[:500] + "..." if len(structure_analysis) > 500 else structure_analysis
+            global_ctx.append(f"- 課程結構分析：{structure_summary}")
+        
         # Add module analysis for question distribution guidance
         modules_analysis = hierarchical_metadata.get('modules_analysis', '')
         if modules_analysis:
-            global_ctx.append(f"- 教學模組分析：{modules_analysis}")
+            global_ctx.append(f"- 教學模組劃分：\n{modules_analysis}")
+        
+        # Add quality score for context
+        quality_score = hierarchical_metadata.get('educational_quality_score', 0)
+        if quality_score > 0:
+            quality_label = "高" if quality_score > 0.7 else "中" if quality_score > 0.4 else "基礎"
+            global_ctx.append(f"- 教育品質評分：{quality_score:.2f} ({quality_label})")
             
     if chap_lines:
         global_ctx.append("- 章節：\n" + "\n".join(chap_lines))
@@ -769,7 +852,7 @@ def build_lecture_notes_prompt_v2(
     if global_summary.strip():
         global_ctx.append(f"- 摘要：{global_summary.strip()}")
     
-    # NEW: Add hierarchical metadata to global context
+    # Add hierarchical metadata to global context
     if hierarchical_metadata:
         course_summary = hierarchical_metadata.get('course_summary', {})
         if course_summary:
@@ -780,6 +863,18 @@ def build_lecture_notes_prompt_v2(
                 f"- 目標學員：{course_summary.get('target_audience', '')}",
                 f"- 難度級別：{course_summary.get('difficulty', '')}"
             ])
+        
+        # Add structure analysis for better context
+        structure_analysis = hierarchical_metadata.get('structure_analysis', '')
+        if structure_analysis:
+            # Extract teaching objectives
+            structure_summary = structure_analysis[:500] + "..." if len(structure_analysis) > 500 else structure_analysis
+            global_ctx.append(f"- 課程架構：{structure_summary}")
+        
+        # Add module breakdown
+        modules_analysis = hierarchical_metadata.get('modules_analysis', '')
+        if modules_analysis:
+            global_ctx.append(f"- 模組架構：\n{modules_analysis}")
     
     if chap_lines:
         global_ctx.append("- 章節：\n" + "\n".join(chap_lines))
@@ -1640,13 +1735,14 @@ def generate_educational_content(
     raw_asr_text: str,
     ocr_segments: Union[List[Dict], str],
     video_id: str,
-    video_title: Optional[str] = None,  # ← ADD THIS HERE
+    video_title: Optional[str] = None,
     run_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[str, int], None]] = None,
     *,
     # NEW PARAMETERS
     chapters: Optional[Dict[str, str]] = None,  # {"00:10:17": "[課程導入] 課程開始"}
-    course_summary: Optional[Dict[str, str]] = None,  # From video_chaptering
+    course_summary: Optional[Dict[str, str]] = None,  # DEPRECATED: Use hierarchical_metadata instead
+    hierarchical_metadata: Optional[Dict] = None,  # ← ADD THIS! Full metadata from chapter generation
     # Existing parameters
     shuffle_options: bool = False,
     regenerate_explanations: bool = False,
@@ -1656,8 +1752,13 @@ def generate_educational_content(
 ) -> EducationalContentResult:
     """
     Main function to generate educational content from pre-processed segments.
-    Post-processing behavior is controlled by function parameters (no env vars).
+    
+    Args:
+        hierarchical_metadata: Full metadata from video_chaptering.hierarchical_multipass_generation()
+                              Contains: structure_analysis, modules_analysis, course_summary, 
+                              educational_quality_score, token_usage
     """
+    
     report("initializing", progress_callback)
 
     if run_dir is None:
@@ -1709,11 +1810,70 @@ def generate_educational_content(
         ctx_budget = MODEL_BUDGETS.get(model, 100_000)
 
         # ========================================================================
-        # Topic Extraction - SKIP if we have course_summary from chapters
+        # Topic Extraction - Use metadata if available, else extract
         # ========================================================================
-        if course_summary:
-            # Use provided data from chapter generation
-            logger.info("📊 Using course summary from chapter generation, skipping extraction")
+        
+        # Priority 1: Use full hierarchical_metadata (best)
+        if hierarchical_metadata and hierarchical_metadata.get('modules_analysis'):
+            logger.info("=" * 60)
+            logger.info("📊 Using FULL hierarchical metadata from chapter generation")
+            logger.info("   ✅ Skipping LLM call - using existing analysis")
+            logger.info("=" * 60)
+            
+            # Extract rich context from metadata
+            structure_analysis = hierarchical_metadata.get('structure_analysis', '')
+            modules_analysis = hierarchical_metadata.get('modules_analysis', '')
+            course_summary_data = hierarchical_metadata.get('course_summary', {})
+            quality_score = hierarchical_metadata.get('educational_quality_score', 0)
+            
+            # Parse modules into topics
+            topics_list = parse_modules_to_topics(modules_analysis)
+            
+            # Build global summary from multiple sources
+            summary_parts = []
+            if course_summary_data.get('topic'):
+                summary_parts.append(course_summary_data['topic'])
+            if course_summary_data.get('core_content'):
+                summary_parts.append(f"核心內容包括{course_summary_data['core_content']}")
+            if course_summary_data.get('learning_objectives'):
+                summary_parts.append(course_summary_data['learning_objectives'])
+            
+            global_summary = "。".join(summary_parts) if summary_parts else "教學課程內容"
+            
+            # Extract key takeaways
+            key_takeaways = []
+            if course_summary_data.get('learning_objectives'):
+                key_takeaways.append(course_summary_data['learning_objectives'])
+            if structure_analysis and '學習目標' in structure_analysis:
+                # Try to extract learning goals from structure analysis
+                goals_match = re.search(r'學習目標[：:](.*?)(?:\n|$)', structure_analysis)
+                if goals_match:
+                    key_takeaways.append(goals_match.group(1).strip())
+            
+            if not key_takeaways:
+                key_takeaways = [f"掌握{t['title']}" for t in topics_list[:3]]
+            
+            logger.info(f"✅ Extracted from metadata:")
+            logger.info(f"   • Topics: {len(topics_list)}")
+            logger.info(f"   • Quality score: {quality_score}")
+            logger.info(f"   • Summary: {global_summary[:100]}...")
+            
+            # Save extracted info for debugging
+            with open(run_dir / "metadata_extracted_topics.json", "w", encoding="utf-8") as f:
+                json.dump({
+                    "topics": topics_list,
+                    "global_summary": global_summary,
+                    "key_takeaways": key_takeaways,
+                    "source": "hierarchical_metadata"
+                }, f, ensure_ascii=False, indent=2)
+        
+        # Priority 2: Fallback to course_summary only (limited)
+        elif course_summary:
+            logger.info("=" * 60)
+            logger.info("📊 Using LIMITED course_summary (backward compatibility)")
+            logger.info("   ⚠️  Consider passing full hierarchical_metadata for better results")
+            logger.info("=" * 60)
+            
             # Convert course_summary to expected format
             topics_list = []
             if course_summary.get('core_content'):
@@ -1728,13 +1888,17 @@ def generate_educational_content(
                     })
                     
             global_summary = f"{course_summary.get('topic', '')}課程，{course_summary.get('core_content', '')}。{course_summary.get('learning_objectives', '')}"
-            key_takeaways = [course_summary.get('learning_objectives', '')]
-    
-           # Skip the progress report since we're not actually calling LLM             
+            key_takeaways = [course_summary.get('learning_objectives', '')] if course_summary.get('learning_objectives') else []
+            
+            logger.info(f"✅ Extracted from course_summary: {len(topics_list)} topics")
+            
+        # Priority 3: Extract topics ourselves (slowest)
         else:
-            # Original topic extraction code
             report("generating_topics_summary", progress_callback)
-            logger.info("📊 Extracting topics and generating global summary")
+            logger.info("=" * 60)
+            logger.info("📊 NO metadata provided - extracting topics from transcript")
+            logger.info("   ⏱️  This will take extra time (~5-10 seconds)")
+            logger.info("=" * 60)
             
             # Calculate budget for topic extraction
             topics_prompt_template_tokens = count_tokens_llama(
@@ -1773,17 +1937,17 @@ def generate_educational_content(
             topics_list, global_summary, key_takeaways = parse_topics_summary_response(topics_output)
 
             # Log extraction results
-            logger.info(f"✅ Extracted {len(topics_list)} topics with global summary")
-            if key_takeaways:
-                logger.info(f"✅ Identified {len(key_takeaways)} key takeaways")
+            logger.info(f"✅ Extracted via LLM: {len(topics_list)} topics")
                 
             # Save topics to file for debugging
             with open(run_dir / "extracted_topics.json", "w", encoding="utf-8") as f:
                 json.dump({
                     "topics": topics_list,
                     "global_summary": global_summary,
-                    "key_takeaways": key_takeaways
+                    "key_takeaways": key_takeaways,
+                    "source": "llm_extraction"
                 }, f, ensure_ascii=False, indent=2)
+                
 
         # ========================================================================
         # UPDATED: MCQ Generation with Topics and Summary
@@ -1809,6 +1973,7 @@ def generate_educational_content(
             num_questions=config.max_questions,
             chapters=formatted_chapters,
             global_summary=global_summary, 
+            hierarchical_metadata=hierarchical_metadata,
         )
 
         logger.info(f"MCQ prompt approx tokens: {count_tokens_llama(final_mcq_prompt):,}")
@@ -1865,6 +2030,7 @@ def generate_educational_content(
             chapters=formatted_chapters,
             topics=topics_list,
             global_summary=global_summary,
+            hierarchical_metadata=hierarchical_metadata,
         )
         logger.info(f"📘 Generating {config.max_notes_pages} pages of lecture notes with validation")
 
@@ -1951,6 +2117,8 @@ def process_text_for_qa_and_notes(
     audio_segments: Optional[List[Dict]] = None,
     ocr_segments: Optional[List[Dict]] = None,
     video_title: Optional[str] = None,  # ← ADD THIS
+    chapters: Optional[Dict[str, str]] = None,  # ← ADD THIS
+    hierarchical_metadata: Optional[Dict] = None,
     num_questions: int = 10,
     num_pages: int = 3,
     id: str = "",
@@ -1990,6 +2158,8 @@ def process_text_for_qa_and_notes(
             ocr_segments=ocr_segments,          # ← simple OCR (list or string)
             video_id=id or "video",
             video_title=video_title,  # ← ADD THIS
+            chapters=chapters,  # ← ADD THIS
+            hierarchical_metadata=hierarchical_metadata,
             run_dir=None,
             progress_callback=None,
             shuffle_options=False,
