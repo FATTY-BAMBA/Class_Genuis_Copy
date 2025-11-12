@@ -650,27 +650,84 @@ def hierarchical_multipass_generation(
     raw_asr_text: str,
     duration: float,
     ocr_context: str,
-    video_title: Optional[str],  # ADD THIS
+    video_title: Optional[str],
     client: Any,
     config: ChapterConfig,
     progress_callback: Optional[Callable[[str, int], None]] = None
 ) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
     """
-    Three-pass hierarchical generation for high-quality educational chapters
+    Three-pass hierarchical generation for high-quality educational chapters.
+    
+    Strategy:
+    - ASR provides primary timing (instructor's natural teaching flow)
+    - OCR provides supporting detail (slide content, technical terms, visual context)
+    
+    Token Budget:
+    - ASR: 100,000 tokens per pass (primary source)
+    - OCR: 15,000 tokens per pass (supporting detail)
+    - Total: ~115,000 content + ~2,000 instructions = ~117,000 tokens (safe for GPT-4o's 128k context)
+    
     Returns: (raw_llm_text, chapters, metadata)
     """
     
-    # PASS 1: Course Structure Analysis (10% of budget)
+    # ==================== Token Budget Initialization ====================
+    ASR_LIMIT = 100_000   # ASR transcript limit per pass
+    OCR_LIMIT = 15_000    # OCR context limit per pass
+    
+    asr_tokens = count_tokens_llama(raw_asr_text)
+    ocr_tokens = count_tokens_llama(ocr_context) if ocr_context else 0
+    total_content_tokens = asr_tokens + ocr_tokens
+    
+    logger.info("=" * 60)
+    logger.info("🎓 HIERARCHICAL MULTI-PASS CHAPTER GENERATION")
+    logger.info("   Strategy: ASR-primary (timing) + OCR-supporting (detail)")
+    logger.info("=" * 60)
+    logger.info(f"📊 Original ASR tokens: {asr_tokens:,} (limit: {ASR_LIMIT:,})")
+    logger.info(f"📊 Original OCR tokens: {ocr_tokens:,} (limit: {OCR_LIMIT:,})")
+    logger.info(f"📊 Total content tokens: {total_content_tokens:,}")
+    logger.info(f"📊 Video duration: {sec_to_hms(int(duration))}")
+    
+    # Truncate once, reuse in all passes for consistency
+    asr_text = truncate_text_by_tokens(raw_asr_text, ASR_LIMIT)
+    ocr_text = truncate_text_by_tokens(ocr_context, OCR_LIMIT) if ocr_context else ""
+    
+    asr_used = count_tokens_llama(asr_text)
+    ocr_used = count_tokens_llama(ocr_text)
+    content_used = asr_used + ocr_used
+    
+    asr_coverage = (asr_used / asr_tokens * 100) if asr_tokens > 0 else 100
+    ocr_coverage = (ocr_used / ocr_tokens * 100) if ocr_tokens > 0 else 100
+    
+    logger.info(f"✅ Using per pass:")
+    logger.info(f"   • ASR: {asr_used:,} tokens ({asr_coverage:.1f}% of original)")
+    logger.info(f"   • OCR: {ocr_used:,} tokens ({ocr_coverage:.1f}% of original)")
+    logger.info(f"   • Total: {content_used:,} tokens")
+    
+    if asr_tokens > ASR_LIMIT:
+        logger.warning(f"⚠️ ASR truncated from {asr_tokens:,} to {asr_used:,} tokens")
+    if ocr_tokens > OCR_LIMIT:
+        logger.warning(f"⚠️ OCR truncated from {ocr_tokens:,} to {ocr_used:,} tokens")
+    
+    # ==================== PASS 1: Course Structure Analysis ====================
+    logger.info("\n" + "-" * 60)
+    logger.info("🔍 PASS 1: Course Structure Analysis")
+    logger.info("   Goal: Identify learning objectives and overall architecture")
+    logger.info("   Approach: Analyze both ASR and OCR equally")
+    logger.info("-" * 60)
+    
     if progress_callback:
         progress_callback("analyzing_course_structure", 40)
+    
     video_info = ""
     if video_title:
         clean_title = re.sub(r'\.(mp4|avi|mov|mkv|webm|flv|m4v)$', '', video_title, flags=re.IGNORECASE)
         video_info = f"課程檔名：{clean_title}\n"
-        
+        logger.info(f"📚 Video title: {clean_title}")
+    
     structure_prompt = f"""
 作為資深教學設計專家，分析這個{sec_to_hms(int(duration))}教學影片的整體架構：
 
+{video_info}
 【核心學習目標】
 1. 學生完成本課程後應掌握哪些關鍵能力？
 2. 有哪些必須理解的核心理論或概念？
@@ -686,28 +743,53 @@ def hierarchical_multipass_generation(
 - 理論講解 vs. 實例演示 vs. 操作練習 的比例分佈
 - 是否有問答互動、思考題、重點回顧？
 
-影片內容摘要（前40,000字符）：
-{truncate_text_by_tokens(raw_asr_text, 10000)}
+【分析要點】
+- 從講師的教學敘述（ASR）理解教學邏輯和重點
+- 從投影片內容（OCR）識別主要章節結構和專業術語
+- 綜合兩者，建構完整的課程框架
 
-輔助視覺內容：
-{truncate_text_by_tokens(ocr_context, 2000) if ocr_context else "無"}
+完整逐字稿（講師教學內容與時間軸）：
+{asr_text}
+
+視覺輔助內容（投影片/螢幕文字，用於確認主題與術語）：
+{ocr_text if ocr_text else "無視覺輔助內容"}
 """
     
-    structure_response = call_llm(
-        service_type=config.service_type,
-        client=client,
-        system_message="你是課程架構分析專家，擅長識別教學影片的整體學習目標和知識體系",
-        user_message=structure_prompt,
-        model=config.openai_model if config.service_type == "openai" else config.azure_model,
-        max_tokens=1200,
-        temperature=0.3
-    )
+    logger.info(f"📤 PASS 1 prompt: ~{count_tokens_llama(structure_prompt):,} tokens")
+    logger.info("🤖 Calling LLM for structure analysis...")
+    t0 = time.time()
     
-    structure_text = (structure_response.choices[0].message.content 
-                     if config.service_type == "openai" 
-                     else structure_response.choices[0].message.content)
+    try:
+        structure_response = call_llm(
+            service_type=config.service_type,
+            client=client,
+            system_message="你是課程架構分析專家，擅長識別教學影片的整體學習目標和知識體系。你會綜合分析講師講解（ASR）和投影片內容（OCR）來理解課程的完整結構。",
+            user_message=structure_prompt,
+            model=config.openai_model if config.service_type == "openai" else config.azure_model,
+            max_tokens=1200,
+            temperature=0.3
+        )
+        
+        elapsed = time.time() - t0
+        logger.info(f"✅ PASS 1 completed in {elapsed:.1f}s")
+        
+        structure_text = (structure_response.choices[0].message.content 
+                         if config.service_type == "openai" 
+                         else structure_response.choices[0].message.content)
+        
+        logger.info(f"📝 Structure analysis: {len(structure_text)} characters")
+        
+    except Exception as e:
+        logger.error(f"❌ PASS 1 failed: {e}", exc_info=True)
+        raise
     
-    # PASS 2: Learning Modules Identification (30% of budget)
+    # ==================== PASS 2: Learning Modules Identification ====================
+    logger.info("\n" + "-" * 60)
+    logger.info("📚 PASS 2: Learning Modules Identification")
+    logger.info("   Goal: Break down course into 7-12 coherent learning units")
+    logger.info("   Approach: ASR-primary (conceptual transitions)")
+    logger.info("-" * 60)
+    
     if progress_callback:
         progress_callback("identifying_learning_modules", 60)
     
@@ -719,36 +801,81 @@ def hierarchical_multipass_generation(
 1. 有明確的學習目標
 2. 包含完整的教學閉環（講解→範例→練習）
 3. 時長合理（10-30分鐘）
-4. 有清晰的開始和結束標記（避免過於細碎的主題切分）
+4. 有清晰的開始和結束標記
 
-特別注意以下教學轉折信號：
-- 主題轉換："接下來我們進入"、"現在開始講"、"第二部分"
-- 深度變化："有了基礎我們來看"、"更深入的問題是"
-- 應用轉向："理論講完了我們來實際操作"、"來看一個例子"
+【模塊邊界識別策略（重要性排序）】
 
-完整逐字稿（精簡至160,000字符）：
-{truncate_text_by_tokens(raw_asr_text, 70000)}
+**第一優先：講師的重大主題轉換（ASR - 主要依據）**
+- 明確的章節宣告："接下來進入新的章節/部分"、"第一部分/第二部分"
+- 重大內容轉換："基礎/理論講完了，現在來看..."、"從概念到實踐"
+- 教學方法的重大轉變：理論講解 → 實際操作 → 案例分析
+- 講師的總結與過渡："我們剛才講了...，現在來看..."
+
+**第二優先：教學邏輯的結構轉換（ASR內容分析）**
+- 從簡單到複雜的明顯層級變化
+- 從單一工具/概念到綜合應用
+- 從講解到練習的轉換
+- 階段性總結後開始新主題
+
+**第三優先：視覺結構變化（OCR - 輔助參考）**
+- 投影片的大標題變化（章節編號、大段落標記）
+- 顯著的內容類型切換（理論投影片 → 軟體操作界面 → 實例演示）
+- 用於確認模塊的主題名稱和專業術語
+
+⚠️ 重點提醒：
+- 模塊是大的學習單元，不要被頻繁的小標題變化誤導
+- 單個投影片變化不等於模塊邊界
+- 優先關注講師的語言信號，投影片用於確認主題
+
+完整逐字稿（主要依據 - 包含講師的主題轉換信號）：
+{asr_text}
+
+視覺輔助內容（次要參考 - 用於確認主題名稱）：
+{ocr_text if ocr_text else "無視覺輔助內容"}
 
 請輸出格式：
 模塊名稱 ~ 預估時間範圍 ~ 核心學習點 ~ 教學方法
-範例：演算法基礎 ~ 00:00-00:25 ~ 時間複雜度分析 ~ 理論講解+範例演示
+
+範例：
+基礎工具操作 ~ 00:00-00:25 ~ Illustrator介面認識、基本工具使用 ~ 理論講解+實例演示
+進階設計技巧 ~ 00:25-00:50 ~ Logo設計、色彩管理、輸出設定 ~ 綜合案例+實際操作
 """
     
-    modules_response = call_llm(
-        service_type=config.service_type,
-        client=client,
-        system_message="你是課程模塊設計師，擅長將教學內容分解為邏輯連貫的學習單元",
-        user_message=modules_prompt,
-        model=config.openai_model if config.service_type == "openai" else config.azure_model,
-        max_tokens=1500,
-        temperature=0.2
-    )
+    logger.info(f"📤 PASS 2 prompt: ~{count_tokens_llama(modules_prompt):,} tokens")
+    logger.info("🤖 Calling LLM for module identification...")
+    t0 = time.time()
     
-    modules_text = (modules_response.choices[0].message.content 
-                   if config.service_type == "openai" 
-                   else modules_response.choices[0].message.content)
+    try:
+        modules_response = call_llm(
+            service_type=config.service_type,
+            client=client,
+            system_message="你是課程模塊設計師，擅長將教學內容分解為邏輯連貫的學習單元。你主要依據講師的語言信號（ASR）來識別模塊邊界，因為模塊是基於概念轉換而非視覺變化。投影片（OCR）主要用於確認模塊的主題名稱。",
+            user_message=modules_prompt,
+            model=config.openai_model if config.service_type == "openai" else config.azure_model,
+            max_tokens=1500,
+            temperature=0.2
+        )
+        
+        elapsed = time.time() - t0
+        logger.info(f"✅ PASS 2 completed in {elapsed:.1f}s")
+        
+        modules_text = (modules_response.choices[0].message.content 
+                       if config.service_type == "openai" 
+                       else modules_response.choices[0].message.content)
+        
+        logger.info(f"📝 Modules analysis: {len(modules_text)} characters")
+        
+    except Exception as e:
+        logger.error(f"❌ PASS 2 failed: {e}", exc_info=True)
+        raise
     
-# PASS 3: Detailed Chapter Generation with Course Summary (60% of budget)
+    # ==================== PASS 3: Detailed Chapter Generation ====================
+    logger.info("\n" + "-" * 60)
+    logger.info("📑 PASS 3: Detailed Chapter Generation")
+    logger.info("   Goal: Create 15-30 precise chapter timestamps with titles")
+    logger.info("   Approach: ASR-primary (timing) + OCR-supporting (detail)")
+    logger.info("-" * 60)
+    
     if progress_callback:
         progress_callback("generating_detailed_chapters", 80)
     
@@ -762,24 +889,51 @@ def hierarchical_multipass_generation(
 現在為每個模塊生成具體的章節時間點（總共15-30個章節），並提供課程摘要。
 
 【章節設計原則】
-1. 每個章節代表一個完整的學習子目標
+1. 每個章節代表一個完整的學習子目標（5-10分鐘）
 2. 標記關鍵概念的首次詳細解釋
 3. 標記重要範例或案例分析的開始
 4. 標記練習題或互動環節
 5. 標記重點回顧或總結處
 
-【時間點選擇優先級】
-高優先級：理論首次講解、核心公式推導、重要範例開始
-中優先級：次要概念、補充說明、小練習
-低優先級：重複強調、過渡語句、技術操作細節
+【章節時間點定位策略（重要性排序）】
 
-【標題規範】
-- 使用專業術語，反映具體學習內容
-- 包含所屬模塊標籤（如：[基礎模塊]）
-- 明確指出是講解、範例、練習還是總結
+**第一優先：ASR語言時間戳（主要依據 - 決定章節開始時間）**
+- 講師的明確主題宣告："接下來我們要講..."、"現在進入..."、"首先..."
+- 教學轉換信號："好的，這部分完成了"、"現在來看..."、"我們來示範..."
+- 重要概念的首次詳細解釋開始點
+- 實例演示的明確開始："我們來實際操作一下..."
+- 練習或互動的開始："大家試試看..."
 
-完整內容：
-{raw_asr_text}
+**第二優先：內容邏輯轉換（ASR內容分析）**
+- 從理論講解到實際演示的自然轉換點
+- 新工具/技術的首次詳細介紹
+- 從簡單範例到複雜應用的過渡
+- 階段性小結後開始新的子主題
+
+**第三優先：OCR視覺輔助（補充確認 - 提供章節標題細節）**
+- 確認當前討論的具體主題（投影片標題提供準確名稱）
+- 提供精確的技術術語（當講師說"這個工具"時，OCR顯示"矩形工具"）
+- 補充視覺內容描述（圖表標題、代碼片段、操作步驟）
+- 當ASR表述不夠明確時，參考螢幕內容來補充細節
+
+【標題命名規範】
+- **優先使用講師的自然表述**（來自ASR，更口語化、易懂）
+- **結合投影片的專業術語**（來自OCR，提供準確的技術名稱）
+- 使用具體、可操作的描述（避免"介紹"、"說明"等模糊詞彙）
+- 包含所屬模塊標籤（如：[基礎工具]、[進階技巧]、[實戰案例]）
+- 標題格式：[模塊標籤] 動作/對象/目標
+
+【時間點選擇的黃金原則】
+⚠️ ASR時間戳記錄了講師實際開始講解新主題的時間 - 這是最自然、最符合學習節奏的章節起點
+⚠️ 投影片（OCR）通常在講師宣告主題之後才出現，用於確認內容和提供術語，而非決定時間點
+⚠️ 優先選擇講師明確宣告新主題的時間點（從ASR）作為章節開始時間
+⚠️ 使用投影片內容（從OCR）來豐富和精確化章節標題
+
+完整逐字稿（含精確時間戳 - 主要用於確定章節時間）：
+{asr_text}
+
+視覺輔助內容（投影片/螢幕文字 - 主要用於豐富章節標題）：
+{ocr_text if ocr_text else "無視覺輔助內容"}
 
 總時長：{sec_to_hms(int(duration))}
 
@@ -788,52 +942,121 @@ def hierarchical_multipass_generation(
 
 第一部分 - 章節列表：
 HH:MM:SS - [模塊標籤] 具體章節標題
-（每行一個章節）
+（每行一個章節，時間來自ASR，標題結合ASR表述與OCR術語）
+
+優質範例（時間點來自講師宣告，標題結合講師表述與投影片術語）：
+00:10:03 - [基礎工具介紹] Adobe Illustrator的基本操作和介面設置
+00:19:09 - [效果工具應用] 使用效果工具創建文字彎曲效果
+00:31:51 - [矩形和鋼筆工具] 使用矩形和鋼筆工具創建基本形狀和線條
 
 （空一行）
 
 第二部分 - 課程摘要：
-課程主題：[主要教學領域，如：Python程式設計、資料分析]
-核心內容：[列出6-12個主要教學概念，以頓號分隔]
-學習目標：[學生完成後將掌握的能力]
-適合對象：[目標學員背景]
+課程主題：[主要教學領域，如：Adobe Illustrator基礎教學、Python資料分析]
+核心內容：[列出6-12個主要教學概念，以頓號分隔，反映整個課程的關鍵知識點]
+學習目標：[學生完成後將掌握的具體、可衡量的能力]
+適合對象：[目標學員背景，如：設計初學者、有程式基礎的進階學員]
 難度級別：[初級/中級/高級]
 """
     
-    final_response = call_llm(
-        service_type=config.service_type,
-        client=client,
-        system_message="你是細心的章節設計師，擅長為學習模塊創建精確的時間標記和課程摘要。請嚴格遵守輸出格式，確保包含章節列表和課程摘要兩部分。",
-        user_message=chapters_prompt,
-        model=config.openai_model if config.service_type == "openai" else config.azure_model,
-        max_tokens=3000,  # Increased from 2500 to accommodate summary
-        temperature=0.1
-    )
+    logger.info(f"📤 PASS 3 prompt: ~{count_tokens_llama(chapters_prompt):,} tokens")
+    logger.info("🤖 Calling LLM for final chapter generation...")
+    t0 = time.time()
     
-    final_text = (final_response.choices[0].message.content 
-                 if config.service_type == "openai" 
-                 else final_response.choices[0].message.content)
+    try:
+        final_response = call_llm(
+            service_type=config.service_type,
+            client=client,
+            system_message="你是細心的章節設計師，擅長為學習模塊創建精確的時間標記和課程摘要。你的核心原則是：使用ASR時間戳來確定章節開始時間（因為這反映講師的自然教學節奏），使用OCR內容來豐富章節標題（提供準確的專業術語）。請嚴格遵守輸出格式，確保包含章節列表和課程摘要兩部分。",
+            user_message=chapters_prompt,
+            model=config.openai_model if config.service_type == "openai" else config.azure_model,
+            max_tokens=3000,
+            temperature=0.1
+        )
+        
+        elapsed = time.time() - t0
+        logger.info(f"✅ PASS 3 completed in {elapsed:.1f}s")
+        
+        final_text = (final_response.choices[0].message.content 
+                     if config.service_type == "openai" 
+                     else final_response.choices[0].message.content)
+        
+        logger.info(f"📝 Final output: {len(final_text)} characters")
+        
+    except Exception as e:
+        logger.error(f"❌ PASS 3 failed: {e}", exc_info=True)
+        raise
     
-    # Parse chapters (existing code works)
+    # ==================== Parse Results ====================
+    logger.info("\n" + "-" * 60)
+    logger.info("🔍 Parsing Generated Content")
+    logger.info("-" * 60)
+    
+    # Parse chapters from final output
     chapters = parse_chapters_from_output(final_text)
+    logger.info(f"📊 Parsed {len(chapters)} chapters from LLM output")
     
-    # Parse structured summary (existing code should now work)
+    if chapters:
+        first_chapter = list(chapters.keys())[0]
+        last_chapter = list(chapters.keys())[-1]
+        logger.info(f"📍 Chapter range: {first_chapter} to {last_chapter}")
+    else:
+        logger.warning("⚠️ No chapters were parsed from LLM output!")
+    
+    # Parse structured summary
     course_summary = parse_summary_from_output(final_text)
     
-    # Log if summary was successfully extracted
     if course_summary:
-        logger.info(f"Successfully extracted course summary with {len(course_summary)} fields")
+        logger.info(f"✅ Successfully extracted course summary with {len(course_summary)} fields:")
+        for key, value in course_summary.items():
+            display_value = value[:80] + "..." if len(value) > 80 else value
+            logger.info(f"   • {key}: {display_value}")
     else:
-        logger.warning("Course summary extraction failed, using empty dict")
+        logger.warning("⚠️ Course summary extraction failed, using empty dict")
     
-    # Extract educational metadata
+    # Calculate educational quality score
+    quality_score = estimate_educational_quality(chapters, structure_text)
+    logger.info(f"📈 Educational quality score: {quality_score:.2f}")
+    
+    # ==================== Build Metadata ====================
     metadata = {
-        'generation_method': 'hierarchical_multi_pass',
+        'generation_method': 'hierarchical_multi_pass_asr_primary',
+        'strategy': 'ASR-primary for timing, OCR-supporting for detail',
         'structure_analysis': structure_text,
         'modules_analysis': modules_text,
-        'educational_quality_score': estimate_educational_quality(chapters, structure_text),
-        'course_summary': course_summary  # Now should be populated
+        'educational_quality_score': quality_score,
+        'course_summary': course_summary,
+        'token_usage': {
+            'original': {
+                'asr_tokens': asr_tokens,
+                'ocr_tokens': ocr_tokens,
+                'total_tokens': total_content_tokens
+            },
+            'used_per_pass': {
+                'asr_tokens': asr_used,
+                'ocr_tokens': ocr_used,
+                'total_tokens': content_used
+            },
+            'limits': {
+                'asr_limit': ASR_LIMIT,
+                'ocr_limit': OCR_LIMIT
+            },
+            'coverage': {
+                'asr_coverage': f"{asr_coverage:.1f}%",
+                'ocr_coverage': f"{ocr_coverage:.1f}%"
+            }
+        }
     }
+    
+    logger.info("\n" + "=" * 60)
+    logger.info("✅ HIERARCHICAL GENERATION COMPLETE")
+    logger.info("=" * 60)
+    logger.info(f"📊 Chapters generated: {len(chapters)}")
+    logger.info(f"📊 Summary fields: {len(course_summary)}")
+    logger.info(f"📊 Quality score: {quality_score:.2f}")
+    logger.info(f"📊 Strategy: ASR-primary (timing) + OCR-supporting (detail)")
+    logger.info(f"📊 Total content used: {content_used:,} tokens (ASR: {asr_used:,}, OCR: {ocr_used:,})")
+    logger.info("=" * 60 + "\n")
     
     return final_text, chapters, metadata
 
