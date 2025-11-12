@@ -659,8 +659,14 @@ def hierarchical_multipass_generation(
     Three-pass hierarchical generation for high-quality educational chapters.
     
     Strategy:
-    - ASR provides primary timing (instructor's natural teaching flow)
-    - OCR provides supporting detail (slide content, technical terms, visual context)
+    - ASR (Primary): Provides teaching content, explanations, natural timing, and narrative flow
+    - OCR (Supporting): Provides visual structure, precise terminology, and organized summaries
+    
+    Prioritization:
+    - Chapter timing: ASR timestamps (when instructor announces topics)
+    - Chapter titles: ASR content enriched with OCR terminology
+    - Q&A content: ASR explanations supplemented with OCR structured data
+
     
     Token Budget:
     - ASR: 100,000 tokens per pass (primary source)
