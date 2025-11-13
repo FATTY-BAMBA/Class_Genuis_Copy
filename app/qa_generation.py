@@ -1828,16 +1828,15 @@ def generate_educational_content(
     
             # Parse modules into topics
             topics_list = parse_modules_to_topics(modules_analysis)
+            
             # Build global summary from multiple sources
             summary_parts = []
-            
             if course_summary_data.get('topic'):
                 summary_parts.append(course_summary_data['topic'])
             if course_summary_data.get('core_content'):
                 summary_parts.append(f"核心內容包括{course_summary_data['core_content']}")
             if course_summary_data.get('learning_objectives'):
                 summary_parts.append(course_summary_data['learning_objectives'])
-
             
             global_summary = "。".join(summary_parts) if summary_parts else "教學課程內容"
     
@@ -1849,45 +1848,46 @@ def generate_educational_content(
                 goals_match = re.search(r'學習目標[：:](.*?)(?:\n|$)', structure_analysis)
                 if goals_match:
                     key_takeaways.append(goals_match.group(1).strip())
-                
+            
             if not key_takeaways:
                 key_takeaways = [f"掌握{t['title']}" for t in topics_list[:3]]
-                
+            
             logger.info(f"✅ Extracted from metadata:")
             logger.info(f"   • Topics: {len(topics_list)}")
             logger.info(f"   • Quality score: {quality_score}")
             logger.info(f"   • Summary: {global_summary[:100]}...")
 
-            # ✅ ADD THIS: Create topics_output for file saving later
+            # Create topics_output for file saving later
             topics_output = f"""Topics extracted from hierarchical metadata (no LLM call needed):
 
-        Source: hierarchical_metadata from 3-pass chapter generation
-        Method: Parsed from modules_analysis
-        Quality Score: {quality_score:.2f}
+Source: hierarchical_metadata from 3-pass chapter generation
+Method: Parsed from modules_analysis
+Quality Score: {quality_score:.2f}
 
-        Topics ({len(topics_list)}):
-        {chr(10).join(f"{i+1}. {t['title']} - {t['summary']}" for i, t in enumerate(topics_list))}
+Topics ({len(topics_list)}):
+{chr(10).join(f"{i+1}. {t['title']} - {t['summary']}" for i, t in enumerate(topics_list))}
 
-        Course Summary:
-        {global_summary}
+Course Summary:
+{global_summary}
 
-        Key Takeaways:
-        {chr(10).join(f"- {kt}" for kt in key_takeaways)}
+Key Takeaways:
+{chr(10).join(f"- {kt}" for kt in key_takeaways)}
 
-        Structure Analysis (excerpt):
-        {structure_analysis[:500]}...
+Structure Analysis (excerpt):
+{structure_analysis[:500]}...
 
-        Modules Analysis:
-        {modules_analysis}
-        """
-        # Save extracted info for debugging
-        with open(run_dir / "metadata_extracted_topics.json", "w", encoding="utf-8") as f:
-            json.dump({
-                "topics": topics_list,
-                "global_summary": global_summary,
-                "key_takeaways": key_takeaways,
-                "source": "hierarchical_metadata"
-            }, f, ensure_ascii=False, indent=2)
+Modules Analysis:
+{modules_analysis}
+"""
+            
+            # Save extracted info for debugging
+            with open(run_dir / "metadata_extracted_topics.json", "w", encoding="utf-8") as f:
+                json.dump({
+                    "topics": topics_list,
+                    "global_summary": global_summary,
+                    "key_takeaways": key_takeaways,
+                    "source": "hierarchical_metadata"
+                }, f, ensure_ascii=False, indent=2)
 
         # Priority 2: Fallback to course_summary only (limited)
         elif course_summary:
@@ -1907,29 +1907,27 @@ def generate_educational_content(
                         "summary": f"課程重點：{item}",
                         "keywords": []
                     })
-                    
             
             global_summary = f"{course_summary.get('topic', '')}課程，{course_summary.get('core_content', '')}。{course_summary.get('learning_objectives', '')}"
             key_takeaways = [course_summary.get('learning_objectives', '')] if course_summary.get('learning_objectives') else []
     
             logger.info(f"✅ Extracted from course_summary: {len(topics_list)} topics")
     
-            # ✅ ADD THIS: Create topics_output for file saving later
+            # Create topics_output for file saving later
             topics_output = f"""Topics extracted from course_summary (legacy mode):
 
-        Source: course_summary (limited metadata)
-        Warning: Consider using full hierarchical_metadata for better results
+Source: course_summary (limited metadata)
+Warning: Consider using full hierarchical_metadata for better results
 
-        Topics ({len(topics_list)}):  
-        {chr(10).join(f"{i+1}. {t['title']}" for i, t in enumerate(topics_list))}
+Topics ({len(topics_list)}):  
+{chr(10).join(f"{i+1}. {t['title']}" for i, t in enumerate(topics_list))}
 
-        Course Summary:
-        {global_summary}
+Course Summary:
+{global_summary}
 
-        Key Takeaways:
-        {chr(10).join(f"- {kt}" for kt in key_takeaways if kt)}
-        """
-            
+Key Takeaways:
+{chr(10).join(f"- {kt}" for kt in key_takeaways if kt)}
+"""
         # Priority 3: Extract topics ourselves (slowest)
         else:
             report("generating_topics_summary", progress_callback)
