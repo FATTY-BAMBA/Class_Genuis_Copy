@@ -912,7 +912,9 @@ def build_lecture_notes_prompt_v2(
     video_title: Optional[str] = None,
     global_summary: str = "",
     # NEW: Add hierarchical metadata
-    hierarchical_metadata: Optional[Dict] = None
+    hierarchical_metadata: Optional[Dict] = None,
+    section_title: Optional[str] = None,      # ← ADD THIS
+    units: Optional[List[Dict]] = None        # ← ADD THIS
 ) -> str:
     """ASR-first lecture notes prompt. Transforms transcripts into structured, hierarchical study guides.
        Schema: sections[{title, content, key_points[]}], summary, key_terms[]
