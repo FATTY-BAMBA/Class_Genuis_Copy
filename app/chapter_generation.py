@@ -1244,6 +1244,8 @@ def generate_chapters_debug(
                 duration=duration,
                 ocr_context=ocr_context,
                 video_title=video_title,  # ADD THIS
+                section_title=section_title,      # ← ADD
+                units=units,                       # ← ADD
                 client=client,
                 config=config,
                 progress_callback=progress_callback
