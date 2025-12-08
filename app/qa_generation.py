@@ -2280,6 +2280,8 @@ def process_text_for_qa_and_notes(
     video_title: Optional[str] = None,  # ← ADD THIS
     chapters: Optional[Dict[str, str]] = None,  # ← ADD THIS
     hierarchical_metadata: Optional[Dict] = None,
+    section_title: Optional[str] = None,      # ← ADD
+    units: Optional[List[Dict]] = None,       # ← ADD
     num_questions: int = 10,
     num_pages: int = 3,
     id: str = "",
