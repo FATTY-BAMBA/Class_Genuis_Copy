@@ -1789,6 +1789,7 @@ def result_to_pipeline_like(
 
 
 # ==================== LEGACY CLIENT ADAPTER ====================
+
 def result_to_legacy_client_format(
     result: EducationalContentResult,
     *,
@@ -1797,12 +1798,25 @@ def result_to_legacy_client_format(
     section_no: int,
     created_at: str,
     chapters: Optional[List[Dict]] = None,
-    original_units: Optional[List[Dict]] = None,      # ← ADD THIS
-    suggested_units: Optional[List[Dict]] = None      # ← ADD THIS
+    original_units: Optional[List[Dict]] = None,      # ← NEW
+    suggested_units: Optional[List[Dict]] = None      # ← NEW
 ) -> dict:
     """
     Convert to client's expected API format with proper Options structure,
-    Tags, and CourseType fields.
+    Tags, CourseType fields, and Units/SuggestedUnits.
+    
+    Args:
+        result: Educational content result with MCQs and notes
+        id: Video/section ID
+        team_id: Team identifier
+        section_no: Section number
+        created_at: ISO timestamp
+        chapters: Optional chapter list for response
+        original_units: Original units from client (pass-through)
+        suggested_units: AI-generated suggested units
+    
+    Returns:
+        Dictionary in client API format ready for webhook POST
     """
     
     # Difficulty mapping to Chinese
@@ -1856,15 +1870,23 @@ def result_to_legacy_client_format(
     markdown_lines.append("## 總結")
     markdown_lines.append(result.summary)
     
-    return {
+    # Build response with Units fields
+    response = {
         "Id": id,
         "TeamId": team_id,
         "SectionNo": section_no,
         "CreatedAt": created_at,
         "Questions": client_questions,
         "CourseNote": "\n".join(markdown_lines).strip(),
-        "chapters": chapters or []
+        "Units": original_units or [],           # ← NEW: Original units (pass-through)
+        "SuggestedUnits": suggested_units or []  # ← NEW: AI-generated suggestions
     }
+    
+    # Add chapters if provided (optional - may be removed in future)
+    if chapters:
+        response["chapters"] = chapters
+    
+    return response
 
 # ==================== ASR PREPROCESSING ====================
 def preprocess_asr_text(raw_asr_text: str, min_chunk_duration: int = 60, max_gap: int = 10) -> str:
