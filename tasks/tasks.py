@@ -1145,6 +1145,82 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             units=units                          # ← ADD THIS
         )
 
+
+        # ========== NEW: GENERATE SUGGESTED UNITS ==========
+logger.info("=" * 60)
+logger.info("🎓 GENERATING SUGGESTED UNITS FOR CLIENT")
+logger.info("=" * 60)
+
+# Import the helper functions
+from app.qa_generation import (
+    parse_modules_to_topics,
+    extract_suggested_units_from_chapters,
+    extract_suggested_units_from_topics
+)
+
+# Extract topics from hierarchical metadata (if available)
+topics_list = []
+if chapter_metadata and chapter_metadata.get('modules_analysis'):
+    try:
+        topics_list = parse_modules_to_topics(
+            chapter_metadata.get('modules_analysis', '')
+        )
+        logger.info(f"✅ Extracted {len(topics_list)} topics from chapter metadata")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to extract topics from metadata: {e}")
+
+# Generate suggested units using the best available method
+suggested_units = []
+
+if topics_list and len(topics_list) >= 3:
+    # Method 1: Use topics (best for educational quality)
+    try:
+        suggested_units = extract_suggested_units_from_topics(
+            topics_list=topics_list,
+            chapters_dict=chapters_dict
+        )
+        logger.info(f"📚 Generated {len(suggested_units)} units from topics analysis")
+        logger.info(f"   Method: Topic-based (highest educational quality)")
+    except Exception as e:
+        logger.warning(f"⚠️ Topic-based unit extraction failed: {e}")
+
+if not suggested_units and chapters_dict and len(chapters_dict) >= 3:
+    # Method 2: Fall back to chapters (still good)
+    try:
+        suggested_units = extract_suggested_units_from_chapters(
+            chapters_dict=chapters_dict,
+            max_units=5
+        )
+        logger.info(f"📚 Generated {len(suggested_units)} units from chapters")
+        logger.info(f"   Method: Chapter-based (fallback)")
+    except Exception as e:
+        logger.warning(f"⚠️ Chapter-based unit extraction failed: {e}")
+
+if not suggested_units:
+    # Method 3: Minimum fallback (empty list)
+    logger.warning("⚠️ Insufficient data for unit generation - using empty list")
+    logger.warning("   This will still work, but client won't get AI suggestions")
+
+# Log what we're providing
+logger.info("-" * 60)
+logger.info("📋 UNITS SUMMARY")
+logger.info(f"   • Original Units (from API): {len(units)}")
+logger.info(f"   • Suggested Units (AI-generated): {len(suggested_units)}")
+
+if suggested_units:
+    logger.info("   • Suggested Units:")
+    for unit in suggested_units:
+        logger.info(f"      {unit['UnitNo']}. {unit['Title']} @ {unit['Time']}")
+logger.info("=" * 60)
+
+# ========== UPDATE QA RESULT WITH UNITS ==========
+if qa_result:
+    # Add Units and SuggestedUnits to the payload
+    qa_result["Units"] = units or []                    # Original units (pass-through)
+    qa_result["SuggestedUnits"] = suggested_units or [] # AI-generated suggestions
+    
+    logger.info("✅ Added Units and SuggestedUnits to client payload")
+
         if qa_result:
             total_processing_time = time.time() - processing_start_time
             qa_result["total_processing_time"] = total_processing_time
