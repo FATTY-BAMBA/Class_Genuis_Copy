@@ -741,6 +741,26 @@ def build_mcq_prompt_v2(
 
     chap_lines = []
     if chapters:
+        # Build educational metadata context
+        edu_metadata_context = build_educational_metadata_context(section_title, units)
+    
+        # Log if metadata provided
+        if section_title or units:
+            logger.info("=" * 60)
+            logger.info("📚 EDUCATIONAL METADATA FOR MCQ GENERATION")
+            if section_title:
+                logger.info(f"   📖 Section: {section_title}")
+            if units:
+                logger.info(f"   📑 Units: {len(units)} predefined units")
+                for unit in units:
+                    logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
+            logger.info("=" * 60)
+    
+        # Enhanced question distribution if units provided
+        if units and len(units) > 0:
+            questions_per_unit = max(1, num_questions // len(units))
+            logger.info(f"📊 Suggested distribution: ~{questions_per_unit} questions per unit")
+        
         for c in chapters[:18]:
             ts = c.get("ts") or c.get("timestamp") or ""
             title = c.get("title") or ""
