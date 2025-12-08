@@ -2131,6 +2131,8 @@ Key Takeaways:
             chapters=formatted_chapters,
             global_summary=global_summary, 
             hierarchical_metadata=hierarchical_metadata,
+            section_title=section_title,      # ← ADD
+            units=units                        # ← ADD
         )
 
         logger.info(f"MCQ prompt approx tokens: {count_tokens_llama(final_mcq_prompt):,}")
