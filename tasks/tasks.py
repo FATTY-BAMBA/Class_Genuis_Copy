@@ -961,6 +961,7 @@ def clean_old_uploads(max_age_hours=8):
     name="tasks.process_video_task",
     bind=True, soft_time_limit=7200, time_limit=7500, max_retries=5, default_retry_delay=1200
 )
+
 def process_video_task(self, play_url_or_path, video_info, num_questions=10, num_pages=3):
     file_path = None
     processing_start_time = time.time()
@@ -1008,7 +1009,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
         if not processing_result.get("success"):
             logger.error("❌ ASR PROCESSING FAILED")
             logger.error(f"Error: {processing_result.get('error')}")
-            # Continue with rest of error handling...
+            raise RuntimeError(f"ASR processing failed: {processing_result.get('error')}")
 
         # ---- Video Chaptering ----
         logger.info("📑 Generating video chapters...")
@@ -1097,13 +1098,12 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             logger.info("ℹ️  No educational metadata provided - using standard processing")
 
         # ← MODIFIED: Pass educational metadata to chapter generation
-
         chaptering_result = generate_chapters(
             raw_asr_text=raw_asr_text,
             ocr_segments=ocr_filtered,
             video_title=video_info.get("OriginalFilename"),
-            section_title=section_title,        # ← ADD THIS
-            units=units,                         # ← ADD THIS
+            section_title=section_title,
+            units=units,
             duration=duration,
             video_id=video_info["Id"],
             run_dir=Path(run_dir)
@@ -1124,7 +1124,6 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             logger.warning("⚠️  Chapter generation returned old format (no metadata)")
 
         # ---- Q&A + notes ----
-        # ---- Q&A + notes ----
         logger.info("📚 Generating Q&A and lecture notes (ASR-first)...")
         
         # ← LOG EDUCATIONAL METADATA FOR Q&A
@@ -1141,87 +1140,84 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             raw_asr_text,
             chapters_dict=chapters_dict,           
             hierarchical_metadata=chapter_metadata,
-            section_title=section_title,        # ← ADD THIS
-            units=units                          # ← ADD THIS
+            section_title=section_title,
+            units=units
         )
-
 
         # ========== NEW: GENERATE SUGGESTED UNITS ==========
-logger.info("=" * 60)
-logger.info("🎓 GENERATING SUGGESTED UNITS FOR CLIENT")
-logger.info("=" * 60)
+        logger.info("=" * 60)
+        logger.info("🎓 GENERATING SUGGESTED UNITS FOR CLIENT")
+        logger.info("=" * 60)
 
-# Import the helper functions
-from app.qa_generation import (
-    parse_modules_to_topics,
-    extract_suggested_units_from_chapters,
-    extract_suggested_units_from_topics
-)
-
-# Extract topics from hierarchical metadata (if available)
-topics_list = []
-if chapter_metadata and chapter_metadata.get('modules_analysis'):
-    try:
-        topics_list = parse_modules_to_topics(
-            chapter_metadata.get('modules_analysis', '')
+        # Import the helper functions
+        from app.qa_generation import (
+            parse_modules_to_topics,
+            extract_suggested_units_from_chapters,
+            extract_suggested_units_from_topics
         )
-        logger.info(f"✅ Extracted {len(topics_list)} topics from chapter metadata")
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to extract topics from metadata: {e}")
 
-# Generate suggested units using the best available method
-suggested_units = []
+        # Extract topics from hierarchical metadata (if available)
+        topics_list = []
+        if chapter_metadata and chapter_metadata.get('modules_analysis'):
+            try:
+                topics_list = parse_modules_to_topics(
+                    chapter_metadata.get('modules_analysis', '')
+                )
+                logger.info(f"✅ Extracted {len(topics_list)} topics from chapter metadata")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to extract topics from metadata: {e}")
 
-if topics_list and len(topics_list) >= 3:
-    # Method 1: Use topics (best for educational quality)
-    try:
-        suggested_units = extract_suggested_units_from_topics(
-            topics_list=topics_list,
-            chapters_dict=chapters_dict
-        )
-        logger.info(f"📚 Generated {len(suggested_units)} units from topics analysis")
-        logger.info(f"   Method: Topic-based (highest educational quality)")
-    except Exception as e:
-        logger.warning(f"⚠️ Topic-based unit extraction failed: {e}")
+        # Generate suggested units using the best available method
+        suggested_units = []
 
-if not suggested_units and chapters_dict and len(chapters_dict) >= 3:
-    # Method 2: Fall back to chapters (still good)
-    try:
-        suggested_units = extract_suggested_units_from_chapters(
-            chapters_dict=chapters_dict,
-            max_units=5
-        )
-        logger.info(f"📚 Generated {len(suggested_units)} units from chapters")
-        logger.info(f"   Method: Chapter-based (fallback)")
-    except Exception as e:
-        logger.warning(f"⚠️ Chapter-based unit extraction failed: {e}")
+        if topics_list and len(topics_list) >= 3:
+            # Method 1: Use topics (best for educational quality)
+            try:
+                suggested_units = extract_suggested_units_from_topics(
+                    topics_list=topics_list,
+                    chapters_dict=chapters_dict
+                )
+                logger.info(f"📚 Generated {len(suggested_units)} units from topics analysis")
+                logger.info(f"   Method: Topic-based (highest educational quality)")
+            except Exception as e:
+                logger.warning(f"⚠️ Topic-based unit extraction failed: {e}")
 
-if not suggested_units:
-    # Method 3: Minimum fallback (empty list)
-    logger.warning("⚠️ Insufficient data for unit generation - using empty list")
-    logger.warning("   This will still work, but client won't get AI suggestions")
+        if not suggested_units and chapters_dict and len(chapters_dict) >= 3:
+            # Method 2: Fall back to chapters (still good)
+            try:
+                suggested_units = extract_suggested_units_from_chapters(
+                    chapters_dict=chapters_dict,
+                    max_units=5
+                )
+                logger.info(f"📚 Generated {len(suggested_units)} units from chapters")
+                logger.info(f"   Method: Chapter-based (fallback)")
+            except Exception as e:
+                logger.warning(f"⚠️ Chapter-based unit extraction failed: {e}")
 
-# Log what we're providing
-logger.info("-" * 60)
-logger.info("📋 UNITS SUMMARY")
-logger.info(f"   • Original Units (from API): {len(units)}")
-logger.info(f"   • Suggested Units (AI-generated): {len(suggested_units)}")
+        if not suggested_units:
+            # Method 3: Minimum fallback (empty list)
+            logger.warning("⚠️ Insufficient data for unit generation - using empty list")
+            logger.warning("   This will still work, but client won't get AI suggestions")
 
-if suggested_units:
-    logger.info("   • Suggested Units:")
-    for unit in suggested_units:
-        logger.info(f"      {unit['UnitNo']}. {unit['Title']} @ {unit['Time']}")
-logger.info("=" * 60)
+        # Log what we're providing
+        logger.info("-" * 60)
+        logger.info("📋 UNITS SUMMARY")
+        logger.info(f"   • Original Units (from API): {len(units)}")
+        logger.info(f"   • Suggested Units (AI-generated): {len(suggested_units)}")
 
-# ========== UPDATE QA RESULT WITH UNITS ==========
-if qa_result:
-    # Add Units and SuggestedUnits to the payload
-    qa_result["Units"] = units or []                    # Original units (pass-through)
-    qa_result["SuggestedUnits"] = suggested_units or [] # AI-generated suggestions
-    
-    logger.info("✅ Added Units and SuggestedUnits to client payload")
+        if suggested_units:
+            logger.info("   • Suggested Units:")
+            for unit in suggested_units:
+                logger.info(f"      {unit['UnitNo']}. {unit['Title']} @ {unit['Time']}")
+        logger.info("=" * 60)
 
+        # ========== CONTINUE WITH EXISTING PROCESSING ==========
         if qa_result:
+            # Add Units and SuggestedUnits to the payload
+            qa_result["Units"] = units or []
+            qa_result["SuggestedUnits"] = suggested_units or []
+            logger.info("✅ Added Units and SuggestedUnits to client payload")
+
             total_processing_time = time.time() - processing_start_time
             qa_result["total_processing_time"] = total_processing_time
 
@@ -1266,7 +1262,7 @@ if qa_result:
 
             # Get chapters from the chaptering result and merge into final payload
             # ============ MERGE CHAPTERS INTO FINAL PAYLOAD ============
-            # Use chapters_dict that was already extracted earlier (line ~800)
+            # Use chapters_dict that was already extracted earlier
             if not chapters_dict:
                 logger.warning("⚠️ No chapters returned; using empty dict")
                 chapters_dict = {}
@@ -1324,59 +1320,3 @@ if qa_result:
     finally:
         if file_path and os.path.exists(file_path):
             cleanup_files_task.delay(None, file_path)
-
-# ==================== Health / Monitoring ====================
-
-@celery.task(name="tasks.health_check")
-def health_check():
-    try:
-        import torch
-        gpu_available = torch.cuda.is_available()
-        disk_usage = subprocess.check_output(["df", "-h", PERSIST_BASE], text=True)
-        logger.info(f"📦 Disk usage:\n{disk_usage}")
-
-        cache_files = 0
-        if os.path.exists(CACHE_DIR):
-            cache_files = len([f for f in os.listdir(CACHE_DIR) if f.endswith(".pkl")])
-
-        logger.info(f"🏥 Health check: GPU={gpu_available}, Cache files={cache_files}")
-        return {
-            "status": "healthy",
-            "gpu_available": gpu_available,
-            "cache_files": cache_files,
-            "timestamp": datetime.now().isoformat(),
-        }
-    except Exception as e:
-        logger.error(f"❌ Health check failed: {e}")
-        return {"status": "unhealthy", "error": str(e), "timestamp": datetime.now().isoformat()}
-
-@celery.task(name="tasks.monitor_performance")
-def monitor_performance():
-    try:
-        if os.path.exists(CACHE_DIR):
-            all_files = [f for f in os.listdir(CACHE_DIR) if f.endswith(".pkl")]
-            recent_files = [f for f in all_files if (time.time() - os.path.getmtime(os.path.join(CACHE_DIR, f))) < 3600]
-            logger.info(f"📊 Performance: {len(all_files)} total cache files")
-            logger.info(f"📈 Recent activity: {len(recent_files)} files accessed in last hour")
-            return {
-                "total_cache_files": len(all_files),
-                "recent_activity": len(recent_files),
-                "cache_hit_rate": (len(recent_files) / max(len(all_files), 1)) * 100,
-            }
-        return {"total_cache_files": 0, "recent_activity": 0, "cache_hit_rate": 0}
-    except Exception as e:
-        logger.error(f"❌ Performance monitoring failed: {e}")
-        return {"error": str(e)}
-
-# ==================== Task Routes (match explicit names above) ====================
-celery.conf.task_routes = {
-    "tasks.process_video_task": {"queue": "video_processing"},
-    "tasks.generate_qa_and_notes": {"queue": "qa_generation"},
-    "tasks.generate_from_artifacts": {"queue": "qa_generation"},
-    "tasks.clean_old_uploads": {"queue": "maintenance"},
-    "tasks.cleanup_files": {"queue": "maintenance"},
-    "tasks.health_check": {"queue": "monitoring"},
-    "tasks.monitor_performance": {"queue": "monitoring"},
-}
-
-logger.info("🚀 Tasks Module Loaded (ASR-first QA/Notes + OCR Aligner)")
