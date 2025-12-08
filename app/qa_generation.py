@@ -726,7 +726,9 @@ def build_mcq_prompt_v2(
     num_questions: int = 10,
     chapters: Optional[List[Dict]] = None,
     global_summary: str = "",
-    hierarchical_metadata: Optional[Dict] = None
+    hierarchical_metadata: Optional[Dict] = None,
+    section_title: Optional[str] = None,      # ← NEW
+    units: Optional[List[Dict]] = None        # ← NEW
 ) -> str:
     """ASR-first MCQ prompt with Bloom structuring, global context, and practical constraints.
        Schema preserved: {"mcqs":[{question, options[A..D], correct_answer, explanation, difficulty, topic, tags, course_type}]}.
