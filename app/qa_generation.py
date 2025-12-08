@@ -2190,6 +2190,8 @@ Key Takeaways:
             topics=topics_list,
             global_summary=global_summary,
             hierarchical_metadata=hierarchical_metadata,
+            section_title=section_title,      # ← ADD
+            units=units                        # ← ADD
         )
         logger.info(f"📘 Generating {config.max_notes_pages} pages of lecture notes with validation")
 
