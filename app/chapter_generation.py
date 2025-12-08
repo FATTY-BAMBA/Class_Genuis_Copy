@@ -636,6 +636,44 @@ def build_prompt_body(
 """
     return prompt
 
+def build_educational_context(section_title: Optional[str], units: Optional[List[Dict]]) -> str:
+    """
+    Build educational context from metadata for prompt enhancement.
+    
+    Returns formatted string with course structure information.
+    """
+    if not section_title and not units:
+        return ""
+    
+    context_parts = []
+    
+    if section_title:
+        context_parts.append(f"# 📚 課程單元資訊")
+        context_parts.append(f"本影片屬於課程單元：**{section_title}**")
+        context_parts.append("")
+    
+    if units:
+        context_parts.append(f"## 預定教學單元結構 ({len(units)} 個單元)")
+        context_parts.append("講師計劃在本課程中涵蓋以下教學單元：")
+        context_parts.append("")
+        for unit in units:
+            context_parts.append(f"{unit['UnitNo']}. {unit['Title']}")
+        
+        context_parts.append("")
+        context_parts.append("## 章節設計指引")
+        context_parts.append("✅ 優先考慮這些預定單元作為主要章節分組")
+        context_parts.append("✅ 在逐字稿中尋找講師實際講解這些單元的時間點")
+        context_parts.append(f"✅ 目標：創建 {len(units) * 2} 到 {len(units) * 4} 個章節")
+        context_parts.append("✅ 章節標題建議格式：[單元N：單元名稱] 具體內容")
+        context_parts.append("")
+        context_parts.append("**範例格式：**")
+        context_parts.append("00:05:30 - [單元1：廚具規劃] 廚房工作三角原理與動線設計")
+        context_parts.append("00:18:45 - [單元1：廚具規劃] 廚具尺寸標準與人體工學考量")
+        context_parts.append("00:32:10 - [單元2：天花板大樣圖] 大樣圖繪製基本規範與圖例說明")
+        context_parts.append("")
+    
+    return "\n".join(context_parts)
+
 # ─────────────────────────
 # Hierarchical Multi-Pass Generation (NEW)
 # ─────────────────────────
