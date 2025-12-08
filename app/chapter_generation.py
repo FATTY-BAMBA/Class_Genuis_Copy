@@ -1093,6 +1093,8 @@ def generate_chapters_debug(
     duration: float,
     video_id: str,
     video_title: Optional[str] = None,  # ADD THIS
+    section_title: Optional[str] = None,  # ← ADD
+    units: Optional[List[Dict]] = None,    # ← ADD
     run_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[str, int], None]] = None,
     *,
