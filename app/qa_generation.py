@@ -1688,7 +1688,9 @@ def result_to_legacy_client_format(
     team_id: str,
     section_no: int,
     created_at: str,
-    chapters: Optional[List[Dict]] = None
+    chapters: Optional[List[Dict]] = None,
+    original_units: Optional[List[Dict]] = None,      # ← ADD THIS
+    suggested_units: Optional[List[Dict]] = None      # ← ADD THIS
 ) -> dict:
     """
     Convert to client's expected API format with proper Options structure,
