@@ -750,14 +750,23 @@ def generate_qa_and_notes(
     logger.info("📚 Generating Q&A (ASR-first; chapters come from video_chaptering)")
     logger.info(f"📊 Input: raw_asr_len={len(raw_asr_text)}, ocr_segments={len(ocr_segments)}")
 
+    # ← LOG EDUCATIONAL METADATA FOR Q&A
+    if section_title or units:
+        logger.info("📚 Using educational metadata for Q&A generation")
+        if section_title:
+            logger.info(f"   • Section: {section_title}")
+        if units:
+            logger.info(f"   • Units: {len(units)} learning units")
     try:
         # Get the raw EducationalContentResult object
         qa_result_obj = process_text_for_qa_and_notes(
             raw_asr_text=raw_asr_text,
             ocr_segments=ocr_segments,
             video_title=video_info.get("OriginalFilename"),
-            chapters=chapters_dict,                    # ← ADD THIS LINE
-            hierarchical_metadata=hierarchical_metadata,  # ← ADD THIS LINE
+            chapters=chapters_dict,                    
+            hierarchical_metadata=hierarchical_metadata,
+            section_title=section_title,        # ← ADD THIS
+            units=units,                         # ← ADD THIS
             num_questions=10,
             num_pages=3,
             id=video_info["Id"],
