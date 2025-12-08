@@ -2323,6 +2323,8 @@ def process_text_for_qa_and_notes(
             video_title=video_title,  # ← ADD THIS
             chapters=chapters,  # ← ADD THIS
             hierarchical_metadata=hierarchical_metadata,
+            section_title=section_title,      # ← ADD
+            units=units,                       # ← ADD
             run_dir=None,
             progress_callback=None,
             shuffle_options=False,
