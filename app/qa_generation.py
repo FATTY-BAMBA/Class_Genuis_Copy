@@ -909,7 +909,7 @@ def build_lecture_notes_prompt_v2(
     num_pages: int = 5,
     chapters: Optional[List[Dict]] = None,
     topics: Optional[List[Dict]] = None,
-    video_title=None,  # ADD THIS LINE
+    video_title: Optional[str] = None,
     global_summary: str = "",
     # NEW: Add hierarchical metadata
     hierarchical_metadata: Optional[Dict] = None
