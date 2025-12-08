@@ -917,6 +917,21 @@ def build_lecture_notes_prompt_v2(
     """ASR-first lecture notes prompt. Transforms transcripts into structured, hierarchical study guides.
        Schema: sections[{title, content, key_points[]}], summary, key_terms[]
     """
+    # Build educational metadata context
+    edu_metadata_context = build_educational_metadata_context(section_title, units)
+    
+    # Log if metadata provided
+    if section_title or units:
+        logger.info("=" * 60)
+        logger.info("📚 EDUCATIONAL METADATA FOR LECTURE NOTES")
+        if section_title:
+            logger.info(f"   📖 Section: {section_title}")
+        if units:
+            logger.info(f"   📑 Units: {len(units)} predefined units")
+            for unit in units:
+                logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
+        logger.info("=" * 60)
+        
     topics_snippet = ""
     if topics:
         lines = []
