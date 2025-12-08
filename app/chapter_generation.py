@@ -771,10 +771,14 @@ def hierarchical_multipass_generation(
         video_info = f"課程檔名：{clean_title}\n"
         logger.info(f"📚 Video title: {clean_title}")
     
+    educational_context = build_educational_context(section_title, units)
+    
     structure_prompt = f"""
 作為資深教學設計專家，分析這個{sec_to_hms(int(duration))}教學影片的整體架構：
 
 {video_info}
+{educational_context}
+
 【核心學習目標】
 1. 學生完成本課程後應掌握哪些關鍵能力？
 2. 有哪些必須理解的核心理論或概念？
