@@ -1075,7 +1075,28 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             )
             if not raw_asr_text:
                 raise RuntimeError("ASR stage failed and no segments available for fallback")
-              # -----------------------------------------------------------------------
+        # -----------------------------------------------------------------------
+
+        # ← NEW: EXTRACT EDUCATIONAL METADATA FROM video_info
+        section_title = video_info.get("SectionTitle")
+        units = video_info.get("Units", [])
+
+        # Log what we received
+        if section_title or units:
+            logger.info("=" * 60)
+            logger.info("📚 EDUCATIONAL METADATA RECEIVED FROM API")
+            logger.info("=" * 60)
+            if section_title:
+                logger.info(f"📖 Section Title: {section_title}")
+            if units:
+                logger.info(f"📑 Units ({len(units)}):")
+                for unit in units:
+                    logger.info(f"   {unit['UnitNo']}. {unit['Title']}")
+            logger.info("=" * 60)
+        else:
+            logger.info("ℹ️  No educational metadata provided - using standard processing")
+
+        # ← MODIFIED: Pass educational metadata to chapter generation
 
         chaptering_result = generate_chapters(
             raw_asr_text=raw_asr_text,
