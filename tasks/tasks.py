@@ -720,9 +720,12 @@ def generate_qa_and_notes(
     processing_result, 
     video_info, 
     raw_asr_text,
-    chapters_dict=None,           # ← ADD THIS
-    hierarchical_metadata=None    # ← ADD THIS
+    chapters_dict=None,           
+    hierarchical_metadata=None,
+    section_title=None,      # ← ADD THIS
+    units=None                # ← ADD THIS
 ):
+    
     """
     Generate Q&A and notes using *raw ASR* (ASR-first) + simple OCR context,
     with optional chapter metadata for enhanced quality.
