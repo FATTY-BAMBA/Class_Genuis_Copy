@@ -652,6 +652,8 @@ def hierarchical_multipass_generation(
     duration: float,
     ocr_context: str,
     video_title: Optional[str],
+    section_title: Optional[str],      # ← ADD
+    units: Optional[List[Dict]],       # ← ADD
     client: Any,
     config: ChapterConfig,
     progress_callback: Optional[Callable[[str, int], None]] = None
