@@ -675,6 +675,114 @@ def parse_modules_to_topics(modules_analysis: str) -> List[Dict]:
     
     logger.info(f"Parsed {len(topics)} topics from modules_analysis")
     return topics
+
+# ==================== SUGGESTED UNITS EXTRACTION ====================
+
+def extract_suggested_units_from_chapters(
+    chapters_dict: Dict[str, str],
+    max_units: int = 5
+) -> List[Dict]:
+    """
+    Extract suggested units from generated chapters.
+    
+    Strategy: Takes the first N chapters and converts them to unit format.
+    Works well when chapters represent major learning segments.
+    
+    Args:
+        chapters_dict: Chapter dictionary {"00:05:30": "[單元1：廚具規劃] 內容"} 
+                      or {"00:05:30": "章節標題"}
+        max_units: Maximum number of suggested units (default: 5)
+        
+    Returns:
+        List of suggested units in client API format:
+        [{"UnitNo": 1, "Title": "單元標題", "Time": "00:05:30"}, ...]
+    """
+    suggested = []
+    unit_counter = 1
+    
+    # Take first N chapters as unit representatives
+    for timestamp, title in list(chapters_dict.items())[:max_units]:
+        # Extract clean title (remove unit tags if present like [單元1：xxx])
+        clean_title = re.sub(r'^\[單元\d+[：:][^\]]+\]\s*', '', title)
+        
+        # Also remove other common prefixes
+        clean_title = re.sub(r'^\[.*?\]\s*', '', clean_title)
+        clean_title = clean_title.strip()
+        
+        # Limit title length for readability
+        if len(clean_title) > 50:
+            clean_title = clean_title[:47] + "..."
+        
+        suggested.append({
+            "UnitNo": unit_counter,
+            "Title": clean_title,
+            "Time": timestamp  # Already in HH:mm:ss format from chapters
+        })
+        unit_counter += 1
+    
+    logger.info(f"Extracted {len(suggested)} suggested units from {len(chapters_dict)} chapters")
+    return suggested
+
+
+def extract_suggested_units_from_topics(
+    topics_list: List[Dict],
+    chapters_dict: Optional[Dict[str, str]] = None
+) -> List[Dict]:
+    """
+    Convert topics to suggested units format with optional timestamp matching.
+    
+    Strategy: Uses topic analysis for unit titles, tries to find matching 
+    chapter timestamps based on topic keywords.
+    
+    Args:
+        topics_list: Topics from parse_modules_to_topics() or LLM extraction
+                    Format: [{"id": "01", "title": "主題", "summary": "...", "keywords": [...]}]
+        chapters_dict: Optional chapter timestamps for time matching
+        
+    Returns:
+        List of suggested units in client API format:
+        [{"UnitNo": 1, "Title": "單元標題", "Time": "00:05:30"}, ...]
+    """
+    suggested = []
+    
+    for i, topic in enumerate(topics_list[:5], 1):  # Limit to 5 units
+        title = topic.get('title', f'主題 {i}')
+        
+        # Limit title length
+        if len(title) > 50:
+            title = title[:47] + "..."
+        
+        # Try to find matching timestamp from chapters
+        time = ""
+        if chapters_dict:
+            # Strategy 1: Look for chapters that mention this topic
+            # Extract first 3 significant words from topic title as keywords
+            topic_keywords = [w for w in title.split() if len(w) > 1][:3]
+            
+            for chapter_ts, chapter_title in chapters_dict.items():
+                # Check if any topic keyword appears in chapter title
+                if any(keyword in chapter_title for keyword in topic_keywords):
+                    time = chapter_ts
+                    logger.debug(f"Matched topic '{title}' to chapter at {time}")
+                    break
+        
+        # Strategy 2: Fallback to time_range if available in topic
+        if not time and topic.get('time_range'):
+            time_range = topic['time_range']
+            # Extract start time from "00:00-00:25" format
+            if '-' in time_range:
+                time = time_range.split('-')[0].strip()
+            else:
+                time = time_range
+        
+        suggested.append({
+            "UnitNo": i,
+            "Title": title,
+            "Time": time  # Empty string if no match found
+        })
+    
+    logger.info(f"Extracted {len(suggested)} suggested units from {len(topics_list)} topics")
+    return suggested
     
 def validate_topics_output(data: Dict) -> tuple[bool, List[str]]:
     """
