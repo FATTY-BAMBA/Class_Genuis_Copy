@@ -1,4 +1,4 @@
-# app/app.py
+# app/app.py - Updated with new API format support
 
 import os
 import uuid
@@ -76,7 +76,43 @@ def log_request_info(request_type, **kwargs):
         "request_type": request_type,
         **kwargs
     }
-    print(f"[REQUEST] {json.dumps(log_entry, indent=2)}")
+    print(f"[REQUEST] {json.dumps(log_entry, indent=2, ensure_ascii=False)}")
+
+def validate_units(units):
+    """
+    Validate Units array structure.
+    
+    Returns: (is_valid: bool, error_message: str or None)
+    """
+    if not units:
+        return True, None
+    
+    if not isinstance(units, list):
+        return False, "Units must be an array"
+    
+    for idx, unit in enumerate(units):
+        if not isinstance(unit, dict):
+            return False, f"Unit at index {idx} must be an object"
+        
+        if "UnitNo" not in unit:
+            return False, f"Unit at index {idx} is missing 'UnitNo'"
+        
+        if "Title" not in unit:
+            return False, f"Unit at index {idx} is missing 'Title'"
+        
+        if not isinstance(unit["UnitNo"], int):
+            return False, f"Unit at index {idx}: 'UnitNo' must be an integer (got {type(unit['UnitNo']).__name__})"
+        
+        if not isinstance(unit["Title"], str):
+            return False, f"Unit at index {idx}: 'Title' must be a string (got {type(unit['Title']).__name__})"
+        
+        if unit["UnitNo"] < 1:
+            return False, f"Unit at index {idx}: 'UnitNo' must be positive (got {unit['UnitNo']})"
+        
+        if not unit["Title"].strip():
+            return False, f"Unit at index {idx}: 'Title' cannot be empty"
+    
+    return True, None
     
 # ==================== Health Endpoint ====================
 @app.route("/healthz")
@@ -177,7 +213,7 @@ def upload_file():
         else:
             return jsonify({"error": "No file or video URL provided!"}), 400
 
-        # Create video info object
+        # Create video info object (web UI doesn't have Units structure)
         video_info = {
             "Id": video_id,
             "TeamId": request.form.get('team_id', 'test'),
@@ -187,7 +223,11 @@ def upload_file():
             "OriginalFilename": original_filename,
             "SavedFilename": unique_filename,
             "SavedPath": video_path,
-            "VideoUrl": video_url
+            "VideoUrl": video_url,
+            "SectionTitle": None,  # Not provided in web UI
+            "Units": [],            # Not provided in web UI
+            "NumQuestions": num_questions,
+            "NumPages": num_pages
         }
         
     except Exception as e:
@@ -224,19 +264,39 @@ def upload_file():
 
 @app.route('/upload_url', methods=['POST'])
 def upload_url():
-    """API endpoint for external URL requests"""
+    """
+    API endpoint for external URL requests with enhanced educational metadata.
+    
+    Accepts new fields (backward compatible):
+    - SectionTitle: Overall course section title (optional)
+    - Units: Array of unit objects with UnitNo and Title (optional)
+    
+    Required fields: Id, TeamId, SectionNo, PlayUrl
+    Optional fields: NumQuestions (default: 10), NumPages (default: 3), CreatedAt, SectionTitle, Units
+    """
     from tasks.tasks import process_video_task
 
     try:
         data = request.get_json(force=True)
+        
+        # ==================== VALIDATION ====================
+        # Required fields (unchanged from before)
         required_keys = {"Id", "TeamId", "SectionNo", "PlayUrl"}
         
         if not data or not required_keys.issubset(data.keys()):
             missing = required_keys - set(data.keys()) if data else required_keys
-            return jsonify({"error": f"Missing required keys: {missing}"}), 400
+            return jsonify({"error": f"Missing required keys: {list(missing)}"}), 400
 
         play_url = data["PlayUrl"]
         
+        # Validate PlayUrl format
+        if not isinstance(play_url, str) or not play_url.strip():
+            return jsonify({"error": "PlayUrl must be a non-empty string"}), 400
+        
+        if not play_url.startswith(("http://", "https://", "file://")):
+            return jsonify({"error": f"Invalid PlayUrl format. Must start with http://, https://, or file:// (got: {play_url[:50]}...)"}), 400
+        
+        # ==================== FILE PATH HANDLING ====================
         # Handle file:// URLs that reference existing files
         if play_url.startswith("file://"):
             file_path = play_url.replace("file://", "")
@@ -262,26 +322,90 @@ def upload_url():
                 print(f"   Searched: {possible_paths}")
                 return jsonify({"error": f"File not found: {file_path}"}), 404
 
-        # Build video info
+        # ==================== EXTRACT NEW FIELDS (with defaults) ====================
+        # NEW: Educational metadata (optional - backward compatible)
+        section_title = data.get("SectionTitle", None)
+        units = data.get("Units", [])
+        
+        # Validate SectionTitle if provided
+        if section_title is not None and not isinstance(section_title, str):
+            return jsonify({"error": f"SectionTitle must be a string (got {type(section_title).__name__})"}), 400
+        
+        # Validate Units structure if provided
+        if units:
+            is_valid, error_msg = validate_units(units)
+            if not is_valid:
+                return jsonify({"error": error_msg}), 400
+        
+        # Configuration with defaults (backward compatible)
+        try:
+            num_questions = int(data.get("NumQuestions", 10))  # Default: 10 questions
+            num_pages = int(data.get("NumPages", 3))            # Default: 3 pages
+            
+            if num_questions < 1 or num_questions > 100:
+                return jsonify({"error": f"NumQuestions must be between 1 and 100 (got {num_questions})"}), 400
+            
+            if num_pages < 1 or num_pages > 20:
+                return jsonify({"error": f"NumPages must be between 1 and 20 (got {num_pages})"}), 400
+                
+        except (ValueError, TypeError) as e:
+            return jsonify({"error": f"NumQuestions and NumPages must be integers: {str(e)}"}), 400
+        
+        # ==================== BUILD VIDEO INFO ====================
         video_info = {
+            # Required fields
             "Id": data["Id"],
             "TeamId": data["TeamId"],
             "SectionNo": data["SectionNo"],
             "CreatedAt": data.get("CreatedAt", datetime.now().isoformat()),
             "SourceType": "api_url",
-            "VideoUrl": play_url
+            "VideoUrl": play_url,
+            
+            # NEW: Educational metadata (optional)
+            "SectionTitle": section_title,
+            "Units": units,
+            
+            # Processing configuration
+            "NumQuestions": num_questions,
+            "NumPages": num_pages,
         }
         
-        num_questions = int(data.get("NumQuestions", 10))
-        num_pages = int(data.get("NumPages", 3))
+        # ==================== LOGGING ====================
+        log_data = {
+            "api_request": True,
+            "video_id": data["Id"],
+            "team_id": data["TeamId"],
+            "section_no": data["SectionNo"],
+            "play_url": play_url[:100] + "..." if len(play_url) > 100 else play_url,
+            "num_questions": num_questions,
+            "num_pages": num_pages,
+        }
         
-        log_request_info(
-            "api_request",
-            video_id=data["Id"],
-            team_id=data["TeamId"],
-            section_no=data["SectionNo"],
-            play_url=play_url
-        )
+        # Add educational metadata to logs if provided
+        if section_title:
+            log_data["section_title"] = section_title
+        if units:
+            log_data["units_count"] = len(units)
+        
+        log_request_info("api_request", **log_data)
+        
+        # Log unit details if provided (pretty format)
+        if section_title or units:
+            print("=" * 60)
+            print("📚 EDUCATIONAL METADATA RECEIVED")
+            print("=" * 60)
+            
+            if section_title:
+                print(f"📖 Section Title: {section_title}")
+            
+            if units:
+                print(f"📑 Units ({len(units)}):")
+                for unit in units:
+                    print(f"   {unit['UnitNo']}. {unit['Title']}")
+            
+            print("=" * 60)
+        else:
+            print("ℹ️  No educational metadata (SectionTitle/Units) provided - processing as single video")
         
     except ValueError as e:
         print(f"❌ API request validation error: {str(e)}")
@@ -290,9 +414,9 @@ def upload_url():
         print(f"❌ API request error: {str(e)}")
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
-    # Queue with retries
+    # ==================== QUEUE TASK ====================
     task = None
     last_err = None
     for attempt in range(3):
@@ -310,12 +434,24 @@ def upload_url():
         print(f"❌ Failed to queue API task after 3 attempts: {last_err}")
         return jsonify({"error": "❌ Redis queue unavailable, please try again later."}), 503
 
-    return jsonify({
+    # ==================== RESPONSE ====================
+    response = {
         "status": "queued",
         "task_id": task.id,
         "video_id": data["Id"],
-        "video_url": play_url
-    }), 200
+        "video_url": play_url[:100] + "..." if len(play_url) > 100 else play_url,
+        "num_questions": num_questions,
+        "num_pages": num_pages,
+    }
+    
+    # Include educational metadata in response if provided
+    if section_title:
+        response["section_title"] = section_title
+    if units:
+        response["units_count"] = len(units)
+        response["units"] = units
+    
+    return jsonify(response), 200
 
 # ==================== Debug Routes (Optional) ====================
 @app.route('/debug/uploads', methods=['GET'])
@@ -342,6 +478,58 @@ def debug_uploads():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/test', methods=['POST'])
+def test_api():
+    """
+    Test endpoint to validate API request format without processing.
+    Useful for testing the new SectionTitle and Units fields.
+    """
+    try:
+        data = request.get_json(force=True)
+        
+        # Check required fields
+        required_keys = {"Id", "TeamId", "SectionNo", "PlayUrl"}
+        missing = required_keys - set(data.keys()) if data else required_keys
+        
+        if missing:
+            return jsonify({
+                "valid": False,
+                "error": f"Missing required keys: {list(missing)}",
+                "received_keys": list(data.keys()) if data else []
+            }), 400
+        
+        # Validate Units if provided
+        units = data.get("Units", [])
+        if units:
+            is_valid, error_msg = validate_units(units)
+            if not is_valid:
+                return jsonify({
+                    "valid": False,
+                    "error": error_msg
+                }), 400
+        
+        # Return validation success
+        return jsonify({
+            "valid": True,
+            "message": "API request format is valid",
+            "received": {
+                "id": data["Id"],
+                "team_id": data["TeamId"],
+                "section_no": data["SectionNo"],
+                "play_url": data["PlayUrl"][:50] + "...",
+                "section_title": data.get("SectionTitle"),
+                "units_count": len(units) if units else 0,
+                "num_questions": data.get("NumQuestions", 10),
+                "num_pages": data.get("NumPages", 3)
+            }
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "valid": False,
+            "error": str(e)
+        }), 400
 
 if __name__ == "__main__":
     app.run(debug=True, host='0.0.0.0', port=5000)
