@@ -1124,13 +1124,25 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             logger.warning("⚠️  Chapter generation returned old format (no metadata)")
 
         # ---- Q&A + notes ----
+        # ---- Q&A + notes ----
         logger.info("📚 Generating Q&A and lecture notes (ASR-first)...")
+        
+        # ← LOG EDUCATIONAL METADATA FOR Q&A
+        if section_title or units:
+            logger.info("📚 Passing educational metadata to Q&A generation")
+            if section_title:
+                logger.info(f"   • Section: {section_title}")
+            if units:
+                logger.info(f"   • Units: {len(units)} learning units to structure Q&A")
+        
         qa_result = generate_qa_and_notes(
             processing_result, 
             video_info, 
             raw_asr_text,
-            chapters_dict=chapters_dict,           # ← ADD THIS
-            hierarchical_metadata=chapter_metadata  # ← ADD THIS
+            chapters_dict=chapters_dict,           
+            hierarchical_metadata=chapter_metadata,
+            section_title=section_title,        # ← ADD THIS
+            units=units                          # ← ADD THIS
         )
 
         if qa_result:
