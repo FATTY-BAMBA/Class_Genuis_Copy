@@ -995,7 +995,9 @@ def build_lecture_notes_prompt_v2(
     max_words = (num_pages + 1) * 350
 
     # --- ENHANCED PROMPT ---
+
     prompt = f"""
+{edu_metadata_context}
 你是一位資深的課程編輯和教學設計專家。你的核心任務是將原始的講座逐字稿**轉化、提煉、重構**為一份結構清晰、重點突出、最適合學生複習與深化理解的**終極講義與學習指南**。
 
 ### 核心原則
