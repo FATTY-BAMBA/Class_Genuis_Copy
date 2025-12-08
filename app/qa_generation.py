@@ -1849,6 +1849,8 @@ def generate_educational_content(
     chapters: Optional[Dict[str, str]] = None,  # {"00:10:17": "[課程導入] 課程開始"}
     course_summary: Optional[Dict[str, str]] = None,  # DEPRECATED: Use hierarchical_metadata instead
     hierarchical_metadata: Optional[Dict] = None,  # ← ADD THIS! Full metadata from chapter generation
+    section_title: Optional[str] = None,      # ← ADD THIS
+    units: Optional[List[Dict]] = None,       # ← ADD THIS
     # Existing parameters
     shuffle_options: bool = False,
     regenerate_explanations: bool = False,
