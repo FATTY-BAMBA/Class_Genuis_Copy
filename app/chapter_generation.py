@@ -771,6 +771,18 @@ def hierarchical_multipass_generation(
         video_info = f"課程檔名：{clean_title}\n"
         logger.info(f"📚 Video title: {clean_title}")
     
+    # ← ADD THIS LOGGING BLOCK
+    if section_title or units:
+        logger.info("=" * 60)
+        logger.info("📚 EDUCATIONAL METADATA PROVIDED")
+        if section_title:
+            logger.info(f"   📖 Section: {section_title}")
+        if units:
+            logger.info(f"   📑 Units: {len(units)} predefined learning units")
+            for unit in units:
+                logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
+        logger.info("=" * 60)
+    
     educational_context = build_educational_context(section_title, units)
     
     structure_prompt = f"""
