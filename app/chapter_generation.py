@@ -1400,6 +1400,8 @@ def generate_chapters(
         duration=duration,
         video_id=video_id,
         video_title=video_title,  # ← Make sure this is passed
+        section_title=section_title,        # ← ADD
+        units=units,                         # ← ADD
         run_dir=run_dir,
         progress_callback=progress_callback,
         ocr_context_override=ocr_context_override,
