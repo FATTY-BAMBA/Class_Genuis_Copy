@@ -1875,8 +1875,21 @@ def generate_educational_content(
 
     try:
         logger.info(f"Starting educational content generation for video {video_id}")
+        
+        # Log educational metadata if provided
+        if section_title or units:
+            logger.info("=" * 60)
+            logger.info("📚 EDUCATIONAL METADATA RECEIVED")
+            if section_title:
+                logger.info(f"   📖 Section Title: {section_title}")
+            if units:
+                logger.info(f"   📑 Units ({len(units)}):")
+                for unit in units:
+                    logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
+            logger.info("=" * 60)
 
         config = EducationalContentConfig()
+
         if not validate_config(config):
             raise RuntimeError("Configuration validation failed")
 
