@@ -453,6 +453,70 @@ def build_topics_summary_prompt(transcript: str,
     
     return prompt
 
+
+# ==================== EDUCATIONAL METADATA HELPERS ====================
+def build_educational_metadata_context(
+    section_title: Optional[str],
+    units: Optional[List[Dict]]
+) -> str:
+    """
+    Build educational context from SectionTitle and Units metadata.
+    Similar to chapter_generation.py approach but for Q&A context.
+    
+    Args:
+        section_title: Course section title (e.g., "室內設計實務 廚具規劃")
+        units: List of units with UnitNo and Title
+        
+    Returns:
+        Formatted context string for prompt enhancement
+    """
+    if not section_title and not units:
+        return ""
+    
+    context_parts = []
+    
+    if section_title:
+        context_parts.append(f"# 📚 課程單元資訊")
+        context_parts.append(f"本影片屬於課程單元：**{section_title}**")
+        context_parts.append("")
+    
+    if units:
+        context_parts.append(f"## 預定教學單元結構 ({len(units)} 個單元)")
+        context_parts.append("本課程包含以下教學單元：")
+        for unit in units:
+            context_parts.append(f"   {unit['UnitNo']}. {unit['Title']}")
+        context_parts.append("")
+        
+        context_parts.append("## Q&A 設計指引")
+        context_parts.append("✅ 題目應涵蓋各個教學單元的核心知識點")
+        context_parts.append("✅ 在可能的情況下，為每個單元設計相應題目")
+        context_parts.append(f"✅ 建議分配：每單元 {max(1, 10 // len(units))} 題左右")
+        context_parts.append("✅ 題目標籤 (tags) 中可標註相關單元編號")
+        context_parts.append("")
+        
+        context_parts.append("## 講義筆記指引")
+        context_parts.append("✅ 講義章節應對應教學單元結構")
+        context_parts.append("✅ 為每個單元提供清晰的學習要點整理")
+        context_parts.append("✅ 章節標題建議格式：[單元N：單元名稱] 具體內容")
+    
+    return "\n".join(context_parts)
+
+
+def extract_unit_tags(units: Optional[List[Dict]]) -> List[str]:
+    """
+    Extract unit titles as potential tags for MCQs.
+    
+    Args:
+        units: List of units with UnitNo and Title
+        
+    Returns:
+        List of unit titles suitable for tagging
+    """
+    if not units:
+        return []
+    
+    return [f"單元{unit['UnitNo']}：{unit['Title']}" for unit in units]
+
 def parse_topics_summary_response(response_text: str) -> tuple[List[Dict], str, List[str]]:
     """
     Parse topics, summary, and key takeaways from LLM response.
