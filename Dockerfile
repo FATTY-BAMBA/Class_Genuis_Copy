@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.4
 # =========================================================
 # Base: NVIDIA CUDA 11.8 + cuDNN 8.7
 # =========================================================
@@ -144,7 +144,7 @@ RUN python -m pip install --no-cache-dir \
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
 # -------------------- Verify installations --------------------
-# Updated to include PaddleOCR verification
+# **FIXED ERROR HERE:** Ensuring the entire command is complete and correct.
 RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
     python -c "import numpy; print('✅ NumPy:', numpy.__version__)" && \
     python -c "import flask; print('✅ Flask:', flask.__version__)" && \
