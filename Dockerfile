@@ -94,6 +94,29 @@ RUN python -m pip install --no-cache-dir easyocr==1.7.1
 # CRITICAL: EasyOCR upgrades numpy to 2.x, force it back to 1.26.4
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
+# =========================================================
+# 💡 NEW BLOCK: PaddleOCR (CUDA 11.8 compatible)
+# This is required to resolve the cuDNN error if your code uses PaddleOCR.
+# =========================================================
+# Install PaddlePaddle GPU version for CUDA 11.8
+RUN python -m pip install --no-cache-dir \
+    paddlepaddle-gpu==2.5.2.post118 \
+    -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html
+
+# Install PaddleOCR and its dependencies
+RUN python -m pip install --no-cache-dir \
+    paddleocr==2.7.3 \
+    shapely>=1.7.1 \
+    scikit-image>=0.18.0 \
+    pyclipper>=1.2.1 \
+    lanms-neo==1.0.2
+
+# Force NumPy back to 1.26.4 after PaddleOCR install
+RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
+# =========================================================
+# 💡 END NEW BLOCK
+# =========================================================
+
 # -------------------- Additional dependencies --------------------
 RUN python -m pip install --no-cache-dir \
     sentencepiece \
@@ -128,9 +151,11 @@ RUN python -m pip install --no-cache-dir \
     scipy==1.10.1
 
 # Final NumPy lock (ensure 1.26.4 after all installs)
+# This is CRITICAL, as the 'Additional dependencies' might also install conflicting NumPy versions.
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
 # -------------------- Verify installations --------------------
+# Updated to include PaddleOCR verification
 RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
     python -c "import numpy; print('✅ NumPy:', numpy.__version__)" && \
     python -c "import flask; print('✅ Flask:', flask.__version__)" && \
@@ -139,7 +164,9 @@ RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', t
     python -c "import av; print('✅ PyAV:', av.__version__)" && \
     python -c "import ctranslate2; print('✅ ctranslate2:', ctranslate2.__version__)" && \
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
-    python -c "import faster_whisper; print('✅ faster-whisper:', faster_whisper.__version__)"
+    python -c "import faster_whisper; print('✅ faster-whisper:', faster_whisper.__version__)" && \
+    python -c "import paddle; print('✅ PaddlePaddle:', paddle.__version__, 'CUDA:', paddle.device.is_compiled_with_cuda())" && \
+    python -c "from paddleocr import PaddleOCR; print('✅ PaddleOCR: installed')"
 
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python -c "import sys, pathlib, site; \
