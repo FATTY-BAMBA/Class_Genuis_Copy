@@ -28,6 +28,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GLOG_logtostderr=0 \
     FLAGS_fraction_of_gpu_memory_to_use=0.9
 
+# **CRITICAL FIX:** Add CUDA runtime paths for dynamic linking.
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+
 # -------------------- System deps --------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config libcairo2-dev \
@@ -144,7 +147,6 @@ RUN python -m pip install --no-cache-dir \
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
 # -------------------- Verify installations --------------------
-# **FIXED ERROR HERE:** Ensuring the entire command is complete and correct.
 RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
     python -c "import numpy; print('✅ NumPy:', numpy.__version__)" && \
     python -c "import flask; print('✅ Flask:', flask.__version__)" && \
