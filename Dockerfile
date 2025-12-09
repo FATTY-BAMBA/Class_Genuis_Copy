@@ -94,28 +94,18 @@ RUN python -m pip install --no-cache-dir easyocr==1.7.1
 # CRITICAL: EasyOCR upgrades numpy to 2.x, force it back to 1.26.4
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
-# =========================================================
-# 💡 NEW BLOCK: PaddleOCR (CUDA 11.8 compatible)
-# This is required to resolve the cuDNN error if your code uses PaddleOCR.
-# =========================================================
-# Install PaddlePaddle GPU version for CUDA 11.8
+# -------------------- PaddleOCR (CUDA 11.8 compatible) --------------------
+# Install PaddlePaddle GPU version 3.2.0 for CUDA 11.8 to ensure Python 3.11 compatibility.
 RUN python -m pip install --no-cache-dir \
-    paddlepaddle-gpu==2.5.2.post118 \
-    -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html
+    paddlepaddle-gpu==3.2.0 \
+    -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
 
 # Install PaddleOCR and its dependencies
 RUN python -m pip install --no-cache-dir \
-    paddleocr==2.7.3 \
-    shapely>=1.7.1 \
-    scikit-image>=0.18.0 \
-    pyclipper>=1.2.1 \
-    lanms-neo==1.0.2
+    "paddleocr[all]"
 
 # Force NumPy back to 1.26.4 after PaddleOCR install
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
-# =========================================================
-# 💡 END NEW BLOCK
-# =========================================================
 
 # -------------------- Additional dependencies --------------------
 RUN python -m pip install --no-cache-dir \
@@ -151,7 +141,6 @@ RUN python -m pip install --no-cache-dir \
     scipy==1.10.1
 
 # Final NumPy lock (ensure 1.26.4 after all installs)
-# This is CRITICAL, as the 'Additional dependencies' might also install conflicting NumPy versions.
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
 # -------------------- Verify installations --------------------
