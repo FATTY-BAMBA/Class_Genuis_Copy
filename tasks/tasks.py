@@ -535,12 +535,14 @@ def chapter_llama_asr_processing_fn(video_path: str, window_sec: int = QA_WINDOW
         
         if not segs_raw:
             logger.error("❌ No ASR lines could be parsed")
+            logger.error("❌ VAD removed all audio - video likely has no valid speech/audio")
             return {
                 "success": False,
                 "audio_segments": [],
                 "ocr_segments": [],
                 "method": "chapter_llama_asr",
-                "error": "no_asr_lines"
+                "error": "no_valid_audio",
+                "error_message": "Video has no valid audio or speech content"
             }
         
         logger.info(f"✅ Parsed {len(segs_raw)} ASR segments")
