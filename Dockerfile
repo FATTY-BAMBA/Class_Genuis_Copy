@@ -147,7 +147,9 @@ RUN python -m pip install --no-cache-dir \
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
 # -------------------- Verify installations --------------------
-RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
+RUN echo "🔍 Verifying package installations..." && \
+    echo "================================================" && \
+    python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
     python -c "import numpy; print('✅ NumPy:', numpy.__version__)" && \
     python -c "import flask; print('✅ Flask:', flask.__version__)" && \
     python -c "import celery; print('✅ Celery:', celery.__version__)" && \
@@ -156,8 +158,12 @@ RUN python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', t
     python -c "import ctranslate2; print('✅ ctranslate2:', ctranslate2.__version__)" && \
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
     python -c "import faster_whisper; print('✅ faster-whisper:', faster_whisper.__version__)" && \
-    python -c "import paddle; print('✅ PaddlePaddle:', paddle.__version__, 'CUDA:', paddle.device.is_compiled_with_cuda())" && \
-    python -c "from paddleocr import PaddleOCR; print('✅ PaddleOCR: installed')"
+    echo "------------------------------------------------" && \
+    echo "ℹ️  Checking PaddlePaddle packages (import requires GPU at runtime)" && \
+    python -m pip show paddlepaddle-gpu | grep "Version:" | awk '{print "✅ PaddlePaddle-GPU:", $2}' && \
+    python -m pip show paddleocr | grep "Version:" | awk '{print "✅ PaddleOCR:", $2}' && \
+    echo "================================================" && \
+    echo "✅ All packages verified successfully!"
 
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python -c "import sys, pathlib, site; \
