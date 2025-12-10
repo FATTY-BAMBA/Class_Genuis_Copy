@@ -460,9 +460,9 @@ class OCRProcessor:
 
                         # Dynamic thresholds
                         is_latin = _ascii_ratio(txt) >= 0.7
-                        keep = (conf >= 0.85) if is_latin else (
+                        keep = (conf >= 0.60) if is_latin else (
                             conf >= _OCR_CONF or
-                            (conf >= 0.70 and _cjk_count(txt) >= 16)
+                            (conf >= 0.55 and _cjk_count(txt) >= 4)
                         )
                         
                         if keep:
