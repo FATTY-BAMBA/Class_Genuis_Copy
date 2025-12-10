@@ -1009,9 +1009,45 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
         )
         
         if not processing_result.get("success"):
+            error_code = processing_result.get("error")
+            error_msg = processing_result.get("error_message", error_code)
+            
             logger.error("❌ ASR PROCESSING FAILED")
-            logger.error(f"Error: {processing_result.get('error')}")
-            raise RuntimeError(f"ASR processing failed: {processing_result.get('error')}")
+            logger.error(f"Error: {error_msg}")
+            
+            # If it's a "no valid audio" error, notify client and don't retry
+            if error_code == "no_valid_audio":
+                logger.error("❌ Video has no usable audio - notifying client and skipping retry")
+                
+                error_payload = {
+                    "success": False,
+                    "Id": video_info["Id"],
+                    "TeamId": video_info["TeamId"],
+                    "SectionNo": video_info["SectionNo"],
+                    "error": "no_valid_audio",
+                    "error_message": "Video has no valid audio or speech content",
+                    "processing_time": time.time() - processing_start_time,
+                    "video_info": video_info
+                }
+                
+                # Notify client
+                post_to_client_api(error_payload)
+                
+                # Save error report
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                error_dir = os.path.join(RUNS_BASE, f"{video_info['Id']}_{ts}")
+                os.makedirs(error_dir, exist_ok=True)
+                
+                error_file = os.path.join(error_dir, "error_report.json")
+                with open(error_file, "w", encoding="utf-8") as f:
+                    json.dump(error_payload, f, indent=2, ensure_ascii=False)
+                logger.info(f"💾 Saved error report to: {error_file}")
+                
+                # Don't retry - this is a permanent failure
+                return error_payload
+            
+            # For other errors, retry as normal
+            raise RuntimeError(f"ASR processing failed: {error_msg}")
 
         # ---- Video Chaptering ----
         logger.info("📑 Generating video chapters...")
