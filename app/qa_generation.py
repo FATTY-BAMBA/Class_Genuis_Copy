@@ -53,7 +53,7 @@ def report(stage: str, progress_callback: Optional[Callable[[str, int], None]]):
 class EducationalContentConfig:
     """Configuration for educational content generation service"""
     service_type: str = os.getenv("EDU_SERVICE_TYPE", "openai")
-    openai_model: str = os.getenv("EDU_OPENAI_MODEL", "gpt-4o")
+    openai_model: str = os.getenv("EDU_OPENAI_MODEL", "gpt-4o-mini")
     azure_model: str = os.getenv("EDU_AZURE_MODEL", "Meta-Llama-3.1-8B-Instruct")
     openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
     azure_endpoint: Optional[str] = os.getenv("AZURE_AI_ENDPOINT")
