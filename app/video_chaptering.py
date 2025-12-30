@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ==================== CONFIGURATION ====================
 # These can now be set from the main app's environment/config
 SERVICE_TYPE = os.getenv("CHAPTER_SERVICE_TYPE", "openai")  # "openai" or "azure"
-OPENAI_MODEL = os.getenv("CHAPTER_OPENAI_MODEL", "gpt-4o")
+OPENAI_MODEL = os.getenv("CHAPTER_OPENAI_MODEL", "gpt-4o-mini")
 AZURE_MODEL = os.getenv("CHAPTER_AZURE_MODEL", "Meta-Llama-3.1-8B-Instruct")
 
 # ─────────────────────────
