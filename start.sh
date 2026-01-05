@@ -172,11 +172,6 @@ cleanup() {
   echo
   echo "Shutting down..."
   
-  # Kill tail process if exists
-  if [[ "${TAIL_PID:-}" != "" ]] && kill -0 "${TAIL_PID}" 2>/dev/null; then
-    kill -TERM "${TAIL_PID}" 2>/dev/null || true
-  fi
-  
   # Stop Gunicorn
   if [[ -f /tmp/gunicorn.pid ]]; then
     PID=$(cat /tmp/gunicorn.pid 2>/dev/null || true)
@@ -268,10 +263,9 @@ echo "Starting Celery worker..."
 touch "${CELERY_LOG}"
 chmod 666 "${CELERY_LOG}"
 
-# Start Celery in background
+# Start Celery with tee (logs to both stdout and file)
 celery -A tasks.tasks:celery worker "${CELERY_COMMON_OPTS[@]}" \
-  --logfile="${CELERY_LOG}" \
-  --pidfile=/tmp/celery.pid &
+  --pidfile=/tmp/celery.pid 2>&1 | tee "${CELERY_LOG}" &
 CELERY_BG_PID=$!
 
 # Wait for Celery PID file with extended timeout
@@ -363,25 +357,19 @@ else
   echo "⚠️  Application started (Celery failed)"
 fi
 echo "📍 Application: http://0.0.0.0:5000"
-echo "📋 Logs saved to:"
-echo "    - Celery  : ${CELERY_LOG}"
+echo "📋 Logs:"
+echo "    - Live logs: RunPod UI → Logs tab"
+echo "    - Celery file: ${CELERY_LOG}"
 echo "    - Gunicorn: ${GUNICORN_LOG}"
 echo "============================================"
 echo
 
-# Stream logs
+# Keep container alive
 if [ "${CELERY_STARTED}" = "1" ]; then
-  echo "📊 Streaming Celery logs (filtered)..."
-  echo "    Hiding: PaddlePaddle warnings"
-  echo "    Showing: Downloads, ASR, Processing, Errors"
-  echo "============================================"
+  echo "📊 Celery worker running (logs visible in RunPod UI)"
+  echo "    Also streaming to: ${CELERY_LOG}"
   echo
-  
-  # Stream Celery logs with filtering
-  tail -f "${CELERY_LOG}" | grep -v "Fail to fscanf\|default_variables.cpp" &
-  TAIL_PID=$!
-  
-  # Keep script alive by waiting for the background process
+  # Wait for Celery background process
   wait "${CELERY_BG_PID}"
 else
   echo "📊 Keeping container alive for debugging..."
