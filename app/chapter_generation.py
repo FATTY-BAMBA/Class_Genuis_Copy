@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 class ChapterConfig:
     """Configuration for chapter generation service"""
     service_type: str = os.getenv("CHAPTER_SERVICE_TYPE", "openai")  # "openai" or "azure"
-    openai_model: str = os.getenv("CHAPTER_OPENAI_MODEL", "gpt-4o")
+    openai_model: str = os.getenv("CHAPTER_OPENAI_MODEL", "gpt-4o-mini")
     azure_model: str = os.getenv("CHAPTER_AZURE_MODEL", "Meta-Llama-3.1-8B-Instruct")
     openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
     azure_endpoint: Optional[str] = os.getenv("AZURE_AI_ENDPOINT")
