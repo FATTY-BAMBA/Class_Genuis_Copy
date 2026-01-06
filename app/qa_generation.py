@@ -1239,7 +1239,7 @@ def call_llm(
         }
         
         # Add JSON format enforcement if requested
-        if force_json and model in ["gpt-4o", "gpt-4-turbo-preview", "gpt-3.5-turbo-1106"]:
+        if force_json and model in ["gpt-4o-mini", "gpt-4-turbo-preview", "gpt-3.5-turbo-1106"]:
             kwargs["response_format"] = {"type": "json_object"}
             logger.info("Using JSON format enforcement for OpenAI API")
         
@@ -2057,7 +2057,7 @@ def generate_educational_content(
 
         # Centralize context budgets per model
         MODEL_BUDGETS = {
-            "gpt-4o": 128_000,
+            "gpt-4o-mini": 128_000,
             "Meta-Llama-3.1-8B-Instruct": 128_000,
         }
         ctx_budget = MODEL_BUDGETS.get(model, 100_000)
