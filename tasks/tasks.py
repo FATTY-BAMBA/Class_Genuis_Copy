@@ -1248,23 +1248,17 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             for unit in suggested_units:
                 logger.info(f"      {unit['UnitNo']}. {unit['Title']} @ {unit['Time']}")
         logger.info("=" * 60)
-
-        # ========== CONTINUE WITH EXISTING PROCESSING ==========
         if qa_result:
-            # Add Units and SuggestedUnits to the payload
-            qa_result["Units"] = units or []
-            qa_result["SuggestedUnits"] = suggested_units or []
-            logger.info("✅ Added Units and SuggestedUnits to client payload")
-
+            # ========== METADATA COLLECTION (Don't add to client payload) ==========
             total_processing_time = time.time() - processing_start_time
-            qa_result["total_processing_time"] = total_processing_time
-
+    
             audio_used    = processing_result.get("audio_segments_used", processing_result.get("audio_segments", []))
             audio_raw     = processing_result.get("audio_segments_raw", [])
             ocr_filtered  = processing_result.get("ocr_segments_filtered", processing_result.get("ocr_segments", []))
             ocr_raw       = processing_result.get("ocr_segments_raw", [])
             ocr_ctx_md    = processing_result.get("ocr_context_markdown", "")
 
+            # ========== PERSIST ARTIFACTS TO WORKSPACE ==========
             # Persist ASR/OCR artifacts (aligned-first)
             with open(os.path.join(run_dir, "audio_segments.raw.json"), "w", encoding="utf-8") as f:
                 json.dump(audio_raw, f, indent=2, ensure_ascii=False)
@@ -1275,7 +1269,6 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             if WRITE_FIVEMIN_ARTIFACTS:
                 with open(os.path.join(run_dir, f"audio_{WIN_LABEL}.json"), "w", encoding="utf-8") as f:
                     json.dump(audio_used, f, indent=2, ensure_ascii=False)
-                # (legacy) keep if you still want to compare:
                 with open(os.path.join(run_dir, "audio_segments.used.json"), "w", encoding="utf-8") as f:
                     json.dump(audio_used, f, indent=2, ensure_ascii=False)
 
@@ -1298,39 +1291,73 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             except Exception as _e:
                 logger.warning("⚠️ Failed writing combined_text_for_gpt.txt: %s", _e)
 
-            # Get chapters from the chaptering result and merge into final payload
-            # ============ MERGE CHAPTERS INTO FINAL PAYLOAD ============
-            # Use chapters_dict that was already extracted earlier
+            # ========== MERGE CHAPTERS INTO PAYLOAD ==========
             if not chapters_dict:
                 logger.warning("⚠️ No chapters returned; using empty dict")
                 chapters_dict = {}
-            
+    
             qa_result["chapters"] = chapters_dict
-            
-            # Optional: Add metadata summary for analytics/debugging
-            if chapter_metadata:
-                qa_result["chapter_metadata"] = {
-                    "generation_method": chapter_metadata.get("generation_method"),
-                    "educational_quality_score": chapter_metadata.get("educational_quality_score"),
-                    "strategy": chapter_metadata.get("strategy"),
-                    "token_usage": chapter_metadata.get("token_usage")
-                }
-                logger.info(f"📊 Added chapter metadata to payload (quality: {chapter_metadata.get('educational_quality_score', 0):.2f})")
 
             # Save chapters separately
             with open(os.path.join(run_dir, "chapters.json"), "w", encoding="utf-8") as f:
                 json.dump(chapters_dict, f, indent=2, ensure_ascii=False)
-            
+    
             # Save metadata separately for debugging
             if chapter_metadata:
                 with open(os.path.join(run_dir, "chapter_metadata.json"), "w", encoding="utf-8") as f:
                     json.dump(chapter_metadata, f, indent=2, ensure_ascii=False)
                 logger.info(f"💾 Saved chapter metadata to: {run_dir}/chapter_metadata.json")
 
+            # ========== SAVE COMPREHENSIVE WORKSPACE ARTIFACT ==========
+            workspace_artifact = {
+                **qa_result,
+                "Units": units or [],
+                "SuggestedUnits": suggested_units or [],
+                "total_processing_time": total_processing_time,
+                "processing_metadata": {
+                    "processing_method": processing_result.get("method"),
+                    "optimized_processing_time": processing_result.get("processing_time", 0),
+                    "cache_used": processing_result.get("cache_used", False),
+                    "fallback_used": processing_result.get("fallback_used", False),
+                    "audio_blocks_processed": len(audio_used),
+                    "ocr_segments_processed": len(ocr_filtered),
+                    "duration": processing_result.get("duration"),
+                    "speech_duration": processing_result.get("speech_duration"),
+                    "removed_duration": processing_result.get("removed_duration"),
+                    "speech_ratio": processing_result.get("speech_ratio"),
+                    "removed_ratio": processing_result.get("removed_ratio"),
+                },
+                "chapter_metadata": chapter_metadata,
+            }
+
+            # Save full workspace result
+            workspace_path = os.path.join(run_dir, "full_processing_result.json")
+            with open(workspace_path, "w", encoding="utf-8") as f:
+                json.dump(workspace_artifact, f, indent=2, ensure_ascii=False)
+            logger.info(f"💾 Saved full workspace artifact to {workspace_path}")
+
+            # ========== BUILD CLEAN CLIENT PAYLOAD ==========
+            client_payload = {
+                "Id": qa_result["Id"],
+                "TeamId": qa_result["TeamId"],
+                "SectionNo": qa_result["SectionNo"],
+                "CreatedAt": qa_result["CreatedAt"],
+                "Questions": qa_result["Questions"],
+                "CourseNote": qa_result["CourseNote"],
+                "chapters": qa_result["chapters"]
+            }
+
+            # Save clean client payload
+            client_path = os.path.join(run_dir, "client_payload.json")
+            with open(client_path, "w", encoding="utf-8") as f:
+                json.dump(client_payload, f, indent=2, ensure_ascii=False)
+            logger.info(f"💾 Saved clean client payload to {client_path}")
+
+            # Save legacy QA output (for backward compatibility)
             output_path = os.path.join(run_dir, "qa_and_notes.json")
             with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(qa_result, f, indent=2, ensure_ascii=False)
-            logger.info(f"💾 Saved result to {output_path}")
+                json.dump(workspace_artifact, f, indent=2, ensure_ascii=False)  # Save full version
+            logger.info(f"💾 Saved legacy output to {output_path}")
 
             transcript_path = os.path.join(run_dir, "merged_transcript.txt")
             with open(transcript_path, "w", encoding="utf-8") as f:
@@ -1339,8 +1366,8 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                     f.write(f"[{s:.1f} - {e:.1f}] {t}\n")
             logger.info(f"💾 Saved transcript to {transcript_path}")
 
-            # Optionally POST to client
-            post_to_client_api(qa_result)
+            # ========== SEND CLEAN PAYLOAD TO CLIENT API ==========
+            post_to_client_api(client_payload)  # ← Only send clean data
             logger.info(f"✅ Complete pipeline finished in {total_processing_time:.1f}s")
         else:
             logger.error("❌ Q&A generation failed")
