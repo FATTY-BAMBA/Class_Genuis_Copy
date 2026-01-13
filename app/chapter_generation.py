@@ -244,6 +244,97 @@ def parse_summary_from_output(output_text: str) -> Dict[str, str]:
     
     return summary
 
+def validate_and_normalize_timestamps(
+    chapters: Dict[str, str], 
+    duration_sec: int,
+    video_id: str = "unknown"
+) -> Dict[str, str]:
+    """
+    Validate and normalize chapter timestamps to ensure:
+    1. All timestamps are in HH:MM:SS format
+    2. All timestamps are within video duration
+    3. Timestamps are distributed across the video (not just first few minutes)
+    4. Suspicious clustering is detected and logged
+    
+    Returns: Cleaned and validated chapters dict
+    """
+    if not chapters:
+        return {}
+    
+    def ts_to_seconds(ts: str) -> int:
+        """Convert HH:MM:SS to seconds"""
+        try:
+            parts = ts.split(':')
+            if len(parts) == 3:
+                h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                return h * 3600 + m * 60 + s
+            elif len(parts) == 2:
+                m, s = int(parts[0]), int(parts[1])
+                return m * 60 + s
+            return 0
+        except:
+            return 0
+    
+    validated = {}
+    timestamps_in_seconds = []
+    
+    for ts, title in chapters.items():
+        ts_normalized = _normalize_ts(ts)  # Ensure HH:MM:SS format
+        ts_sec = ts_to_seconds(ts_normalized)
+        
+        # Check 1: Within video duration
+        if ts_sec > duration_sec:
+            logger.warning(f"⚠️ [{video_id}] Skipping chapter at {ts_normalized} ({ts_sec}s) - exceeds duration ({duration_sec}s)")
+            continue
+        
+        # Check 2: Not negative
+        if ts_sec < 0:
+            logger.warning(f"⚠️ [{video_id}] Skipping chapter at {ts_normalized} - negative timestamp")
+            continue
+        
+        validated[ts_normalized] = title
+        timestamps_in_seconds.append(ts_sec)
+    
+    if not validated:
+        logger.error(f"❌ [{video_id}] No valid chapters after timestamp validation!")
+        return {}
+    
+    # Check 3: Detect suspicious clustering (all chapters in first 10% of video)
+    first_chapter_sec = min(timestamps_in_seconds)
+    last_chapter_sec = max(timestamps_in_seconds)
+    chapter_span_sec = last_chapter_sec - first_chapter_sec
+    chapter_span_percent = (chapter_span_sec / duration_sec) * 100 if duration_sec > 0 else 0
+    
+    logger.info(f"📊 [{video_id}] Chapter span: {sec_to_hms(int(chapter_span_sec))} ({chapter_span_percent:.1f}% of video)")
+    
+    # CRITICAL CHECK: If all chapters are in first 10% of video, something is wrong
+    if chapter_span_percent < 10 and duration_sec > 600:  # Only check for videos > 10 min
+        logger.warning("=" * 70)
+        logger.warning(f"⚠️  [{video_id}] SUSPICIOUS CHAPTER CLUSTERING DETECTED!")
+        logger.warning(f"⚠️  All {len(validated)} chapters are in first {chapter_span_percent:.1f}% of video")
+        logger.warning(f"⚠️  Video duration: {sec_to_hms(int(duration_sec))} ({duration_sec}s)")
+        logger.warning(f"⚠️  Chapter range: {sec_to_hms(int(first_chapter_sec))} to {sec_to_hms(int(last_chapter_sec))}")
+        logger.warning(f"⚠️  This likely indicates LLM timestamp format confusion")
+        logger.warning("=" * 70)
+        
+        # Log first few chapters for debugging
+        logger.warning(f"⚠️  Chapters generated:")
+        for ts, title in sorted(validated.items(), key=lambda x: ts_to_seconds(x[0]))[:5]:
+            logger.warning(f"     {ts} - {title[:60]}")
+        if len(validated) > 5:
+            logger.warning(f"     ... and {len(validated) - 5} more")
+    
+    # Check 4: Detect if too many chapters are within first minute
+    chapters_in_first_minute = sum(1 for ts_sec in timestamps_in_seconds if ts_sec < 60)
+    if chapters_in_first_minute > len(timestamps_in_seconds) * 0.5:
+        logger.warning(f"⚠️ [{video_id}] {chapters_in_first_minute}/{len(timestamps_in_seconds)} chapters in first 60 seconds - possible timestamp error")
+    
+    # Summary
+    logger.info(f"✅ [{video_id}] Validated {len(validated)}/{len(chapters)} chapters")
+    logger.info(f"   First: {sec_to_hms(int(first_chapter_sec))} | Last: {sec_to_hms(int(last_chapter_sec))} | Span: {chapter_span_percent:.1f}%")
+    
+    return validated
+
 def globally_balance_chapters(
     chapters: Dict[str, str],
     duration_sec: int,
@@ -273,6 +364,13 @@ def globally_balance_chapters(
 
     # Content-aware deduplication
     dedup = []
+    # ✅ UNIVERSAL FIX: Scale merge threshold with video duration
+    # This prevents over-aggressive merging for long videos
+
+    adaptive_min_gap = max(120, min_gap_sec // 2)
+    
+    logger.info(f"📊 Chapter balancing: {len(chapters)} input chapters, merge threshold = {adaptive_min_gap}s (policy min_gap: {min_gap_sec}s)")
+    
     for s, ts, title in cands:
         if not dedup:
             dedup.append((s, ts, title))
@@ -285,8 +383,10 @@ def globally_balance_chapters(
         prev_module = extract_module_tag(dedup[-1][2])
         curr_module = extract_module_tag(title)
         
-        if time_gap < 120:  # Less than 2 minutes - always merge
+        # ✅ FIXED: Use adaptive threshold instead of hardcoded 120s
+        if time_gap < adaptive_min_gap:
             should_merge = True
+    
         elif prev_module and curr_module and prev_module == curr_module:
             # Same module tag - use min_gap_sec
             should_merge = time_gap < min_gap_sec * 0.7
@@ -905,11 +1005,13 @@ def hierarchical_multipass_generation(
 {ocr_text if ocr_text else "無視覺輔助內容"}
 
 請輸出格式：
-模塊名稱 ~ 預估時間範圍 ~ 核心學習點 ~ 教學方法
+模塊名稱 ~ 預估時間範圍（分鐘） ~ 核心學習點 ~ 教學方法
 
-範例：
-基礎工具操作 ~ 00:00-00:25 ~ Illustrator介面認識、基本工具使用 ~ 理論講解+實例演示
-進階設計技巧 ~ 00:25-00:50 ~ Logo設計、色彩管理、輸出設定 ~ 綜合案例+實際操作
+說明：時間範圍使用分鐘數表示，從0開始到{int(duration/60)}分鐘結束
+
+範例（本影片{int(duration/60)}分鐘）：
+基礎工具操作 ~ 0-{max(10, int(duration/60/10))}分鐘 ~ Illustrator介面認識、基本工具使用 ~ 理論講解+實例演示
+進階設計技巧 ~ {max(10, int(duration/60/10))}-{max(20, int(duration/60/5))}分鐘 ~ Logo設計、色彩管理、輸出設定 ~ 綜合案例+實際操作
 """
     
     logger.info(f"📤 PASS 2 prompt: ~{count_tokens_llama(modules_prompt):,} tokens")
@@ -1071,8 +1173,19 @@ HH:MM:SS - [模塊標籤] 具體章節標題
     logger.info("-" * 60)
     
     # Parse chapters from final output
-    chapters = parse_chapters_from_output(final_text)
-    logger.info(f"📊 Parsed {len(chapters)} chapters from LLM output")
+    chapters_raw = parse_chapters_from_output(final_text)
+    logger.info(f"📊 Parsed {len(chapters_raw)} chapters from LLM output")
+
+        # ✅ NEW: Validate and normalize timestamps
+    chapters = validate_and_normalize_timestamps(
+        chapters_raw, 
+        int(duration),
+        video_id=f"hierarchical_{int(time.time())}"
+    )
+    
+    if not chapters:
+        logger.error("❌ No valid chapters after timestamp validation, using raw chapters")
+        chapters = chapters_raw  # Fallback to raw if validation removes everything
     
     if chapters:
         first_chapter = list(chapters.keys())[0]
@@ -1317,7 +1430,19 @@ def generate_chapters_debug(
                 raw_llm_text = resp.choices[0].message.content
 
             # Parse chapters
-            chapters = parse_chapters_from_output(raw_llm_text)
+            # Parse chapters
+            chapters_raw = parse_chapters_from_output(raw_llm_text)
+
+            # ✅ NEW: Validate and normalize timestamps
+            chapters = validate_and_normalize_timestamps(
+                chapters_raw,
+                int(duration),
+                video_id=video_id
+            )
+            if not chapters:
+                logger.error("❌ No valid chapters after timestamp validation, using raw chapters")
+                chapters = chapters_raw  # Fallback
+
             # Parse structured summary
             course_summary = parse_summary_from_output(raw_llm_text)
             metadata = {'generation_method': 'single_pass',
