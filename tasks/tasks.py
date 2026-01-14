@@ -222,6 +222,48 @@ def post_to_client_api(payload):
     except Exception as e:
         logger.error(f"❌ POST failed: {e}", exc_info=True)
 
+def transform_chapters_to_units(chapters: dict) -> list:
+    """
+    Transform chapters from dict format to Units array format.
+    
+    Args:
+        chapters: Dict with timestamp keys and title values
+                 {"00:07:54": "[合成技術概述] 影像合成的基本概念", ...}
+    
+    Returns:
+        List of unit dicts in client API format
+        [{"UnitNo": 1, "Title": "...", "Time": "00:07:54"}, ...]
+    """
+    if not chapters:
+        logger.warning("No chapters to transform to Units format")
+        return []
+    
+    units = []
+    # Sort chapters by timestamp to ensure correct UnitNo ordering
+    sorted_chapters = sorted(chapters.items(), key=lambda x: x[0])
+    
+    logger.info(f"Transforming {len(sorted_chapters)} chapters to Units format")
+    
+    for idx, (timestamp, title) in enumerate(sorted_chapters, start=1):
+        # Clean up title: remove module tag brackets and reformat
+        # "[合成技術概述] 影像合成的基本概念" -> "合成技術概述 - 影像合成的基本概念"
+        clean_title = title.strip()
+        
+        if clean_title.startswith('[') and ']' in clean_title:
+            bracket_end = clean_title.index(']')
+            module_tag = clean_title[1:bracket_end].strip()
+            content = clean_title[bracket_end+1:].strip()
+            clean_title = f"{module_tag} - {content}" if content else module_tag
+        
+        units.append({
+            "UnitNo": idx,
+            "Title": clean_title,
+            "Time": timestamp
+        })
+    
+    logger.info(f"✅ Transformed to {len(units)} Units")
+    return units
+
 # ---------- ASR (chapter_llama → SingleVideo) ----------
 
 ASR_LINE_RE = re.compile(r"^\s*(\d{2}):(\d{2}):(\d{2})\s*:\s*(.+?)\s*$")
