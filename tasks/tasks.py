@@ -1379,6 +1379,24 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             logger.info(f"💾 Saved full workspace artifact to {workspace_path}")
 
             # ========== BUILD CLEAN CLIENT PAYLOAD ==========
+
+            # Transform chapters to Units format
+            units_from_chapters = transform_chapters_to_units(qa_result["chapters"])
+
+            # Prepare SuggestedUnits from incoming API (or empty if none provided)
+
+            suggested_units_from_api = []
+            if units and isinstance(units, list):
+                logger.info(f"📚 Including {len(units)} SuggestedUnits from incoming API")   
+                for idx, unit in enumerate(units, start=1):
+                    if isinstance(unit, dict):
+                        suggested_units_from_api.append({
+                            "UnitNo": unit.get("UnitNo", idx),
+                            "Title": unit.get("Title", ""),
+                             "Time": unit.get("Time", "")
+                         })                       
+            else:
+                logger.info("ℹ️  No SuggestedUnits in incoming API")
             client_payload = {
                 "Id": qa_result["Id"],
                 "TeamId": qa_result["TeamId"],
@@ -1386,8 +1404,10 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 "CreatedAt": qa_result["CreatedAt"],
                 "Questions": qa_result["Questions"],
                 "CourseNote": qa_result["CourseNote"],
-                "chapters": qa_result["chapters"]
+                "Units": units_from_chapters,              # ← NEW: Generated chapters in Units format
+                "SuggestedUnits": suggested_units_from_api  # ← NEW: Original units from API
             }
+            logger.info(f"📦 Client payload structure: Units={len(units_from_chapters)}, SuggestedUnits={len(suggested_units_from_api)}")
 
             # Save clean client payload
             client_path = os.path.join(run_dir, "client_payload.json")
