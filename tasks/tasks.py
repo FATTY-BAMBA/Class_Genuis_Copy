@@ -1353,8 +1353,9 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             # ========== SAVE COMPREHENSIVE WORKSPACE ARTIFACT ==========
             workspace_artifact = {
                 **qa_result,
-                "Units": units or [],
-                "SuggestedUnits": suggested_units or [],
+                "Units": units_from_chapters or [],                    # Generated chapters (transformed)
+                "SuggestedUnits": suggested_units_from_api or [],      # From incoming API
+                "AIGeneratedSuggestedUnits": suggested_units or [],    # Your AI suggestions
                 "total_processing_time": total_processing_time,
                 "processing_metadata": {
                     "processing_method": processing_result.get("method"),
@@ -1371,7 +1372,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 },
                 "chapter_metadata": chapter_metadata,
             }
-
+               
             # Save full workspace result
             workspace_path = os.path.join(run_dir, "full_processing_result.json")
             with open(workspace_path, "w", encoding="utf-8") as f:
