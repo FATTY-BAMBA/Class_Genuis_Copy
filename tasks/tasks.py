@@ -1350,6 +1350,30 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                     json.dump(chapter_metadata, f, indent=2, ensure_ascii=False)
                 logger.info(f"💾 Saved chapter metadata to: {run_dir}/chapter_metadata.json")
 
+            # ========== TRANSFORM CHAPTERS FOR CLIENT ==========
+            logger.info("🔄 Transforming chapters to client format...")
+
+            # Transform chapters to Units format (safe - returns [] if None)
+            units_from_chapters = transform_chapters_to_units(qa_result.get("chapters", {})) or []
+
+            # Prepare SuggestedUnits from incoming API (safe - defaults to [])
+            suggested_units_from_api = []
+            if units and isinstance(units, list):
+                logger.info(f"📚 Including {len(units)} SuggestedUnits from incoming API")
+                for idx, unit in enumerate(units, start=1):
+                    if isinstance(unit, dict):
+                        suggested_units_from_api.append({
+                            "UnitNo": unit.get("UnitNo", idx),
+                            "Title": unit.get("Title", ""),
+                            "Time": unit.get("Time", "")
+                        })
+            else:
+                logger.info("ℹ️  No SuggestedUnits in incoming API")
+                
+            # Safe defaults for all unit types
+            units_from_chapters = units_from_chapters or []
+            suggested_units_from_api = suggested_units_from_api or []
+
             # ========== SAVE COMPREHENSIVE WORKSPACE ARTIFACT ==========
             workspace_artifact = {
                 **qa_result,
@@ -1379,29 +1403,6 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 json.dump(workspace_artifact, f, indent=2, ensure_ascii=False)
             logger.info(f"💾 Saved full workspace artifact to {workspace_path}")
 
-            # ========== TRANSFORM CHAPTERS FOR CLIENT ==========
-            logger.info("🔄 Transforming chapters to client format...")
-
-            # Transform chapters to Units format (safe - returns [] if None)
-            units_from_chapters = transform_chapters_to_units(qa_result.get("chapters", {})) or []
-
-            # Prepare SuggestedUnits from incoming API (safe - defaults to [])
-            suggested_units_from_api = []
-            if units and isinstance(units, list):
-                logger.info(f"📚 Including {len(units)} SuggestedUnits from incoming API")
-                for idx, unit in enumerate(units, start=1):
-                    if isinstance(unit, dict):
-                        suggested_units_from_api.append({
-                            "UnitNo": unit.get("UnitNo", idx),
-                            "Title": unit.get("Title", ""),
-                            "Time": unit.get("Time", "")
-                        })
-            else:
-                logger.info("ℹ️  No SuggestedUnits in incoming API")
-                
-            # Safe defaults for all unit types
-            units_from_chapters = units_from_chapters or []
-            suggested_units_from_api = suggested_units_from_api or []
 
             # ========== BUILD CLEAN CLIENT PAYLOAD ==========
             client_payload = {
