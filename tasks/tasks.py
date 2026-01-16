@@ -1359,7 +1359,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             # Prepare SuggestedUnits from incoming API (safe - defaults to [])
             units_from_api = []
             if units and isinstance(units, list):
-                logger.info(f"📚 Including {len(units)} SuggestedUnits from incoming API")
+                logger.info(f"📚 Including {len(units)} Units from incoming API")  # ← Fixed
                 for idx, unit in enumerate(units, start=1):
                     if isinstance(unit, dict):
                         units_from_api.append({
@@ -1368,12 +1368,12 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                             "Time": unit.get("Time", "")
                         })
             else:
-                logger.info(f"📚 Including {len(units)} Units from incoming API")
-                
+                logger.info("ℹ️  No Units provided in incoming API")  
+
             # Safe defaults for all unit types
             units_from_chapters = units_from_chapters or []
-            units_from_chapters = units_from_api or []
-
+            units_from_api = units_from_api or []
+                
             # ========== SAVE COMPREHENSIVE WORKSPACE ARTIFACT ==========
             workspace_artifact = {
                 **qa_result,
@@ -1417,7 +1417,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             }
 
             logger.info(f"📦 Client payload summary:")
-            logger.info(f"   • Units (from API): {len(suggested_units_from_api)}")
+            logger.info(f"   • Units (from API): {len(units_from_api)}")
             logger.info(f"   • SuggestedUnits (AI-generated): {len(units_from_chapters)}")
             logger.info(f"   • Questions: {len(client_payload['Questions'])}")
 
