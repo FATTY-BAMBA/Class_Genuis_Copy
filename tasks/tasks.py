@@ -1368,7 +1368,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                             "Time": unit.get("Time", "")
                         })
             else:
-                logger.info("ℹ️  No SuggestedUnits in incoming API")
+                logger.info(f"📚 Including {len(units)} Units from incoming API")
                 
             # Safe defaults for all unit types
             units_from_chapters = units_from_chapters or []
@@ -1412,14 +1412,14 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 "CreatedAt": qa_result["CreatedAt"],
                 "Questions": qa_result["Questions"],
                 "CourseNote": qa_result["CourseNote"],
-                "Units": units_from_chapters,              # Generated chapters in client format
-                "SuggestedUnits": suggested_units_from_api  # Original units from API
+                "Units": suggested_units_from_api,         # ← Their units (from API)
+                "SuggestedUnits": units_from_chapters      # ← AI-generated chapters as suggestions
             }
 
             logger.info(f"📦 Client payload summary:")
-            logger.info(f"   • Units: {len(units_from_chapters)}")
-            logger.info(f"   • SuggestedUnits: {len(suggested_units_from_api)}")
-            logger.info(f"   • Questions: {len(client_payload['Questions'])}")  
+            logger.info(f"   • Units (from API): {len(suggested_units_from_api)}")
+            logger.info(f"   • SuggestedUnits (AI-generated): {len(units_from_chapters)}")
+            logger.info(f"   • Questions: {len(client_payload['Questions'])}")
 
             # Save clean client payload
             client_path = os.path.join(run_dir, "client_payload.json")
