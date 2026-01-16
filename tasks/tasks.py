@@ -1357,12 +1357,12 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             units_from_chapters = transform_chapters_to_units(qa_result.get("chapters", {})) or []
 
             # Prepare SuggestedUnits from incoming API (safe - defaults to [])
-            suggested_units_from_api = []
+            units_from_api = []
             if units and isinstance(units, list):
                 logger.info(f"📚 Including {len(units)} SuggestedUnits from incoming API")
                 for idx, unit in enumerate(units, start=1):
                     if isinstance(unit, dict):
-                        suggested_units_from_api.append({
+                        units_from_api.append({
                             "UnitNo": unit.get("UnitNo", idx),
                             "Title": unit.get("Title", ""),
                             "Time": unit.get("Time", "")
@@ -1372,13 +1372,13 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 
             # Safe defaults for all unit types
             units_from_chapters = units_from_chapters or []
-            suggested_units_from_api = suggested_units_from_api or []
+            units_from_chapters = units_from_api or []
 
             # ========== SAVE COMPREHENSIVE WORKSPACE ARTIFACT ==========
             workspace_artifact = {
                 **qa_result,
-                "Units": units_from_chapters or [],                    # Generated chapters (transformed)
-                "SuggestedUnits": suggested_units_from_api or [],      # From incoming API
+                "Units": units_from_chapters or [],                    # AI-generated chapters (transformed)
+                "SuggestedUnits": units_from_api or [],                # From incoming API (for workspace only)
                 "AIGeneratedSuggestedUnits": suggested_units or [],    # Your AI suggestions
                 "total_processing_time": total_processing_time,
                 "processing_metadata": {
@@ -1412,8 +1412,8 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 "CreatedAt": qa_result["CreatedAt"],
                 "Questions": qa_result["Questions"],
                 "CourseNote": qa_result["CourseNote"],
-                "Units": suggested_units_from_api,         # ← Their units (from API)
-                "SuggestedUnits": units_from_chapters      # ← AI-generated chapters as suggestions
+                "Units": units_from_api,              # ← Their units (from API)
+                "SuggestedUnits": units_from_chapters  # ← AI-generated chapters as suggestions
             }
 
             logger.info(f"📦 Client payload summary:")
