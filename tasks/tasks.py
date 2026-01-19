@@ -264,6 +264,90 @@ def transform_chapters_to_units(chapters: dict) -> list:
     logger.info(f"✅ Transformed to {len(units)} Units")
     return units
 
+# ==================== Unit time fill helpers ====================
+
+_PARENT_UNIT_RE = re.compile(r"(?:^\s*\[?\s*)單元\s*(\d+)\s*[:：]")
+
+def _hms_to_sec(hms: str):
+    try:
+        parts = (hms or "").strip().split(":")
+        if len(parts) == 2:
+            m, s = int(parts[0]), int(parts[1])
+            return m * 60 + s
+        if len(parts) == 3:
+            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+            return h * 3600 + m * 60 + s
+        return None
+    except Exception:
+        return None
+
+def _sec_to_hms(sec: int) -> str:
+    if sec is None:
+        return ""
+    if sec < 0:
+        sec = 0
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_fill_if_empty=True):
+    """
+    Fill Units[].Time using earliest SuggestedUnits[].Time for each parent unit number,
+    where SuggestedUnits Title starts with 单元N: / 單元N： / [單元N：...].
+
+    Returns: (updated_units, stats_dict)
+    """
+    stats = {
+        "filled_count": 0,
+        "skipped_existing_time": 0,
+        "unmatched_units": 0,
+        "unmatched_suggested": 0,
+        "invalid_suggested_times": 0,
+    }
+
+    earliest = {}  # unit_no -> earliest_sec
+
+    for su in (suggested_units or []):
+        title = (su.get("Title") or "").strip()
+        t_str = (su.get("Time") or "").strip()
+
+        m = _PARENT_UNIT_RE.search(title)
+        if not m:
+            stats["unmatched_suggested"] += 1
+            continue
+
+        unit_no = int(m.group(1))
+        sec = _hms_to_sec(t_str)
+        if sec is None:
+            stats["invalid_suggested_times"] += 1
+            continue
+
+        if unit_no not in earliest or sec < earliest[unit_no]:
+            earliest[unit_no] = sec
+
+    updated = []
+    for u in (units_from_api or []):
+        unit_no = u.get("UnitNo")
+        cur_time = (u.get("Time") or "").strip()
+
+        if only_fill_if_empty and cur_time:
+            stats["skipped_existing_time"] += 1
+            updated.append(u)
+            continue
+
+        if isinstance(unit_no, int) and unit_no in earliest:
+            new_time = _sec_to_hms(earliest[unit_no])
+            if new_time and new_time != cur_time:
+                u = {**u, "Time": new_time}
+                stats["filled_count"] += 1
+            updated.append(u)
+        else:
+            stats["unmatched_units"] += 1
+            updated.append(u)
+
+    return updated, stats
+
 # ---------- ASR (chapter_llama → SingleVideo) ----------
 
 ASR_LINE_RE = re.compile(r"^\s*(\d{2}):(\d{2}):(\d{2})\s*:\s*(.+?)\s*$")
@@ -1373,11 +1457,27 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             # Safe defaults for all unit types
             units_from_chapters = units_from_chapters or []
             units_from_api = units_from_api or []
+
+            # ✅ NEW: Fill API Units[].Time using earliest matching SuggestedUnits time
+            units_from_api, unit_time_stats = fill_unit_times_from_suggested_units( 
+                units_from_api,
+                units_from_chapters,
+                only_fill_if_empty=True,
+            )
+
+            logger.info(
+                "🕒 Filled Units Time from SuggestedUnits: filled=%d skipped_existing=%d unmatched_units=%d unmatched_suggested=%d invalid_suggested_times=%d",
+                unit_time_stats["filled_count"],
+                unit_time_stats["skipped_existing_time"],
+                unit_time_stats["unmatched_units"],
+                unit_time_stats["unmatched_suggested"],
+                unit_time_stats["invalid_suggested_times"],
+            )
                 
             # ========== SAVE COMPREHENSIVE WORKSPACE ARTIFACT ==========
             workspace_artifact = {
                 **qa_result,
-                "Units": units_from_chapters or [],                    # AI-generated chapters (transformed)
+                "Units": units_from_chapters or [],                    # Units from API
                 "SuggestedUnits": units_from_api or [],                # From incoming API (for workspace only)
                 "AIGeneratedSuggestedUnits": suggested_units or [],    # Your AI suggestions
                 "total_processing_time": total_processing_time,
