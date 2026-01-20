@@ -270,7 +270,7 @@ def _extract_json_blob(text: str) -> Optional[str]:
 
     # raw json
     s = text.strip()
-    if s.startswith("{") and s.endswith("}"):
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
         return s
 
     return None
@@ -1419,7 +1419,16 @@ def hierarchical_multipass_generation(
             }
         }
     }
-    
+    # ✅ CRITICAL: expose structured SuggestedUnits to downstream pipeline (tasks.py)
+    metadata["suggested_units_structured"] = suggested_units_structured
+    # ✅ DEBUG: preserve raw PASS3 JSON/text for production debugging
+    metadata["pass3_raw_json_text"] = final_text
+    logger.info(
+        "🧩 PASS3 SuggestedUnits structured: %d (units_provided=%s)",
+        len(suggested_units_structured),
+        "yes" if units else "no"
+    )
+
     logger.info("\n" + "=" * 60)
     logger.info("✅ HIERARCHICAL GENERATION COMPLETE")
     logger.info("=" * 60)
