@@ -894,8 +894,10 @@ def generate_qa_and_notes(
     raw_asr_text,
     chapters_dict=None,           
     hierarchical_metadata=None,
-    section_title=None,      # ← ADD THIS
-    units=None                # ← ADD THIS
+    section_title=None,     
+    units=None,
+    num_questions=10,
+    num_pages=3
 ):
     
     """
@@ -931,16 +933,17 @@ def generate_qa_and_notes(
             logger.info(f"   • Units: {len(units)} learning units")
     try:
         # Get the raw EducationalContentResult object
-        qa_result_obj = process_text_for_qa_and_notes(
+        logger.info(f"🧮 Using num_questions={num_questions}, num_pages={num_pages} (from request)")
+        qa_result_obj = process_text_for_qa_and_notes(   
             raw_asr_text=raw_asr_text,
             ocr_segments=ocr_segments,
             video_title=video_info.get("OriginalFilename"),
             chapters=chapters_dict,                    
             hierarchical_metadata=hierarchical_metadata,
-            section_title=section_title,        # ← ADD THIS
-            units=units,                         # ← ADD THIS
-            num_questions=10,
-            num_pages=3,
+            section_title=section_title,
+            units=units,
+            num_questions=num_questions,
+            num_pages=num_pages,
             id=video_info["Id"],
             team_id=video_info["TeamId"],
             section_no=video_info["SectionNo"],
@@ -1349,7 +1352,9 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             chapters_dict=chapters_dict,           
             hierarchical_metadata=chapter_metadata,
             section_title=section_title,
-            units=units
+            units=units,
+            num_questions=num_questions,
+            num_pages=num_pages
         )
 
         # ========== NEW: GENERATE SUGGESTED UNITS ==========
