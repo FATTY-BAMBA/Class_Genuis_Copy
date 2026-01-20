@@ -266,7 +266,7 @@ def transform_chapters_to_units(chapters: dict) -> list:
 
 # ==================== Unit time fill helpers ====================
 
-_PARENT_UNIT_RE = re.compile(r"(?:^\s*\[?\s*)單元\s*(\d+)\s*[:：]")
+_PARENT_UNIT_RE = re.compile(r"(?:^\s*\[\s*單元\s*|\b單元\s*)(\d+)(?:\s*\]|\s*[:：])")
 
 def _hms_to_sec(hms: str):
     try:
@@ -312,12 +312,20 @@ def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_f
         title = (su.get("Title") or "").strip()
         t_str = (su.get("Time") or "").strip()
 
-        m = _PARENT_UNIT_RE.search(title)
-        if not m:
+        parent = su.get("ParentUnitNo", None)
+        if parent is not None:
+            try:
+                unit_no = int(parent)
+            except Exception:
+                unit_no = None
+        else:
+            # fallback to regex (for backward compatibility)
+            m = _PARENT_UNIT_RE.search(title)
+            unit_no = int(m.group(1)) if m else None
+        if unit_no is None:
             stats["unmatched_suggested"] += 1
-            continue
-
-        unit_no = int(m.group(1))
+            continue         
+        
         sec = _hms_to_sec(t_str)
         if sec is None:
             stats["invalid_suggested_times"] += 1
@@ -1458,12 +1466,26 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             units_from_chapters = units_from_chapters or []
             units_from_api = units_from_api or []
 
-            # ✅ NEW: Fill API Units[].Time using earliest matching SuggestedUnits time
-            units_from_api, unit_time_stats = fill_unit_times_from_suggested_units( 
-                units_from_api,
-                units_from_chapters,
-                only_fill_if_empty=True,
-            )
+            # ✅ Prefer structured SuggestedUnits from PASS3 metadata (best)
+            suggested_structured = None
+            if chapter_metadata and isinstance(chapter_metadata.get("suggested_units_structured"), list):  
+                suggested_structured = chapter_metadata["suggested_units_structured"]
+            if suggested_structured:
+                units_from_api, unit_time_stats = fill_unit_times_from_suggested_units(
+                    units_from_api,
+                    suggested_structured,
+                    only_fill_if_empty=True,
+                )
+                logger.info("🧩 Using structured SuggestedUnits for Units Time fill")
+            else:
+                unit_time_stats = {
+                    "filled_count": 0,
+                    "skipped_existing_time": 0,
+                    "unmatched_units": 0,
+                    "unmatched_suggested": 0,
+                    "invalid_suggested_times": 0,
+                }
+                logger.info("ℹ️ No structured SuggestedUnits available; skipping Units Time fill")
 
             logger.info(
                 "🕒 Filled Units Time from SuggestedUnits: filled=%d skipped_existing=%d unmatched_units=%d unmatched_suggested=%d invalid_suggested_times=%d",
@@ -1477,9 +1499,9 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             # ========== SAVE COMPREHENSIVE WORKSPACE ARTIFACT ==========
             workspace_artifact = {
                 **qa_result,
-                "Units": units_from_chapters or [],                    # Units from API
-                "SuggestedUnits": units_from_api or [],                # From incoming API (for workspace only)
-                "AIGeneratedSuggestedUnits": suggested_units or [],    # Your AI suggestions
+                "Units": units_from_api or [],               # ✅ Units from incoming API (maybe with times filled)
+                "SuggestedUnits": units_from_chapters or [], # ✅ Suggested units from AI chapters
+                "AIGeneratedSuggestedUnits": suggested_units or [],
                 "total_processing_time": total_processing_time,
                 "processing_metadata": {
                     "processing_method": processing_result.get("method"),
