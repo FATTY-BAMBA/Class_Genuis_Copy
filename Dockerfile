@@ -57,7 +57,7 @@ COPY . .
 # -------------------- Install PyTorch 2.1.2 (CUDA 11.8) - MUST BE FIRST --------------------
 RUN pip3 install --no-cache-dir --force-reinstall \
     torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 \
-    --index-url https://download.pytorch.org/whl/cu118
+    --extra-index-url https://download.pytorch.org/whl/cu118
 
 # CRITICAL: Force NumPy 1.26.4 AFTER PyTorch
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
