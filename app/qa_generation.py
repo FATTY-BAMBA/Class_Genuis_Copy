@@ -21,6 +21,8 @@ import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable, Any
+from pydantic import ValidationError
+
 
 # Azure AI Inference imports
 from azure.ai.inference import ChatCompletionsClient
@@ -39,11 +41,13 @@ STAGES = {
     "initializing": 5,
     "processing_inputs": 15,
     "initializing_client": 25,
+    "generating_topics_summary": 40,
     "generating_mcqs": 55,
     "generating_notes": 80,
     "processing_results": 92,
     "completed": 100,
 }
+
 def report(stage: str, progress_callback: Optional[Callable[[str, int], None]]):
     if progress_callback:
         progress_callback(stage, STAGES.get(stage, 0))
@@ -104,7 +108,6 @@ class LectureNoteSection:
     key_points: List[str]
     examples: List[str]
 
-from dataclasses import field  # ← Add this import if not already there
 @dataclass
 class EducationalContentResult:
     mcqs: List[MCQ]
@@ -484,7 +487,9 @@ def build_educational_metadata_context(
         context_parts.append(f"## 預定教學單元結構 ({len(units)} 個單元)")
         context_parts.append("本課程包含以下教學單元：")
         for unit in units:
-            context_parts.append(f"   {unit['UnitNo']}. {unit['Title']}")
+            unit_no = unit.get("UnitNo", "")
+            unit_title = unit.get("Title", "")
+            context_parts.append(f"   {unit_no}. {unit_title}")
         context_parts.append("")
         
         context_parts.append("## Q&A 設計指引")
@@ -847,23 +852,23 @@ def build_mcq_prompt_v2(
     application_n = base + (1 if rem >= 2 else 0)
     analysis_n    = base
 
+    # Build educational metadata context (must NOT depend on chapters)
+    edu_metadata_context = build_educational_metadata_context(section_title, units)
+
+    # Log if metadata provided (also should NOT depend on chapters)
+    if section_title or units:
+        logger.info("=" * 60)
+        logger.info("📚 EDUCATIONAL METADATA FOR MCQ GENERATION")
+        if section_title:
+            logger.info(f"   📖 Section: {section_title}")
+        if units:
+            logger.info(f"   📑 Units: {len(units)} predefined units")
+            for unit in units:
+                logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
+        logger.info("=" * 60)
+
     chap_lines = []
     if chapters:
-        # Build educational metadata context
-        edu_metadata_context = build_educational_metadata_context(section_title, units)
-    
-        # Log if metadata provided
-        if section_title or units:
-            logger.info("=" * 60)
-            logger.info("📚 EDUCATIONAL METADATA FOR MCQ GENERATION")
-            if section_title:
-                logger.info(f"   📖 Section: {section_title}")
-            if units:
-                logger.info(f"   📑 Units: {len(units)} predefined units")
-                for unit in units:
-                    logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
-            logger.info("=" * 60)
-    
         # Enhanced question distribution if units provided
         if units and len(units) > 0:
             questions_per_unit = max(1, num_questions // len(units))
@@ -1010,6 +1015,7 @@ def build_mcq_prompt_v2(
 """
     return prompt
 
+
 def build_lecture_notes_prompt_v2(
     transcript: str,
     *,
@@ -1019,17 +1025,15 @@ def build_lecture_notes_prompt_v2(
     topics: Optional[List[Dict]] = None,
     video_title: Optional[str] = None,
     global_summary: str = "",
-    # NEW: Add hierarchical metadata
     hierarchical_metadata: Optional[Dict] = None,
-    section_title: Optional[str] = None,      # ← ADD THIS
-    units: Optional[List[Dict]] = None        # ← ADD THIS
+    section_title: Optional[str] = None,
+    units: Optional[List[Dict]] = None
 ) -> str:
     """ASR-first lecture notes prompt. Transforms transcripts into structured, hierarchical study guides.
-       Schema: sections[{title, content, key_points[]}], summary, key_terms[]
+       Schema: sections[{title, content, key_points[], examples[]}], summary, key_terms[]
     """
-    # Build educational metadata context
     edu_metadata_context = build_educational_metadata_context(section_title, units)
-    
+
     # Log if metadata provided
     if section_title or units:
         logger.info("=" * 60)
@@ -1039,19 +1043,21 @@ def build_lecture_notes_prompt_v2(
         if units:
             logger.info(f"   📑 Units: {len(units)} predefined units")
             for unit in units:
-                logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
+                logger.info(f"      {unit.get('UnitNo')}. {unit.get('Title')}")
         logger.info("=" * 60)
-        
+
+    # Topics snippet
     topics_snippet = ""
     if topics:
         lines = []
         for i, t in enumerate(topics, 1):
-            tid   = t.get("id", str(i).zfill(2))
+            tid = t.get("id", str(i).zfill(2))
             title = t.get("title", "")
-            summ  = t.get("summary", "")
+            summ = t.get("summary", "")
             lines.append(f"{tid}. {title}：{summ}")
         topics_snippet = "\n".join(lines)
 
+    # Chapters snippet
     chap_lines = []
     if chapters:
         for c in chapters[:18]:
@@ -1059,42 +1065,42 @@ def build_lecture_notes_prompt_v2(
             title = c.get("title", "")
             if ts or title:
                 chap_lines.append(f"- {ts}：{title}")
-                
+
+    # Global context block
     global_ctx = []
+    if (video_title or "").strip():
+        global_ctx.append(f"- 影片/課程標題：{(video_title or '').strip()}")
     if global_summary.strip():
         global_ctx.append(f"- 摘要：{global_summary.strip()}")
-    
-    # Add hierarchical metadata to global context
+
     if hierarchical_metadata:
-        course_summary = hierarchical_metadata.get('course_summary', {})
+        course_summary = hierarchical_metadata.get("course_summary", {}) or {}
         if course_summary:
             global_ctx.extend([
                 f"- 核心主題：{course_summary.get('topic', '')}",
                 f"- 關鍵技術：{course_summary.get('core_content', '')}",
                 f"- 學習目標：{course_summary.get('learning_objectives', '')}",
                 f"- 目標學員：{course_summary.get('target_audience', '')}",
-                f"- 難度級別：{course_summary.get('difficulty', '')}"
+                f"- 難度級別：{course_summary.get('difficulty', '')}",
             ])
-        
-        # Add structure analysis for better context
-        structure_analysis = hierarchical_metadata.get('structure_analysis', '')
+
+        structure_analysis = hierarchical_metadata.get("structure_analysis", "") or ""
         if structure_analysis:
-            # Extract teaching objectives
             structure_summary = structure_analysis[:500] + "..." if len(structure_analysis) > 500 else structure_analysis
             global_ctx.append(f"- 課程架構：{structure_summary}")
-        
-        # Add module breakdown
-        modules_analysis = hierarchical_metadata.get('modules_analysis', '')
+
+        modules_analysis = hierarchical_metadata.get("modules_analysis", "") or ""
         if modules_analysis:
             global_ctx.append(f"- 模組架構：\n{modules_analysis}")
-    
+
     if chap_lines:
         global_ctx.append("- 章節：\n" + "\n".join(chap_lines))
     if topics_snippet:
         global_ctx.append("- 主題大綱：\n" + topics_snippet)
-        
+
     global_ctx_block = "\n".join(global_ctx) if global_ctx else "（無）"
 
+    # OCR block
     ocr_block = ""
     if ocr_context.strip():
         ocr_block = f"## 螢幕文字（OCR，僅作輔助參考）\n{ocr_context}\n\n"
@@ -1102,49 +1108,83 @@ def build_lecture_notes_prompt_v2(
     min_words = num_pages * 400
     max_words = (num_pages + 1) * 350
 
-    # --- ENHANCED PROMPT ---
-
     prompt = f"""
 {edu_metadata_context}
-你是一位資深的課程編輯和教學設計專家。你的核心任務是將原始的講座逐字稿**轉化、提煉、重構**為一份結構清晰、重點突出、最適合學生複習與深化理解的**終極講義與學習指南**。
+你是一位資深的課程編輯和教學設計專家。你的任務是將逐字稿**轉化、提煉、重構**成「可複習、可照做」的終極講義。請**只輸出 JSON**。
 
-### 核心原則
-1.  **重構，勿抄寫 (Transform, Don't Transcribe):** 大膽地刪除贅詞、重複句和離題內容。根據邏輯重新組織內容順序，即使與原逐字稿順序不同。目標是創造最佳的**學習敘事流暢度**。
-2.  **為掃讀而設計 (Design for Scannability):** 使用清晰的標題層級、項目符號和編號列表。學生應該能在 60 秒內找到任何特定主題。
-3.  **強調可操作知識 (Emphasize Actionable Knowledge):** 突出顯示定義、步驟、命令和關鍵見解。
+### 核心原則（必須遵守）
+1) **ASR-first**：以 ASR 逐字稿為主要依據；OCR 僅輔助描述畫面內容。衝突時以 ASR 為準。
+2) **重構，勿抄寫**：刪除贅詞與離題內容，可重排順序以提升學習敘事。
+3) **可掃讀**：標題層級清楚、列表化、步驟化；60 秒內能定位主題。
+4) **可操作**：每節都要產出「可以照做」的步驟與例子，不要只有概述。
 
 ### 全域脈絡（Global Context）
 {global_ctx_block}
 
-### 內容與語氣要求
--   **語氣:** 專業、清晰、簡潔的書面語（過去式）。扮演總結專家講課內容的編輯角色。
--   **建議講義結構（可靈活調整以符合課程邏輯）：**
-    -   **課程目標與概述:** 簡要說明本段課程的核心目標與學習內容。
-    -   **核心概念講解:** 對每個主要概念進行深入解釋。**所有關鍵術語必須在內容中加粗並明確定義**。
-    -   **操作指南與實例 (Step-by-Step Guide):** 這是講義的主體。將講師的操作提煉為清晰的編號列表或步驟。
-        -   **💻 對於編程課程:** 必須提取並提供**乾淨、可執行的程式碼區塊**（使用 ```python, ```java, ```html 等標記）。
-        -   **🎨 對於軟體/設計課程:** 明確說明工具位置、選單指令序列和預期效果。
-    -   **教師的專業建議 (Instructor's Know-How):** 專門整理講師提到的：
-        -   ❌ **常見錯誤與陷阱** (Common Mistakes)
-        -   ✅ **最佳實踐與技巧** (Best Practices & Pro-Tips)
-        -   💡 **真實應用場景** (Real-World Applications)
-    -   **視覺參考:** 使用提供的 OCR 文字來描述或解釋屏幕上重要的圖表、界面或簡報內容。（例如：「如投影片所示：[根據OCR描述]」）
--   **忽略:** 行政雜訊（點名、會議ID、技術問題等）。
+### 章節/Units 使用規則（非常重要）
+- **Units/章節只能用來決定分段與排序**。
+- **禁止**把 Units 標題改寫成「本節介紹…」就結束。
+- 每一節都必須包含：步驟、注意事項、陷阱、技巧、應用情境、例子（含程式碼若適用）。
 
-### 輸出格式（嚴格遵守 JSON 結構）
+---
+
+## ✅ 每個 section.content 必須照下面模板輸出（標題不可改名，不可省略）
+
+### 課程目標與概述
+（2-4 行，描述本節學什麼、為什麼重要）
+
+### 核心概念講解
+- **術語/概念**：定義（務必清楚）
+- **術語/概念**：定義
+
+### 操作指南與實例
+1) 步驟…
+2) 步驟…
+- 若是編程/前端/資料處理（HTML/JS/CSV/JSON/Chart.js/FileReader/事件監聽等），本小節**必須至少包含 1 個可執行的 code block**（```html / ```javascript / ```python）。
+
+### ❌ 常見錯誤與陷阱
+- 錯誤：… → 後果：…
+- 錯誤：… → 後果：…
+
+### ✅ 最佳實踐與技巧
+- 技巧：… → 原因/效果：…
+- 技巧：… → 原因/效果：…
+
+### 💡 真實應用場景
+- 情境：… → 如何應用：…
+
+---
+
+## ✅ 輸出硬性規則（違反視為失敗）
+1) 每個 section 的 content 必須包含上述 **6 個小節標題**（不可省略）。
+2) 若逐字稿沒有講到某小節：可根據上下文**合理推斷**並保持簡短；真的無法推斷就寫「（本節無）」但**不可刪標題**。
+3) **程式/前端相關內容**：`### 操作指南與實例` 必須至少 1 個可執行程式碼區塊（禁止只有偽碼）。
+4) ❌/✅/💡 的最低要求：
+   - ❌ 至少 2 條（錯在哪 + 後果）
+   - ✅ 至少 2 條（可操作技巧）
+   - 💡 至少 1 條（真實情境）
+5) `key_points`：每節 2–3 條，必須可用來出題（避免空泛）。
+6) `examples`：每節 3–5 條具體例子：
+   - 編程課程：至少 1 條含 code（可與 content 重複或補充）
+   - 非編程課程：至少 1 條提供實務案例
+
+---
+
+### 輸出格式（嚴格 JSON；只輸出 JSON）
 ```json
 {{
   "sections": [
     {{
-      "title": "層級化標題 (e.g., '1.1 核心概念：Python列表')",
-      "content": "結構化的Markdown內容。**將關鍵術語加粗**。使用項目列表、編號列表、圖示(❌✅💡)和程式碼區塊。遵循上述『建議講義結構』。",
-      "key_points": ["本節最核心的2-3個摘要要點", "避免冗長，保持精簡"]
+      "title": "層級化標題（例：'1.2 事件監聽：click 與回呼函式'）",
+      "content": "必須包含 6 個小節標題的 Markdown 內容",
+      "key_points": ["2-3 條可複習考點"],
+      "examples": ["3-5 條具體例子（編程需至少 1 條含 code）"]
     }}
   ],
-  "summary": "全文的過去式總結，強調最重要的3-5個課程收穫和後續行動建議。",
+  "summary": "全文過去式總結：3-5 個收穫 + 後續行動建議",
   "key_terms": [
-    {{ "term": "關鍵術語1", "definition": "清晰的定義" }},
-    {{ "term": "關鍵術語2", "definition": "清晰的定義" }}
+    {{ "term": "術語1", "definition": "清晰定義" }},
+    {{ "term": "術語2", "definition": "清晰定義" }}
   ]
 }}
 ```
