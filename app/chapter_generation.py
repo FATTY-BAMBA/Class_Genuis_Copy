@@ -1005,7 +1005,8 @@ def hierarchical_multipass_generation(
 {ocr_text if ocr_text else "無視覺輔助內容"}
 
 請輸出格式：
-模塊名稱 ~ 預估時間範圍（分鐘） ~ 核心學習點 ~ 教學方法
+模塊名稱 ~ 起始時間戳(HH:MM:SS) ~ 結束時間戳(HH:MM:SS) ~ 核心學習點 ~ 教學方法
+起始時間戳必須是逐字稿中出現過的時間戳之一
 
 說明：時間範圍使用分鐘數表示，從0開始到{int(duration/60)}分鐘結束
 
