@@ -101,6 +101,7 @@ CHAPTER_LINE_RE = re.compile(
     """,
     re.VERBOSE,
 )
+TS_IN_LINE = re.compile(r'^\s*(\d{1,2}:\d{2}:\d{2})\s*:')
 
 def sec_to_hms(sec: int) -> str:
     """Convert seconds to HH:MM:SS format"""
@@ -137,6 +138,8 @@ def clean_chapter_titles(chapters: Dict[str, str]) -> Dict[str, str]:
 
 def count_tokens_llama(text: str) -> int:
     """Approximate token counting for mixed Chinese/English (≈1 token per CJK char; 1/4 per other chars)"""
+    if not text:
+        return 0
     chinese_chars = sum(1 for char in text if _is_cjk(char))
     non_chinese_len = len(text) - chinese_chars
     return chinese_chars + max(1, non_chinese_len // 4)
@@ -201,7 +204,7 @@ def parse_chapters_from_output(output_text: str) -> Dict[str, str]:
                 ts = parts[0].strip()
                 title = parts[1].strip()
                 # Validate timestamp format
-                if re.match(r'\d{2}:\d{2}:\d{2}', ts):
+                if re.fullmatch(r'\d{2}:\d{2}:\d{2}', ts):
                     chapters[ts] = title
     
     # If no chapters found, try the original regex approach
@@ -260,21 +263,25 @@ def validate_and_normalize_timestamps(
     """
     if not chapters:
         return {}
-    
+
     def ts_to_seconds(ts: str) -> int:
-        """Convert HH:MM:SS to seconds"""
+        """Convert HH:MM:SS to seconds. Return -1 if invalid."""
         try:
             parts = ts.split(':')
             if len(parts) == 3:
                 h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                if h < 0 or m < 0 or s < 0 or m >= 60 or s >= 60:
+                    return -1
                 return h * 3600 + m * 60 + s
             elif len(parts) == 2:
                 m, s = int(parts[0]), int(parts[1])
+                if m < 0 or s < 0 or m >= 60 or s >= 60:
+                    return -1
                 return m * 60 + s
-            return 0
-        except:
-            return 0
-    
+            return -1
+        except Exception:
+            return -1
+        
     validated = {}
     timestamps_in_seconds = []
     
@@ -289,7 +296,7 @@ def validate_and_normalize_timestamps(
         
         # Check 2: Not negative
         if ts_sec < 0:
-            logger.warning(f"⚠️ [{video_id}] Skipping chapter at {ts_normalized} - negative timestamp")
+            logger.warning(f"⚠️ [{video_id}] Skipping chapter at {ts_normalized} - invalid timestamp")
             continue
         
         validated[ts_normalized] = title
@@ -348,16 +355,35 @@ def globally_balance_chapters(
         """Extract [module] tag if present"""
         match = re.match(r'\[([^\]]+)\]', title)
         return match.group(1) if match else ""
-    
-    def ts_to_s(ts: str) -> int:
-        p = ts.split(":")
-        if len(p) == 2:
-            return int(p[0]) * 60 + int(p[1])
-        if len(p) == 3:
-            return int(p[0]) * 3600 + int(p[1]) * 60 + int(p[2])
-        return 0
 
-    cands = [(ts_to_s(ts), ts, t.strip()) for ts, t in chapters.items() if 0 <= ts_to_s(ts) <= duration_sec]
+    def ts_to_s(ts: str) -> int:
+        """
+        Convert a timestamp string to seconds.
+        Accepts: "MM:SS" or "HH:MM:SS"
+        Returns: seconds, or -1 if invalid
+        """
+        try:
+            p = ts.strip().split(":")
+            if len(p) == 2:
+                m, s = int(p[0]), int(p[1])
+                if m < 0 or s < 0 or m >= 60 or s >= 60:
+                    return -1
+                return m * 60 + s
+            if len(p) == 3:
+                h, m, s = int(p[0]), int(p[1]), int(p[2])
+                if h < 0 or m < 0 or s < 0 or m >= 60 or s >= 60:
+                    return -1
+                return h * 3600 + m * 60 + s
+            return -1
+        except Exception:
+            return -1
+
+    cands = []
+    for ts, t in chapters.items():
+        s = ts_to_s(ts)
+        if 0 <= s <= duration_sec:
+            cands.append((s, ts, t.strip()))
+        
     cands.sort(key=lambda x: x[0])
     if not cands:
         return {}
@@ -614,14 +640,12 @@ def build_prompt_body(
     duration_hms = sec_to_hms(int(duration_sec))
     min_gap_sec, (t_low, t_high), max_caps = chapter_policy(int(duration_sec))
     
-    # Extract first and last timestamps for concrete examples
+    # Extract first and last REAL ASR timestamps (lines like "HH:MM:SS: ...")
     timestamps = []
-    for line in transcript.split('\n'):
-        if ':' in line and len(line.split(':')) >= 4:
-            ts_part = ':'.join(line.split(':')[:3])
-            if re.match(r'\d{2}:\d{2}:\d{2}', ts_part):
-                timestamps.append(ts_part)
-    
+    for line in transcript.splitlines():
+        m = TS_IN_LINE.match(line)
+        if m:
+            timestamps.append(_normalize_ts(m.group(1)))
     first_ts = timestamps[0] if timestamps else "00:00:00"
     last_ts = timestamps[-1] if timestamps else duration_hms
 
@@ -703,7 +727,7 @@ def build_prompt_body(
 
 # 內容資料
 ## 主要逐字稿（包含真實時間戳）：
-{transcript[:50000]}... [其餘內容已載入]
+{transcript}
 
 ## 輔助視覺內容：
 {ocr_context if ocr_context else "（無螢幕內容參考）"}
@@ -1008,11 +1032,9 @@ def hierarchical_multipass_generation(
 模塊名稱 ~ 起始時間戳(HH:MM:SS) ~ 結束時間戳(HH:MM:SS) ~ 核心學習點 ~ 教學方法
 起始時間戳必須是逐字稿中出現過的時間戳之一
 
-說明：時間範圍使用分鐘數表示，從0開始到{int(duration/60)}分鐘結束
-
-範例（本影片{int(duration/60)}分鐘）：
-基礎工具操作 ~ 0-{max(10, int(duration/60/10))}分鐘 ~ Illustrator介面認識、基本工具使用 ~ 理論講解+實例演示
-進階設計技巧 ~ {max(10, int(duration/60/10))}-{max(20, int(duration/60/5))}分鐘 ~ Logo設計、色彩管理、輸出設定 ~ 綜合案例+實際操作
+範例（注意：時間戳必須是 HH:MM:SS）：
+基礎工具操作 ~ 00:05:24 ~ 00:18:45 ~ 介面認識、基本工具使用 ~ 理論講解+實例演示
+進階設計技巧 ~ 00:18:45 ~ 00:36:10 ~ 色彩管理、輸出設定 ~ 綜合案例+實際操作
 """
     
     logger.info(f"📤 PASS 2 prompt: ~{count_tokens_llama(modules_prompt):,} tokens")
@@ -1177,24 +1199,31 @@ HH:MM:SS - [模塊標籤] 具體章節標題
     chapters_raw = parse_chapters_from_output(final_text)
     logger.info(f"📊 Parsed {len(chapters_raw)} chapters from LLM output")
 
-        # ✅ NEW: Validate and normalize timestamps
+    # ✅ NEW: Validate and normalize timestamps
     chapters = validate_and_normalize_timestamps(
         chapters_raw, 
         int(duration),
         video_id=f"hierarchical_{int(time.time())}"
     )
-    
+
     if not chapters:
-        logger.error("❌ No valid chapters after timestamp validation, using raw chapters")
-        chapters = chapters_raw  # Fallback to raw if validation removes everything
+        logger.error("❌ No valid chapters after timestamp validation, using time-based fallback")
+        chapters = create_time_based_fallback(int(duration))
     
     if chapters:
-        first_chapter = list(chapters.keys())[0]
-        last_chapter = list(chapters.keys())[-1]
+        def _ts_to_seconds(ts: str) -> int:
+            h, m, s = map(int, ts.split(":"))
+            return h * 3600 + m * 60 + s
+            
+        sorted_keys = sorted(chapters.keys(), key=_ts_to_seconds)
+        first_chapter = sorted_keys[0]
+        last_chapter = sorted_keys[-1]
+
         logger.info(f"📍 Chapter range: {first_chapter} to {last_chapter}")
+
     else:
         logger.warning("⚠️ No chapters were parsed from LLM output!")
-    
+        
     # Parse structured summary
     course_summary = parse_summary_from_output(final_text)
     
@@ -1284,7 +1313,7 @@ def generate_chapters_debug(
     ocr_context_override: Optional[str] = None,
     # NEW: Add control parameter
     force_generation_method: Optional[str] = None,  # 'hierarchical' or 'single_pass'
-) -> Tuple[str, Dict[str, str], Dict[str, str]]:
+) -> Tuple[str, Dict[str, str], Dict[str, str], Dict[str, Any]]:
     """
     Enhanced version with smart routing between hierarchical and single-pass generation
     """
@@ -1304,7 +1333,7 @@ def generate_chapters_debug(
             logger.warning("Configuration validation failed, using time-based fallback")
             fallback = create_time_based_fallback(int(duration))
             fallback = ensure_traditional_chapters(fallback)
-            return ("", {}, fallback)
+            return ("", {}, fallback, {"generation_method": "time_based_fallback", "course_summary": {}})
 
         if progress_callback:
             progress_callback("processing_inputs", 10)
@@ -1390,11 +1419,24 @@ def generate_chapters_debug(
                 progress_callback("single_pass_processing", 30)
             
             # Use original single-pass generation
-            prompt_template = build_prompt_body("", int(duration), ocr_context)
+            prompt_template = build_prompt_body("", int(duration), ocr_context, video_title)
             template_tokens = count_tokens_llama(prompt_template)
+
             CONTEXT_BUDGET = 128_000
-            max_transcript_tokens = max(0, CONTEXT_BUDGET - template_tokens)
-            transcript_for_prompt = truncate_text_by_tokens(raw_asr_text, max_transcript_tokens)
+
+            asr_tokens = count_tokens_llama(raw_asr_text)
+            if template_tokens + asr_tokens <= CONTEXT_BUDGET:
+                transcript_for_prompt = raw_asr_text
+                logger.info(
+                    f"✅ Using full ASR (template={template_tokens:,}, asr={asr_tokens:,}, budget={CONTEXT_BUDGET:,})"
+                )
+            else:
+                max_transcript_tokens = max(0, CONTEXT_BUDGET - template_tokens)
+                transcript_for_prompt = truncate_text_by_tokens(raw_asr_text, max_transcript_tokens)
+                logger.warning(
+                    f"⚠️ Truncating ASR (template={template_tokens:,}, asr={asr_tokens:,}, "
+                    f"budget={CONTEXT_BUDGET:,}, allowed_asr={max_transcript_tokens:,})"
+                )
             full_prompt = build_prompt_body(transcript_for_prompt, int(duration), ocr_context, video_title)
 
             with open(run_dir / "full_prompt.txt", "w", encoding="utf-8") as f:
@@ -1441,8 +1483,8 @@ def generate_chapters_debug(
                 video_id=video_id
             )
             if not chapters:
-                logger.error("❌ No valid chapters after timestamp validation, using raw chapters")
-                chapters = chapters_raw  # Fallback
+                logger.error("❌ No valid chapters after timestamp validation, using time-based fallback")
+                chapters = create_time_based_fallback(int(duration))
 
             # Parse structured summary
             course_summary = parse_summary_from_output(raw_llm_text)
@@ -1624,16 +1666,17 @@ def main():
 
     # Generate
     logger.info("Starting chapter generation...")
-    raw_text, parsed_raw, final_chapters = generate_chapters_debug(
+
+    raw_text, parsed_raw, final_chapters, metadata = generate_chapters_debug(
         raw_asr_text=raw_asr_text,
         ocr_segments=ocr_segments,
         duration=args.duration,
         video_id=args.video_id,
         run_dir=run_dir,
         progress_callback=cli_progress_callback,
-        ocr_context_override=ocr_context_override,  # raw OCR passes straight through
+        ocr_context_override=ocr_context_override,
     )
-
+    
     # Console output
     print("\n" + "="*50)
     print("✅ CHAPTER GENERATION COMPLETE")
