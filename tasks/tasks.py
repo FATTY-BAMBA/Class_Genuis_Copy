@@ -294,7 +294,7 @@ def _sec_to_hms(sec: int) -> str:
 def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_fill_if_empty=True):
     """
     Fill Units[].Time using earliest SuggestedUnits[].Time for each parent unit number,
-    where SuggestedUnits Title starts with 单元N: / 單元N： / [單元N：...].
+    using SuggestedUnits[].ParentUnitNo when present, else falling back to regex parse from Title.
 
     Returns: (updated_units, stats_dict)
     """
@@ -308,10 +308,16 @@ def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_f
 
     earliest = {}  # unit_no -> earliest_sec
 
+    # 1) Build earliest start time per ParentUnitNo
     for su in (suggested_units or []):
+        if not isinstance(su, dict):
+            stats["unmatched_suggested"] += 1
+            continue
+
         title = (su.get("Title") or "").strip()
         t_str = (su.get("Time") or "").strip()
 
+        # Prefer structured parent mapping
         parent = su.get("ParentUnitNo", None)
         if parent is not None:
             try:
@@ -319,13 +325,14 @@ def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_f
             except Exception:
                 unit_no = None
         else:
-            # fallback to regex (for backward compatibility)
+            # Fallback to regex (backward compatibility)
             m = _PARENT_UNIT_RE.search(title)
             unit_no = int(m.group(1)) if m else None
+
         if unit_no is None:
             stats["unmatched_suggested"] += 1
-            continue         
-        
+            continue
+
         sec = _hms_to_sec(t_str)
         if sec is None:
             stats["invalid_suggested_times"] += 1
@@ -334,17 +341,30 @@ def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_f
         if unit_no not in earliest or sec < earliest[unit_no]:
             earliest[unit_no] = sec
 
+    # 2) Fill Units from API (coerce UnitNo to int safely)
     updated = []
     for u in (units_from_api or []):
-        unit_no = u.get("UnitNo")
+        if not isinstance(u, dict):
+            stats["unmatched_units"] += 1
+            updated.append(u)
+            continue
+
+        raw_uno = u.get("UnitNo")
+        try:
+            unit_no = int(raw_uno)
+        except Exception:
+            unit_no = None
+
         cur_time = (u.get("Time") or "").strip()
 
+        # Skip if we only fill empty and it already has a Time
         if only_fill_if_empty and cur_time:
             stats["skipped_existing_time"] += 1
             updated.append(u)
             continue
 
-        if isinstance(unit_no, int) and unit_no in earliest:
+        # Fill if we have an earliest time for this unit_no
+        if unit_no is not None and unit_no in earliest:
             new_time = _sec_to_hms(earliest[unit_no])
             if new_time and new_time != cur_time:
                 u = {**u, "Time": new_time}
