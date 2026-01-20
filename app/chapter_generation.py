@@ -247,6 +247,125 @@ def parse_summary_from_output(output_text: str) -> Dict[str, str]:
     
     return summary
 
+def _extract_json_blob(text: str) -> Optional[str]:
+    """
+    Try to extract JSON from:
+    - raw JSON
+    - ```json ... ```
+    - ``` ... ```
+    Returns JSON string or None.
+    """
+    if not text:
+        return None
+
+    # fenced ```json ... ```
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # fenced ``` ... ```
+    m = re.search(r"```\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # raw json
+    s = text.strip()
+    if s.startswith("{") and s.endswith("}"):
+        return s
+
+    return None
+
+
+def safe_load_json(text: str) -> Optional[Dict[str, Any]]:
+    blob = _extract_json_blob(text)
+    if not blob:
+        return None
+    try:
+        obj = json.loads(blob)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _is_hms(ts: str) -> bool:
+    return bool(re.fullmatch(r"\d{2}:\d{2}:\d{2}", (ts or "").strip()))
+
+
+def normalize_suggested_units(
+    suggested_units: Any,
+    units: Optional[List[Dict]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Normalize SuggestedUnits list:
+    - enforce fields
+    - ensure Time is HH:MM:SS
+    - ensure ParentUnitNo is valid if units provided
+    - sort by Time
+    - renumber UnitNo sequentially
+    """
+    if not isinstance(suggested_units, list):
+        return []
+
+    valid_parent_set = None
+    if units:
+        valid_parent_set = set()
+        for u in units:
+            try:
+                valid_parent_set.add(int(u.get("UnitNo")))
+            except Exception:
+                pass
+
+    out: List[Dict[str, Any]] = []
+    for su in suggested_units:
+        if not isinstance(su, dict):
+            continue
+
+        title = str(su.get("Title") or "").strip()
+        ts = str(su.get("Time") or "").strip()
+
+        if not title or not _is_hms(ts):
+            continue
+
+        parent = su.get("ParentUnitNo", None)
+        if not units:
+            parent = None
+        else:
+            if parent is not None:
+                try:
+                    parent = int(parent)
+                except Exception:
+                    parent = None
+            if valid_parent_set is not None and parent is not None and parent not in valid_parent_set: 
+                parent = None
+
+        out.append({
+            "UnitNo": 0,  # will renumber
+            "ParentUnitNo": parent,
+            "Title": title,
+            "Time": ts,
+        })
+
+    # sort and renumber
+    out.sort(key=lambda x: x["Time"])
+    for i, su in enumerate(out, 1):
+        su["UnitNo"] = i
+    return out
+
+
+def suggested_units_to_chapters_dict(suggested_units: List[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Convert SuggestedUnits to the chapters dict expected by the rest of the pipeline.
+    Key = timestamp, Value = title (optionally prefixed with ParentUnitNo).
+    """
+    chapters: Dict[str, str] = {}
+    for su in suggested_units:
+        ts = su["Time"]
+        title = su["Title"]
+        p = su.get("ParentUnitNo")
+        prefix = f"[單元{p}] " if p is not None else ""
+        chapters[ts] = prefix + title
+    return chapters
+
 def validate_and_normalize_timestamps(
     chapters: Dict[str, str], 
     duration_sec: int,
@@ -1140,26 +1259,35 @@ def hierarchical_multipass_generation(
 
 總時長：{sec_to_hms(int(duration))}
 
-【輸出格式要求】
-請嚴格按照以下格式輸出：
+【輸出格式要求（重要：只輸出 JSON，不要輸出任何其他文字）】
+請輸出一個 JSON 物件，格式如下：
 
-第一部分 - 章節列表：
-HH:MM:SS - [模塊標籤] 具體章節標題
-（每行一個章節，時間來自ASR，標題結合ASR表述與OCR術語）
+{{
+  "SuggestedUnits": [
+    {{
+      "UnitNo": 1,
+      "ParentUnitNo": null,
+      "Title": "章節標題（繁體中文）",
+      "Time": "HH:MM:SS"
+    }}
+  ],
+  "CourseSummary": {{
+    "topic": "...",
+    "core_content": "...",
+    "learning_objectives": "...",
+    "target_audience": "...",
+    "difficulty": "..."
+  }}
+}}
 
-優質範例（時間點來自講師宣告，標題結合講師表述與投影片術語）：
-00:10:03 - [基礎工具介紹] Adobe Illustrator的基本操作和介面設置
-00:19:09 - [效果工具應用] 使用效果工具創建文字彎曲效果
-00:31:51 - [矩形和鋼筆工具] 使用矩形和鋼筆工具創建基本形狀和線條
+規則：
+1) Time 必須是逐字稿中存在或非常接近（±60 秒內）的 HH:MM:SS
+2) SuggestedUnits 需依時間遞增排序
+3) 若有提供「預定教學單元 Units」，每一個 SuggestedUnit 必須填 ParentUnitNo，值必須是 Units 裡的 UnitNo
+4) 若未提供 Units，ParentUnitNo 必須為 null
+5) 只輸出 JSON，禁止 ```、禁止多餘解釋、禁止條列文字
 
-（空一行）
 
-第二部分 - 課程摘要：
-課程主題：[主要教學領域，如：Adobe Illustrator基礎教學、Python資料分析]
-核心內容：[列出6-12個主要教學概念，以頓號分隔，反映整個課程的關鍵知識點]
-學習目標：[學生完成後將掌握的具體、可衡量的能力]
-適合對象：[目標學員背景，如：設計初學者、有程式基礎的進階學員]
-難度級別：[初級/中級/高級]
 """
     
     logger.info(f"📤 PASS 3 prompt: ~{count_tokens_llama(chapters_prompt):,} tokens")
@@ -1170,7 +1298,12 @@ HH:MM:SS - [模塊標籤] 具體章節標題
         final_response = call_llm(
             service_type=config.service_type,
             client=client,
-            system_message="你是細心的章節設計師，擅長為學習模塊創建精確的時間標記和課程摘要。你的核心原則是：使用ASR時間戳來確定章節開始時間（因為這反映講師的自然教學節奏），使用OCR內容來豐富章節標題（提供準確的專業術語）。請嚴格遵守輸出格式，確保包含章節列表和課程摘要兩部分。",
+            system_message=(
+                "你是細心的章節設計師。"
+                "章節時間以 ASR 時間戳為準，章節標題可用 OCR 補充專業術語。"
+                "請只輸出一個 JSON 物件，且 JSON 必須包含 SuggestedUnits 與 CourseSummary。"
+                "禁止輸出任何其他文字、禁止 ```。"
+            ),
             user_message=chapters_prompt,
             model=config.openai_model if config.service_type == "openai" else config.azure_model,
             max_tokens=3000,
@@ -1194,39 +1327,46 @@ HH:MM:SS - [模塊標籤] 具體章節標題
     logger.info("\n" + "-" * 60)
     logger.info("🔍 Parsing Generated Content")
     logger.info("-" * 60)
-    
-    # Parse chapters from final output
-    chapters_raw = parse_chapters_from_output(final_text)
-    logger.info(f"📊 Parsed {len(chapters_raw)} chapters from LLM output")
 
-    # ✅ NEW: Validate and normalize timestamps
+    data = safe_load_json(final_text)
+
+    suggested_units_structured: List[Dict[str, Any]] = []
+    course_summary: Dict[str, Any] = {}
+
+    if data:
+        suggested_units_structured = normalize_suggested_units(
+            data.get("SuggestedUnits"),
+            units=units
+        )
+        cs = data.get("CourseSummary")
+        if isinstance(cs, dict):
+            course_summary = cs
+            
+        # Optional: keep summary consistent with chapters (Traditional)
+        if _opencc and course_summary:
+            for k, v in list(course_summary.items()):
+                if isinstance(v, str):
+                    course_summary[k] = to_traditional(v)
+                    
+    # Build chapters_raw from SuggestedUnits if available, else fallback to text parsing
+    if suggested_units_structured:
+        chapters_raw = suggested_units_to_chapters_dict(suggested_units_structured)
+        logger.info(f"📊 Parsed {len(suggested_units_structured)} SuggestedUnits from JSON")
+    else:
+        logger.warning("⚠️ PASS 3 JSON parse failed; falling back to text chapter parsing")
+        chapters_raw = parse_chapters_from_output(final_text)
+        course_summary = parse_summary_from_output(final_text)
+
+    # ✅ ALWAYS build `chapters` from `chapters_raw`
     chapters = validate_and_normalize_timestamps(
-        chapters_raw, 
+        chapters_raw,
         int(duration),
-        video_id=f"hierarchical_{int(time.time())}"
+        video_id="hierarchical_pass3"
     )
-
     if not chapters:
         logger.error("❌ No valid chapters after timestamp validation, using time-based fallback")
         chapters = create_time_based_fallback(int(duration))
-    
-    if chapters:
-        def _ts_to_seconds(ts: str) -> int:
-            h, m, s = map(int, ts.split(":"))
-            return h * 3600 + m * 60 + s
-            
-        sorted_keys = sorted(chapters.keys(), key=_ts_to_seconds)
-        first_chapter = sorted_keys[0]
-        last_chapter = sorted_keys[-1]
 
-        logger.info(f"📍 Chapter range: {first_chapter} to {last_chapter}")
-
-    else:
-        logger.warning("⚠️ No chapters were parsed from LLM output!")
-        
-    # Parse structured summary
-    course_summary = parse_summary_from_output(final_text)
-    
     if course_summary:
         logger.info(f"✅ Successfully extracted course summary with {len(course_summary)} fields:")
         for key, value in course_summary.items():
@@ -1473,7 +1613,6 @@ def generate_chapters_debug(
                 raw_llm_text = resp.choices[0].message.content
 
             # Parse chapters
-            # Parse chapters
             chapters_raw = parse_chapters_from_output(raw_llm_text)
 
             # ✅ NEW: Validate and normalize timestamps
@@ -1489,7 +1628,8 @@ def generate_chapters_debug(
             # Parse structured summary
             course_summary = parse_summary_from_output(raw_llm_text)
             metadata = {'generation_method': 'single_pass',
-                        'course_summary': course_summary}
+                        'course_summary': course_summary,
+                        }
 
         # COMMON POST-PROCESSING (existing logic)
         if progress_callback:
