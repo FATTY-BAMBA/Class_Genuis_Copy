@@ -222,6 +222,17 @@ def post_to_client_api(payload):
     except Exception as e:
         logger.error(f"❌ POST failed: {e}", exc_info=True)
 
+# --- Client title cleanup (for display only; does NOT affect chapter generation) ---
+TITLE_PREFIX_RE = re.compile(r"^\s*單元\s*\d+\s*[-－–—:：]\s*")
+
+def clean_client_title(title: str) -> str:
+    """
+    Remove prefixes like:
+      '單元1 - ', '單元2:', '單元3：'
+    from the beginning of a title.
+    """
+    return TITLE_PREFIX_RE.sub("", (title or "")).strip()
+
 def transform_chapters_to_units(chapters: dict) -> list:
     """
     Transform chapters from dict format to Units array format.
@@ -257,7 +268,9 @@ def transform_chapters_to_units(chapters: dict) -> list:
             module_tag = clean_title[1:bracket_end].strip()
             content = clean_title[bracket_end+1:].strip()
             clean_title = f"{module_tag} - {content}" if content else module_tag
-        
+            
+        # ✅ remove "單元1 -", "單元2 -", etc. for client output
+        clean_title = clean_client_title(clean_title)
         units.append({
             "UnitNo": idx,
             "Title": clean_title,
@@ -1479,7 +1492,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                     if isinstance(unit, dict):
                         units_from_api.append({
                             "UnitNo": unit.get("UnitNo", idx),
-                            "Title": unit.get("Title", ""),
+                            "Title": clean_client_title(unit.get("Title", "")),
                             "Time": unit.get("Time", "")
                         })
             else:
