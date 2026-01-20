@@ -1347,6 +1347,17 @@ def hierarchical_multipass_generation(
             for k, v in list(course_summary.items()):
                 if isinstance(v, str):
                     course_summary[k] = to_traditional(v)
+    # Optional: warn if client provided Units but model did not map all SuggestedUnits
+    if units and suggested_units_structured:
+        missing = sum(
+            1 for x in suggested_units_structured
+            if x.get("ParentUnitNo") is None
+        )
+        if missing:
+            logger.warning(
+                f"⚠️ {missing}/{len(suggested_units_structured)} SuggestedUnits missing ParentUnitNo "
+                f"(client provided {len(units)} Units)"
+            )
                     
     # Build chapters_raw from SuggestedUnits if available, else fallback to text parsing
     if suggested_units_structured:
