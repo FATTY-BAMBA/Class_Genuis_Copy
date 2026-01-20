@@ -103,6 +103,62 @@ CHAPTER_LINE_RE = re.compile(
 )
 TS_IN_LINE = re.compile(r'^\s*(\d{1,2}:\d{2}:\d{2})\s*:')
 
+ASR_TS_RE = re.compile(r"^\s*(\d{1,2}:\d{2}:\d{2})\s*:")
+
+def ts_to_seconds_hms(ts: str) -> int:
+    try:
+        h, m, s = ts.strip().split(":")
+        h, m, s = int(h), int(m), int(s)
+        if h < 0 or m < 0 or s < 0 or m >= 60 or s >= 60:
+            return -1
+        return h * 3600 + m * 60 + s
+    except Exception:
+        return -1
+
+def extract_asr_timestamps_sorted(raw_asr_text: str) -> List[str]:
+    """Return sorted unique HH:MM:SS timestamps found in raw ASR."""
+    seen = set()
+    for line in (raw_asr_text or "").splitlines():
+        m = ASR_TS_RE.match(line)
+        if m:
+            seen.add(_normalize_ts(m.group(1)))
+    out = sorted(seen, key=ts_to_seconds_hms)
+    return out
+
+def pick_anchor_timestamps(asr_ts_sorted: List[str], k: int = 12) -> List[str]:
+    """
+    Pick k timestamps spread across the whole ASR (including the tail).
+    Always includes first and last if available.
+    """
+    if not asr_ts_sorted:
+        return []
+    if len(asr_ts_sorted) <= k:
+        return asr_ts_sorted
+
+    idxs = [0]
+    # evenly spaced indices
+    for i in range(1, k - 1):
+        idxs.append(round(i * (len(asr_ts_sorted) - 1) / (k - 1)))
+    idxs.append(len(asr_ts_sorted) - 1)
+
+    # unique + ordered
+    idxs = sorted(set(idxs))
+    return [asr_ts_sorted[i] for i in idxs if 0 <= i < len(asr_ts_sorted)]
+
+def chapters_coverage_ratio(
+    suggested_units_structured: List[Dict[str, Any]],
+    last_asr_sec: int
+) -> float:
+    """Compute last chapter time / last ASR time."""
+    if not suggested_units_structured or last_asr_sec <= 0:
+        return 1.0
+    last_ch_ts = suggested_units_structured[-1].get("Time")
+    last_ch_sec = ts_to_seconds_hms(str(last_ch_ts or ""))
+    if last_ch_sec < 0:
+        return 0.0
+    return last_ch_sec / last_asr_sec
+
+
 def sec_to_hms(sec: int) -> str:
     """Convert seconds to HH:MM:SS format"""
     if sec < 0:
@@ -352,19 +408,61 @@ def normalize_suggested_units(
     return out
 
 
-def suggested_units_to_chapters_dict(suggested_units: List[Dict[str, Any]]) -> Dict[str, str]:
+def suggested_units_to_chapters_dict(
+    suggested_units: List[Dict[str, Any]],
+    *,
+    duration_sec: Optional[int] = None,
+    bump_limit_sec: int = 59,   # keep within the “±60s” spirit
+) -> Dict[str, str]:
     """
-    Convert SuggestedUnits to the chapters dict expected by the rest of the pipeline.
-    Key = timestamp, Value = title (optionally prefixed with ParentUnitNo).
+    Convert SuggestedUnits -> chapters dict, while preventing timestamp key collisions.
+
+    If duplicate timestamps exist, we bump later ones forward by +1s (up to bump_limit_sec)
+    so we don't overwrite earlier chapters.
+
+    This does NOT try to re-snap to ASR; it just guarantees uniqueness for dict keys.
     """
+    def bump_ts(ts: str, delta: int) -> str:
+        base = ts_to_seconds_hms(ts)
+        if base < 0:
+            return ts
+        bumped = base + delta
+        if duration_sec is not None:
+            bumped = min(bumped, max(0, duration_sec - 1))
+        return sec_to_hms(bumped)
+
     chapters: Dict[str, str] = {}
+    used = set()
+
     for su in suggested_units:
-        ts = su["Time"]
-        title = su["Title"]
+        ts = str(su.get("Time") or "").strip()
+        title = str(su.get("Title") or "").strip()
         p = su.get("ParentUnitNo")
         prefix = f"[單元{p}] " if p is not None else ""
-        chapters[ts] = prefix + title
+
+        if not _is_hms(ts) or not title:
+            continue
+
+        candidate = ts
+        if candidate in used:
+            # bump forward until free (within bump_limit_sec)
+            placed = False
+            for d in range(1, bump_limit_sec + 1):
+                cand2 = bump_ts(ts, d)
+                if cand2 not in used:
+                    candidate = cand2
+                    placed = True
+                    break
+            if not placed:
+                # last resort: append a tiny suffix to keep uniqueness (won't be HH:MM:SS)
+                # Better than silent overwrite; and you'll SEE it in logs/debug.
+                candidate = f"{ts}#{len(used)}"
+
+        used.add(candidate)
+        chapters[candidate] = prefix + title
+
     return chapters
+
 
 def validate_and_normalize_timestamps(
     chapters: Dict[str, str], 
@@ -980,6 +1078,16 @@ def hierarchical_multipass_generation(
     # Truncate once, reuse in all passes for consistency
     asr_text = truncate_text_by_tokens(raw_asr_text, ASR_LIMIT)
     ocr_text = truncate_text_by_tokens(ocr_context, OCR_LIMIT) if ocr_context else ""
+
+    asr_ts_sorted = extract_asr_timestamps_sorted(raw_asr_text)  # use RAW, not truncated
+    asr_end_ts = asr_ts_sorted[-1] if asr_ts_sorted else sec_to_hms(int(duration))
+    asr_end_sec = ts_to_seconds_hms(asr_end_ts)
+    anchors = pick_anchor_timestamps(asr_ts_sorted, k=14)
+
+    logger.info(f"🧾 ASR time coverage: first={asr_ts_sorted[0] if asr_ts_sorted else 'N/A'} "
+                f"last={asr_end_ts} (asr_ts_count={len(asr_ts_sorted)})")
+    logger.info(f"🧷 Anchor timestamps (spread): {anchors}")
+
     
     asr_used = count_tokens_llama(asr_text)
     ocr_used = count_tokens_llama(ocr_text)
@@ -1358,10 +1466,71 @@ def hierarchical_multipass_generation(
                 f"⚠️ {missing}/{len(suggested_units_structured)} SuggestedUnits missing ParentUnitNo "
                 f"(client provided {len(units)} Units)"
             )
+
+    # -------------------------
+    # Coverage Guardrail (CRITICAL)
+    # If chapters only cover early part of ASR, re-run PASS3 once with anchors.
+    # -------------------------
+    if suggested_units_structured and asr_end_sec > 0:
+        cov = chapters_coverage_ratio(suggested_units_structured, asr_end_sec)
+        last_ch = suggested_units_structured[-1]["Time"]
+        logger.info(f"📏 PASS3 coverage check: last_chapter={last_ch}, asr_end={asr_end_ts}, ratio={cov:.2f}")
+        
+        # If ASR is long enough and chapters end too early => retry once
+        # Example: ASR ends at 2:39 but chapters stop at 0:40 => ratio ~0.25 => retry
+        if asr_end_sec >= 3600 and cov < 0.60:
+            logger.warning(
+                f"⚠️ PASS3 chapters end too early (ratio={cov:.2f}). Retrying PASS3 with anchor timestamps..."
+            )
+            retry_hint = f"""
+    【強制覆蓋規則（必須遵守）】
+    - 逐字稿最後時間戳約為：{asr_end_ts}
+    - 你輸出的最後一個章節 Time 必須 >= {sec_to_hms(max(0, int(asr_end_sec * 0.85)))}（至少覆蓋到後段）
+    - 禁止只生成前段章節；必須涵蓋整段教學（包含後半段/後段）
+    - 以下是逐字稿中分佈於全程的時間戳樣本（必須用來選章節時間點，且要包含後段時間戳）：
+    {", ".join(anchors[-10:] if len(anchors) >= 10 else anchors)}
+    """
+            chapters_prompt_retry = chapters_prompt + "\n" + retry_hint
+            retry_resp = call_llm(
+                service_type=config.service_type,
+                client=client,
+                system_message=(
+                    "你是細心的章節設計師。"
+                    "請只輸出 JSON（包含 SuggestedUnits 與 CourseSummary），禁止任何其他文字。"
+                    "章節 Time 必須對齊 ASR 真實時間戳，且必須覆蓋整段逐字稿到後段。"
+                ),
+                user_message=chapters_prompt_retry,
+                model=config.openai_model if config.service_type == "openai" else config.azure_model,
+                max_tokens=3000,
+                temperature=0.1
+            )
+            final_text_retry = (
+                retry_resp.choices[0].message.content
+                if config.service_type == "openai"
+                else retry_resp.choices[0].message.content
+            )
+            data_retry = safe_load_json(final_text_retry)
+            if data_retry:
+                suggested_retry = normalize_suggested_units(data_retry.get("SuggestedUnits"), units=units)
+                if suggested_retry:
+                    suggested_units_structured = suggested_retry
+                    cs2 = data_retry.get("CourseSummary")
+                    if isinstance(cs2, dict):
+                        course_summary = cs2
+                    final_text = final_text_retry  # keep raw text for debugging
+                    logger.info(f"✅ PASS3 retry succeeded: SuggestedUnits={len(suggested_units_structured)}")
+                else:
+                    logger.warning("⚠️ PASS3 retry JSON parsed but SuggestedUnits empty; keeping first result")
+            else:
+                logger.warning("⚠️ PASS3 retry JSON parse failed; keeping first result")
                     
     # Build chapters_raw from SuggestedUnits if available, else fallback to text parsing
     if suggested_units_structured:
-        chapters_raw = suggested_units_to_chapters_dict(suggested_units_structured)
+        chapters_raw = suggested_units_to_chapters_dict(
+            suggested_units_structured,
+            duration_sec=int(duration),
+            bump_limit_sec=59
+        )
         logger.info(f"📊 Parsed {len(suggested_units_structured)} SuggestedUnits from JSON")
     else:
         logger.warning("⚠️ PASS 3 JSON parse failed; falling back to text chapter parsing")
