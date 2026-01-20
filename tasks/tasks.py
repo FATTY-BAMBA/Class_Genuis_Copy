@@ -240,7 +240,10 @@ def transform_chapters_to_units(chapters: dict) -> list:
     
     units = []
     # Sort chapters by timestamp to ensure correct UnitNo ordering
-    sorted_chapters = sorted(chapters.items(), key=lambda x: x[0])
+    def _ts_key(ts: str):
+        sec = _hms_to_sec(ts)  # you already have this helper
+        return sec if sec is not None else 10**12
+    sorted_chapters = sorted(chapters.items(), key=lambda x: _ts_key(x[0]))
     
     logger.info(f"Transforming {len(sorted_chapters)} chapters to Units format")
     
@@ -1338,7 +1341,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
 
         # ========== NEW: GENERATE SUGGESTED UNITS ==========
         logger.info("=" * 60)
-        logger.info("🎓 GENERATING SUGGESTED UNITS FOR CLIENT")
+        logger.info("🎓 GENERATING TEACHING SUGGESTIONS (workspace only)")
         logger.info("=" * 60)
 
         # Import the helper functions
@@ -1466,7 +1469,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             logger.info("🔄 Transforming chapters to client format...")
 
             # Transform chapters to Units format (safe - returns [] if None)
-            units_from_chapters = transform_chapters_to_units(qa_result.get("chapters", {})) or []
+            navigation_units = transform_chapters_to_units(chapters_dict or {}) or []
 
             # Prepare SuggestedUnits from incoming API (safe - defaults to [])
             units_from_api = []
@@ -1483,7 +1486,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 logger.info("ℹ️  No Units provided in incoming API")  
 
             # Safe defaults for all unit types
-            units_from_chapters = units_from_chapters or []
+            navigation_units = navigation_units or []
             units_from_api = units_from_api or []
 
             # ✅ Prefer structured SuggestedUnits from PASS3 metadata (best)
@@ -1520,8 +1523,8 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             workspace_artifact = {
                 **qa_result,
                 "Units": units_from_api or [],               # ✅ Units from incoming API (maybe with times filled)
-                "SuggestedUnits": units_from_chapters or [], # ✅ Suggested units from AI chapters
-                "AIGeneratedSuggestedUnits": suggested_units or [],
+                "SuggestedUnits": navigation_units or [],  # ✅ Navigation chapters (video navigation)
+                "TeachingSuggestions": suggested_units or [],  # PASS3/topic-based suggestions (workspace only)
                 "total_processing_time": total_processing_time,
                 "processing_metadata": {
                     "processing_method": processing_result.get("method"),
@@ -1555,12 +1558,12 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 "Questions": qa_result["Questions"],
                 "CourseNote": qa_result["CourseNote"],
                 "Units": units_from_api,              # ← Their units (from API)
-                "SuggestedUnits": units_from_chapters  # ← AI-generated chapters as suggestions
+                "SuggestedUnits": navigation_units  # ← Video navigation chapters
             }
 
             logger.info(f"📦 Client payload summary:")
             logger.info(f"   • Units (from API): {len(units_from_api)}")
-            logger.info(f"   • SuggestedUnits (AI-generated): {len(units_from_chapters)}")
+            logger.info(f"   • SuggestedUnits (navigation): {len(navigation_units)}")
             logger.info(f"   • Questions: {len(client_payload['Questions'])}")
 
             # Save clean client payload
@@ -1582,6 +1585,25 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                     f.write(f"[{s:.1f} - {e:.1f}] {t}\n")
             logger.info(f"💾 Saved transcript to {transcript_path}")
 
+            # ---- Guardrail: SuggestedUnits must exactly reflect chapters_dict ----
+            chapters_sorted = sorted((chapters_dict or {}).items(), key=lambda x: x[0])  # [(ts, title)]
+            nav_sorted = [(u.get("Time"), u.get("Title")) for u in (navigation_units or [])]
+
+            if len(nav_sorted) != len(chapters_sorted):
+                logger.warning(
+                    "⚠️ navigation_units count %d != chapters_dict count %d",
+                    len(nav_sorted), len(chapters_sorted)
+                )
+            # Hard check: timestamps should match 1:1 (this is what client uses for navigation)
+            chapters_times = [ts for ts, _ in chapters_sorted]
+            nav_times = [ts for ts, _ in nav_sorted]
+
+            if chapters_times and nav_times and chapters_times != nav_times:
+                logger.error("❌ navigation_units times do not match chapters_dict times. Refusing to send.")
+                logger.error("   chapters_times=%s", chapters_times)
+                logger.error("   nav_times=%s", nav_times)
+                raise RuntimeError("Refusing to send mismatched navigation SuggestedUnits")
+     
             # ========== SEND CLEAN PAYLOAD TO CLIENT API ==========
             post_to_client_api(client_payload)  # ← Only send clean data
             logger.info(f"✅ Complete pipeline finished in {total_processing_time:.1f}s")
