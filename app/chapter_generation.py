@@ -1,4 +1,4 @@
-# app/video_chaptering.py
+# app/chapter_generation.py
 """
 Module for generating video chapters from *raw* ASR and OCR inputs.
 - No ASR/OCR preprocessing/merging; we use what you pass in.
