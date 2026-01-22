@@ -1511,6 +1511,8 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             else:
                 logger.info("ℹ️  No Units provided in incoming API")  
 
+            
+        
             # Safe defaults for all unit types
             navigation_units = navigation_units or []
             units_from_api = units_from_api or []
@@ -1519,14 +1521,115 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             suggested_structured = None
             if chapter_metadata and isinstance(chapter_metadata.get("suggested_units_structured"), list):  
                 suggested_structured = chapter_metadata["suggested_units_structured"]
+
+            # ========== 🔍 DIAGNOSTIC LOGGING FOR UNIT MAPPING ==========
+            logger.info("=" * 60)
+            logger.info("🔍 DIAGNOSTIC: UNIT MAPPING DATA")
+            logger.info("=" * 60)
+
+            # Log what we received from API
+            logger.info(f"📥 Units from API: {len(units_from_api)}")
+            for unit in units_from_api:
+                logger.info(f"   • Unit {unit['UnitNo']}: {unit['Title'][:50]} | Time: '{unit.get('Time', 'EMPTY')}'")
+
+            # Log structured SuggestedUnits
             if suggested_structured:
+                logger.info(f"📊 Structured SuggestedUnits: {len(suggested_structured)}")
+    
+                # Group by ClientUnitNo to see mapping
+                from collections import defaultdict
+                mapping = defaultdict(list)
+                unmapped = []
+    
+                for su in suggested_structured:
+                    client_unit_no = su.get("ClientUnitNo")
+                    if client_unit_no:
+                        mapping[client_unit_no].append({
+                            "UnitNo": su.get("UnitNo"),
+                            "Title": su.get("Title", "")[:50],
+                            "Time": su.get("Time")
+                        })
+                    else:
+                        unmapped.append({
+                            "UnitNo": su.get("UnitNo"),
+                            "Title": su.get("Title", "")[:50],
+                            "Time": su.get("Time")
+                        })
+    
+                # Log mapping results
+                logger.info(f"📍 Mapping Summary:")
+                for client_unit_no in sorted(mapping.keys()):
+                    chapters = mapping[client_unit_no]
+                    first_time = chapters[0]["Time"]
+                    logger.info(f"   ClientUnit {client_unit_no} → {len(chapters)} chapters")
+                    logger.info(f"      First chapter: {chapters[0]['Title']} @ {first_time}")
+                    if len(chapters) > 1:
+                        logger.info(f"      Last chapter: {chapters[-1]['Title']} @ {chapters[-1]['Time']}")
+    
+                if unmapped:
+                    logger.info(f"⚠️ {len(unmapped)} SuggestedUnits have NO ClientUnitNo:")
+                    for item in unmapped[:3]:  # Show first 3
+                    logger.info(f"      • {item['Title']} @ {item['Time']}")
+            else:
+                logger.info("❌ No structured SuggestedUnits in metadata!")
+                if chapter_metadata:
+                    logger.info(f"   Available metadata keys: {list(chapter_metadata.keys())}")
+                else:
+                    logger.info("   No chapter_metadata at all!")
+
+            # Check if enriched units are available
+            if chapter_metadata and chapter_metadata.get("client_units_with_timestamps"):
+                enriched = chapter_metadata["client_units_with_timestamps"]
+                logger.info(f"✅ Found enriched units in metadata: {len(enriched)} units")
+                for unit in enriched:
+                    logger.info(f"   • Unit {unit['UnitNo']}: {unit['Title'][:50]} | Time: '{unit.get('Time', 'EMPTY')}'")
+            else:
+                logger.info("⚠️ No enriched units in metadata - will use legacy fill method")
+
+            logger.info("=" * 60)
+
+    
+            # ========== ✅ NEW: USE ENRICHED UNITS FROM CHAPTER GENERATION ==========
+            if chapter_metadata and chapter_metadata.get("client_units_with_timestamps"):
+                # Best approach: Use pre-calculated enriched units from chapter generation
+                enriched_units = chapter_metadata["client_units_with_timestamps"]
+                unit_diagnostics = chapter_metadata.get("unit_diagnostics", {})
+    
+                logger.info("=" * 60)
+                logger.info("✅ USING ENRICHED UNITS FROM CHAPTER GENERATION")
+                logger.info("=" * 60)
+    
+                # Replace units_from_api with enriched versions
+                units_from_api = []
+                for unit in enriched_units:
+                    units_from_api.append({
+                        "UnitNo": unit.get("UnitNo"),
+                        "Title": clean_client_title(unit.get("Title", "")),
+                        "Time": unit.get("Time", "")  # Already back-calculated!
+                    })
+                # Build stats for logging compatibility
+                unit_time_stats = {
+                    "filled_count": unit_diagnostics.get("units_found", 0),
+                    "skipped_existing_time": 0,
+                    "unmatched_units": unit_diagnostics.get("units_missing", 0),
+                    "unmatched_suggested": unit_diagnostics.get("unmapped_suggested_units", 0),
+                    "invalid_suggested_times": 0,
+                }
+
+                logger.info(f"✅ Enriched {len(units_from_api)} Units with timestamps")
+                logger.info("   Method: Back-calculation from chapter generation")
+
+            elif suggested_structured:
+                # Fallback: Use legacy fill method
+                logger.warning("⚠️ Enriched units not available; using legacy fill method")
                 units_from_api, unit_time_stats = fill_unit_times_from_suggested_units(
                     units_from_api,
                     suggested_structured,
                     only_fill_if_empty=True,
                 )
-                logger.info("🧩 Using structured SuggestedUnits for Units Time fill")
+                logger.info("🧩 Using structured SuggestedUnits for Units Time fill (legacy)")
             else:
+                # No mapping available
                 unit_time_stats = {
                     "filled_count": 0,
                     "skipped_existing_time": 0,
@@ -1535,16 +1638,17 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                     "invalid_suggested_times": 0,
                 }
                 logger.info("ℹ️ No structured SuggestedUnits available; skipping Units Time fill")
-
+                
+            # Log results
             logger.info(
-                "🕒 Filled Units Time from SuggestedUnits: filled=%d skipped_existing=%d unmatched_units=%d unmatched_suggested=%d invalid_suggested_times=%d",
+                "🕒 Unit Time Fill Results: filled=%d skipped_existing=%d unmatched_units=%d unmatched_suggested=%d invalid_suggested_times=%d",
                 unit_time_stats["filled_count"],
                 unit_time_stats["skipped_existing_time"],
                 unit_time_stats["unmatched_units"],
                 unit_time_stats["unmatched_suggested"],
                 unit_time_stats["invalid_suggested_times"],
             )
-                
+
             # ========== SAVE COMPREHENSIVE WORKSPACE ARTIFACT ==========
             workspace_artifact = {
                 **qa_result,
@@ -1566,7 +1670,29 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                     "removed_ratio": processing_result.get("removed_ratio"),
                 },
                 "chapter_metadata": chapter_metadata,
-            }
+            } 
+
+            # ========== 📊 LOG WORKSPACE ARTIFACT SUMMARY ==========
+            logger.info("=" * 60)
+            logger.info("📦 WORKSPACE ARTIFACT SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"   • Questions: {len(workspace_artifact.get('Questions', []))}")
+            logger.info(f"   • CourseNote pages: {workspace_artifact.get('CourseNote', '').count('---') + 1}")
+            logger.info(f"   • Units (from API): {len(workspace_artifact.get('Units', []))}")
+            logger.info(f"   • SuggestedUnits (navigation): {len(workspace_artifact.get('SuggestedUnits', []))}")
+            logger.info(f"   • TeachingSuggestions: {len(workspace_artifact.get('TeachingSuggestions', []))}")
+
+            # Detailed Units breakdown
+            units_with_time = sum(1 for u in workspace_artifact.get('Units', []) if u.get('Time'))
+            units_without_time = len(workspace_artifact.get('Units', [])) - units_with_time
+            logger.info(f"   • Units with timestamps: {units_with_time}/{len(workspace_artifact.get('Units', []))}")
+            if units_without_time > 0:
+                logger.warning(f"   ⚠️ Units WITHOUT timestamps: {units_without_time}")
+                for unit in workspace_artifact.get('Units', []):
+                    if not unit.get('Time'):
+                        logger.warning(f"      - Unit {unit['UnitNo']}: {unit['Title'][:50]}")
+            logger.info("=" * 60)
+
                
             # Save full workspace result
             workspace_path = os.path.join(run_dir, "full_processing_result.json")
@@ -1587,10 +1713,30 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 "SuggestedUnits": navigation_units  # ← Video navigation chapters
             }
 
-            logger.info(f"📦 Client payload summary:")
-            logger.info(f"   • Units (from API): {len(units_from_api)}")
-            logger.info(f"   • SuggestedUnits (navigation): {len(navigation_units)}")
+            # ========== 📤 CLIENT PAYLOAD SUMMARY ==========
+            logger.info("=" * 60)
+            logger.info("📤 CLIENT PAYLOAD SUMMARY (What's being sent)")
+            logger.info("=" * 60)
             logger.info(f"   • Questions: {len(client_payload['Questions'])}")
+            logger.info(f"   • CourseNote: {'Present' if client_payload.get('CourseNote') else 'Empty'}")
+            logger.info(f"   • Units (from API): {len(client_payload['Units'])}")
+            logger.info(f"   • SuggestedUnits (navigation): {len(client_payload['SuggestedUnits'])}")
+
+            # Detailed Units check
+            logger.info("")
+            logger.info("📍 Client Units Detail:")
+            for unit in client_payload['Units']:
+                time_status = "✅" if unit.get('Time') else "❌ MISSING"
+                logger.info(f"   {time_status} Unit {unit['UnitNo']}: {unit['Title'][:50]} @ {unit.get('Time', 'NO TIME')}")
+            # Validation check
+            missing_times = sum(1 for u in client_payload['Units'] if not u.get('Time'))
+            if missing_times > 0:
+                logger.error(f"❌ CRITICAL: {missing_times}/{len(client_payload['Units'])} Units have NO timestamps!")
+                logger.error("   This may indicate chapter generation mapping failure")
+            else:
+                logger.info(f"✅ All {len(client_payload['Units'])} Units have timestamps")
+
+            logger.info("=" * 60)
 
             # Save clean client payload
             client_path = os.path.join(run_dir, "client_payload.json")
