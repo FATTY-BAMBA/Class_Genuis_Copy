@@ -282,7 +282,7 @@ def transform_chapters_to_units(chapters: dict) -> list:
 
 # ==================== Unit time fill helpers ====================
 
-_PARENT_UNIT_RE = re.compile(r"(?:^\s*\[\s*單元\s*|\b單元\s*)(\d+)(?:\s*\]|\s*[:：])")
+_UNIT_NO_IN_TITLE_RE = re.compile(r"(?:^\s*\[\s*單元\s*|\b單元\s*)(\d+)(?:\s*\]|\s*[:：])")
 
 def _hms_to_sec(hms: str):
     try:
@@ -309,10 +309,12 @@ def _sec_to_hms(sec: int) -> str:
 
 def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_fill_if_empty=True):
     """
-    Fill Units[].Time using earliest SuggestedUnits[].Time for each parent unit number,
-    using SuggestedUnits[].ParentUnitNo when present, else falling back to regex parse from Title.
+    Fill Units[].Time using earliest SuggestedUnits[].Time for each mapped client unit number.
 
-    Returns: (updated_units, stats_dict)
+    Priority for mapping a SuggestedUnit -> Units[].UnitNo:
+      1) SuggestedUnits[].ClientUnitNo   (NEW correct mapping)
+      2) SuggestedUnits[].ParentUnitNo   (legacy / older meaning)
+      3) Parse from title like "[單元3：...]" or "單元3：" (legacy)
     """
     stats = {
         "filled_count": 0,
@@ -324,7 +326,6 @@ def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_f
 
     earliest = {}  # unit_no -> earliest_sec
 
-    # 1) Build earliest start time per ParentUnitNo
     for su in (suggested_units or []):
         if not isinstance(su, dict):
             stats["unmatched_suggested"] += 1
@@ -333,16 +334,26 @@ def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_f
         title = (su.get("Title") or "").strip()
         t_str = (su.get("Time") or "").strip()
 
-        # Prefer structured parent mapping
-        parent = su.get("ParentUnitNo", None)
-        if parent is not None:
+        # ✅ NEW: prefer ClientUnitNo (correct for mapping to client's Units)
+        unit_no = su.get("ClientUnitNo", None)
+        if unit_no is not None:
             try:
-                unit_no = int(parent)
+                unit_no = int(unit_no)
             except Exception:
                 unit_no = None
-        else:
-            # Fallback to regex (backward compatibility)
-            m = _PARENT_UNIT_RE.search(title)
+
+        # fallback 1: ParentUnitNo (older meaning; keep for compatibility)
+        if unit_no is None:
+            parent = su.get("ParentUnitNo", None)
+            if parent is not None:
+                try:
+                    unit_no = int(parent)
+                except Exception:
+                    unit_no = None
+
+        # fallback 2: parse from title
+        if unit_no is None:
+            m = _UNIT_NO_IN_TITLE_RE.search(title)  # if you didn't rename, use _PARENT_UNIT_RE here
             unit_no = int(m.group(1)) if m else None
 
         if unit_no is None:
@@ -357,7 +368,6 @@ def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_f
         if unit_no not in earliest or sec < earliest[unit_no]:
             earliest[unit_no] = sec
 
-    # 2) Fill Units from API (coerce UnitNo to int safely)
     updated = []
     for u in (units_from_api or []):
         if not isinstance(u, dict):
@@ -373,13 +383,11 @@ def fill_unit_times_from_suggested_units(units_from_api, suggested_units, only_f
 
         cur_time = (u.get("Time") or "").strip()
 
-        # Skip if we only fill empty and it already has a Time
         if only_fill_if_empty and cur_time:
             stats["skipped_existing_time"] += 1
             updated.append(u)
             continue
 
-        # Fill if we have an earliest time for this unit_no
         if unit_no is not None and unit_no in earliest:
             new_time = _sec_to_hms(earliest[unit_no])
             if new_time and new_time != cur_time:
@@ -1604,7 +1612,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             logger.info(f"💾 Saved transcript to {transcript_path}")
 
             # ---- Guardrail: SuggestedUnits must exactly reflect chapters_dict ----
-            chapters_sorted = sorted((chapters_dict or {}).items(), key=lambda x: x[0])  # [(ts, title)]
+            chapters_sorted = sorted((chapters_dict or {}).items(), key=lambda x: _hms_to_sec(x[0]) or 10**12)
             nav_sorted = [(u.get("Time"), u.get("Title")) for u in (navigation_units or [])]
 
             if len(nav_sorted) != len(chapters_sorted):
