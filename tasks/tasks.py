@@ -1569,7 +1569,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 if unmapped:
                     logger.info(f"⚠️ {len(unmapped)} SuggestedUnits have NO ClientUnitNo:")
                     for item in unmapped[:3]:  # Show first 3
-                    logger.info(f"      • {item['Title']} @ {item['Time']}")
+                        logger.info(f"      • {item['Title']} @ {item['Time']}")
             else:
                 logger.info("❌ No structured SuggestedUnits in metadata!")
                 if chapter_metadata:
@@ -1648,6 +1648,14 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 unit_time_stats["unmatched_suggested"],
                 unit_time_stats["invalid_suggested_times"],
             )
+            # ========== 📊 LOG FINAL UNIT STATE ==========
+            logger.info("=" * 60)
+            logger.info("📋 FINAL UNITS STATE (For Client)")
+            logger.info("=" * 60)
+            for unit in units_from_api:
+                time_status = "✅" if unit.get("Time") else "❌"
+                logger.info(f"   {time_status} Unit {unit['UnitNo']}: {unit['Title'][:50]} | Time: '{unit.get('Time', 'EMPTY')}'")
+            logger.info("=" * 60)
 
             # ========== SAVE COMPREHENSIVE WORKSPACE ARTIFACT ==========
             workspace_artifact = {
