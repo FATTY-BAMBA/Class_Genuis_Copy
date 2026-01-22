@@ -494,6 +494,220 @@ def normalize_suggested_units(
         su["UnitNo"] = i
     return out
 
+def back_calculate_unit_timestamps(
+    suggested_units_structured: List[Dict[str, Any]],
+    client_units: Optional[List[Dict[str, Any]]]
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Back-calculate timestamps for client's Units based on SuggestedUnits mapping.
+    Also validates logical order and provides diagnostics.
+    
+    Args:
+        suggested_units_structured: AI-generated chapters with ClientUnitNo mapping
+        client_units: Original Units from client (can be None/empty)
+        
+    Returns:
+        Tuple of:
+        - enriched_units: Units with timestamps and metadata
+        - diagnostics: Validation results and statistics
+        
+    Example:
+        Input client_units:
+        [
+            {"UnitNo": 1, "Title": "廚具規劃"},
+            {"UnitNo": 2, "Title": "天花板大樣圖"},
+            {"UnitNo": 3, "Title": "冷氣配置"}
+        ]
+        
+        Input suggested_units_structured:
+        [
+            {UnitNo: 1, Title: "廚房三角原理", Time: "00:05:10", ClientUnitNo: 1},
+            {UnitNo: 2, Title: "廚具尺寸標準", Time: "00:18:30", ClientUnitNo: 1},
+            {UnitNo: 3, Title: "大樣圖規範", Time: "00:32:15", ClientUnitNo: 2},
+            ...
+        ]
+        
+        Output enriched_units:
+        [
+            {
+                "UnitNo": 1,
+                "Title": "廚具規劃",
+                "Time": "00:05:10",  # First SuggestedUnit with ClientUnitNo=1
+                "EndTime": "00:32:15",
+                "Duration": "00:27:05",
+                "SuggestedUnitCount": 2,
+                "FirstChapter": "廚房工作三角原理與動線設計",
+                "LastChapter": "廚具尺寸標準與人體工學考量"
+            },
+            ...
+        ]
+    """
+    
+    # Handle case where no Units provided
+    if not client_units:
+        logger.info("ℹ️ No client Units provided - skipping Unit timestamp back-calculation")
+        return [], {
+            "units_provided": False,
+            "validation_passed": True,
+            "message": "No client Units to process"
+        }
+    
+    if not suggested_units_structured:
+        logger.warning("⚠️ No SuggestedUnits generated - cannot back-calculate Unit timestamps")
+        return client_units, {
+            "units_provided": True,
+            "validation_passed": False,
+            "error": "No SuggestedUnits available for mapping"
+        }
+    
+    # Build mapping: ClientUnitNo -> list of SuggestedUnits
+    unit_chapters_map: Dict[int, List[Dict[str, Any]]] = {}
+    unmapped_chapters: List[Dict[str, Any]] = []
+    
+    for su in suggested_units_structured:
+        client_unit_no = su.get("ClientUnitNo")
+        
+        if client_unit_no is None:
+            unmapped_chapters.append(su)
+            continue
+        
+        if client_unit_no not in unit_chapters_map:
+            unit_chapters_map[client_unit_no] = []
+        
+        unit_chapters_map[client_unit_no].append(su)
+    
+    # Sort chapters within each Unit by time
+    for unit_no in unit_chapters_map:
+        unit_chapters_map[unit_no].sort(
+            key=lambda x: ts_to_seconds_hms(x["Time"])
+        )
+    
+    # Enrich client units with timestamps and metadata
+    enriched_units = []
+    validation_issues = []
+    
+    for i, unit in enumerate(client_units):
+        unit_no = unit.get("UnitNo")
+        enriched_unit = dict(unit)  # Copy original
+        
+        if unit_no not in unit_chapters_map:
+            # Unit not found in video
+            logger.warning(
+                f"⚠️ Unit {unit_no} ('{unit.get('Title')}') has NO mapped chapters in video!"
+            )
+            enriched_unit.update({
+                "Time": "",
+                "EndTime": None,
+                "Duration": None,
+                "SuggestedUnitCount": 0,
+                "FirstChapter": None,
+                "LastChapter": None
+            })
+            validation_issues.append({
+                "unit_no": unit_no,
+                "issue": "not_found",
+                "message": f"Unit '{unit.get('Title')}' not found in video"
+            })
+            enriched_units.append(enriched_unit)
+            continue
+        
+        # Get chapters for this Unit
+        chapters = unit_chapters_map[unit_no]
+        first_chapter = chapters[0]
+        last_chapter = chapters[-1]
+        
+        # Calculate start time (first chapter of this Unit)
+        start_time = first_chapter["Time"]
+        start_sec = ts_to_seconds_hms(start_time)
+        
+        # Calculate end time (first chapter of NEXT Unit, or None if last)
+        end_time = None
+        end_sec = None
+        duration_sec = None
+        
+        if i + 1 < len(client_units):
+            next_unit_no = client_units[i + 1].get("UnitNo")
+            if next_unit_no in unit_chapters_map:
+                next_chapters = unit_chapters_map[next_unit_no]
+                end_time = next_chapters[0]["Time"]
+                end_sec = ts_to_seconds_hms(end_time)
+                duration_sec = end_sec - start_sec
+        
+        enriched_unit.update({
+            "Time": start_time,
+            "EndTime": end_time,
+            "Duration": sec_to_hms(duration_sec) if duration_sec else None,
+            "SuggestedUnitCount": len(chapters),
+            "FirstChapter": first_chapter["Title"],
+            "LastChapter": last_chapter["Title"]
+        })
+        
+        enriched_units.append(enriched_unit)
+        
+        logger.info(
+            f"✅ Unit {unit_no}: {unit['Title']}\n"
+            f"   → Starts at: {start_time}\n"
+            f"   → Contains: {len(chapters)} chapters\n"
+            f"   → First: {first_chapter['Title']}\n"
+            f"   → Last: {last_chapter['Title']}"
+        )
+    
+    # Validate logical order
+    timestamps_valid = True
+    for i in range(len(enriched_units) - 1):
+        current = enriched_units[i]
+        next_unit = enriched_units[i + 1]
+        
+        if not current.get("Time") or not next_unit.get("Time"):
+            continue
+        
+        current_sec = ts_to_seconds_hms(current["Time"])
+        next_sec = ts_to_seconds_hms(next_unit["Time"])
+        
+        if current_sec >= next_sec:
+            timestamps_valid = False
+            validation_issues.append({
+                "unit_no": current["UnitNo"],
+                "issue": "order_violation",
+                "message": f"Unit {current['UnitNo']} ({current['Time']}) should come before Unit {next_unit['UnitNo']} ({next_unit['Time']})"
+            })
+            logger.error(
+                f"❌ ORDER VIOLATION: Unit {current['UnitNo']} ({current['Time']}) >= "
+                f"Unit {next_unit['UnitNo']} ({next_unit['Time']})"
+            )
+    
+    # Build diagnostics
+    diagnostics = {
+        "units_provided": True,
+        "total_units": len(client_units),
+        "units_found": sum(1 for u in enriched_units if u.get("Time")),
+        "units_missing": sum(1 for u in enriched_units if not u.get("Time")),
+        "total_suggested_units": len(suggested_units_structured),
+        "mapped_suggested_units": sum(len(chapters) for chapters in unit_chapters_map.values()),
+        "unmapped_suggested_units": len(unmapped_chapters),
+        "timestamps_valid": timestamps_valid,
+        "validation_issues": validation_issues
+    }
+    
+    # Log summary
+    logger.info("\n" + "=" * 60)
+    logger.info("📍 UNIT TIMESTAMP BACK-CALCULATION SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"✅ Units found: {diagnostics['units_found']}/{diagnostics['total_units']}")
+    logger.info(f"⚠️ Units missing: {diagnostics['units_missing']}/{diagnostics['total_units']}")
+    logger.info(f"📊 SuggestedUnits mapped: {diagnostics['mapped_suggested_units']}/{diagnostics['total_suggested_units']}")
+    logger.info(f"📊 SuggestedUnits unmapped: {diagnostics['unmapped_suggested_units']}")
+    logger.info(f"{'✅' if timestamps_valid else '❌'} Timestamp order: {'Valid' if timestamps_valid else 'INVALID'}")
+    
+    if validation_issues:
+        logger.warning(f"\n⚠️ {len(validation_issues)} validation issues found:")
+        for issue in validation_issues:
+            logger.warning(f"   - {issue['message']}")
+    
+    logger.info("=" * 60 + "\n")
+    
+    return enriched_units, diagnostics
+
 def suggested_units_to_chapters_dict(
     suggested_units: List[Dict[str, Any]],
     *,
@@ -1663,6 +1877,14 @@ def hierarchical_multipass_generation(
                             course_summary[k] = to_traditional(v)
                 final_text = final_text_retry  # keep raw text for debugging
                 logger.info(f"✅ PASS3 retry succeeded: SuggestedUnits={len(suggested_units_structured)}")
+                # ✅ NEW: Recalculate enriched units after retry
+                if units:
+                    enriched_units, unit_diagnostics = back_calculate_unit_timestamps(
+                        suggested_units_structured=suggested_units_structured,
+                        client_units=units
+                    )
+                    logger.info(f"🔄 Recalculated Unit timestamps after retry")
+
             else:
                 if data_retry is None:
                     logger.warning("⚠️ PASS3 retry JSON parse failed; keeping first result")
@@ -1681,7 +1903,32 @@ def hierarchical_multipass_generation(
         logger.warning("⚠️ PASS 3 JSON parse failed; falling back to text chapter parsing")
         chapters_raw = parse_chapters_from_output(final_text)
         course_summary = parse_summary_from_output(final_text)
-
+    # ✅ NEW: Back-calculate Unit timestamps (if client provided Units)
+    enriched_units = None
+    unit_diagnostics = None
+    if units:
+        enriched_units, unit_diagnostics = back_calculate_unit_timestamps(
+            suggested_units_structured=suggested_units_structured,
+            client_units=units
+        )
+        logger.info("\n" + "=" * 60)
+        logger.info("📍 UNIT TIMESTAMP BACK-CALCULATION RESULTS")
+        logger.info("=" * 60)
+        if enriched_units:
+            for unit in enriched_units:
+                if unit.get("Time"):
+                    logger.info(
+                        f"✅ Unit {unit['UnitNo']}: {unit['Title']}\n"
+                        f"   → Starts at: {unit['Time']}\n"
+                        f"   → First chapter: {unit.get('FirstChapter', 'N/A')}"
+                    )
+                else:
+                    logger.info(
+                        f"⚠️ Unit {unit['UnitNo']}: {unit['Title']}\n"
+                        f"   → Not found in video!"
+                    )
+        logger.info("=" * 60 + "\n")
+ 
     # ✅ ALWAYS build `chapters` from `chapters_raw`
     chapters = validate_and_normalize_timestamps(
         chapters_raw,
@@ -1735,6 +1982,11 @@ def hierarchical_multipass_generation(
     }
     # ✅ CRITICAL: expose structured SuggestedUnits to downstream pipeline (tasks.py)
     metadata["suggested_units_structured"] = suggested_units_structured
+    # ✅ NEW: Add enriched units and diagnostics
+    metadata["client_units_original"] = units
+    metadata["client_units_with_timestamps"] = enriched_units
+    metadata["unit_diagnostics"] = unit_diagnostics
+
     # ✅ DEBUG: preserve raw PASS3 JSON/text for production debugging
     metadata["pass3_raw_json_text"] = final_text
     logger.info(
