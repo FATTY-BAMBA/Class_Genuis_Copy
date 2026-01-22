@@ -25,6 +25,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+PASS3_JSON_SCHEMA = """
+{
+  "SuggestedUnits": [
+    {
+      "UnitNo": 1,
+      "ParentUnitNo": null,
+      "Title": "章節標題（繁體中文）",
+      "Time": "HH:MM:SS"
+    }
+  ],
+  "CourseSummary": {
+    "topic": "...",
+    "core_content": "...",
+    "learning_objectives": "...",
+    "target_audience": "...",
+    "difficulty": "..."
+  }
+}
+""".strip()
+
 
 # Optional Azure AI Inference imports (only if used)
 try:
@@ -1466,25 +1486,27 @@ def hierarchical_multipass_generation(
 【輸出格式要求（重要：只輸出 JSON，不要輸出任何其他文字）】
 請輸出一個 JSON 物件，格式如下：
 
-{
+{PASS3_JSON_SCHEMA}
+
+{{ 
   "SuggestedUnits": [
-    {
+    {{ 
       "UnitNo": 1,
       "ParentUnitNo": null,
       "Title": "章節標題（繁體中文）",
       "Time": "HH:MM:SS",
       "ClientUnitNo": 2,
       "ClientUnitTitle": "（對應到客戶提供的 Units 中該 UnitNo 的 Title）"
-    }
+    }}
   ],
-  "CourseSummary": {
+  "CourseSummary": {{
     "topic": "...",
     "core_content": "...",
     "learning_objectives": "...",
     "target_audience": "...",
     "difficulty": "..."
-  }
-}
+  }}
+}}
 
 規則：
 1) Time 必須是逐字稿中存在或非常接近（±60 秒內）的 HH:MM:SS
