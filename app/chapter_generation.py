@@ -101,10 +101,15 @@ CHAPTER_LINE_RE = re.compile(
     """,
     re.VERBOSE,
 )
-TS_IN_LINE = re.compile(r'^\s*(\d{1,2}:\d{2}:\d{2})\s*:')
 
-ASR_TS_RE = re.compile(r"^\s*(\d{1,2}:\d{2}:\d{2})\s*:")
-
+ASR_TS_RE = re.compile(
+    r"""^\s*
+        \[?(\d{1,2}:\d{2}:\d{2})\]?
+        \s*(?:[:\-–—]\s*|\s+)
+    """,
+    re.VERBOSE,
+)
+    
 def ts_to_seconds_hms(ts: str) -> int:
     try:
         h, m, s = ts.strip().split(":")
@@ -124,6 +129,16 @@ def extract_asr_timestamps_sorted(raw_asr_text: str) -> List[str]:
             seen.add(_normalize_ts(m.group(1)))
     out = sorted(seen, key=ts_to_seconds_hms)
     return out
+
+def get_first_last_asr_ts(raw_asr_text: str, duration_sec: int) -> Tuple[str, str]:
+    """
+    Returns (first_ts, last_ts) from raw ASR timestamps if present,
+    otherwise falls back to 00:00:00 and full duration.
+    """
+    ts_sorted = extract_asr_timestamps_sorted(raw_asr_text)
+    if ts_sorted:
+        return ts_sorted[0], ts_sorted[-1]
+    return "00:00:00", sec_to_hms(int(duration_sec))
 
 def pick_anchor_timestamps(asr_ts_sorted: List[str], k: int = 12) -> List[str]:
     """
@@ -309,43 +324,69 @@ def _extract_json_blob(text: str) -> Optional[str]:
     - raw JSON
     - ```json ... ```
     - ``` ... ```
+    - or: first {...} / [...] span inside surrounding text
     Returns JSON string or None.
     """
     if not text:
         return None
 
-    # fenced ```json ... ```
-    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    # ```json ... ```
+    m = re.search(r"```json\s*([\[{].*?[\]}])\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
 
-    # fenced ``` ... ```
-    m = re.search(r"```\s*(\{.*?\})\s*```", text, re.DOTALL)
+    # ``` ... ```
+    m = re.search(r"```\s*([\[{].*?[\]}])\s*```", text, re.DOTALL)
     if m:
         return m.group(1).strip()
 
-    # raw json
     s = text.strip()
+
+    # raw json only
     if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
         return s
+
+    # NEW: attempt to extract the first JSON object/array embedded in other text
+    first_obj = s.find("{")
+    last_obj = s.rfind("}")
+    if 0 <= first_obj < last_obj:
+        candidate = s[first_obj:last_obj + 1].strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            return candidate
+
+    first_arr = s.find("[")
+    last_arr = s.rfind("]")
+    if 0 <= first_arr < last_arr:
+        candidate = s[first_arr:last_arr + 1].strip()
+        if candidate.startswith("[") and candidate.endswith("]"):
+            return candidate
 
     return None
 
 
-def safe_load_json(text: str) -> Optional[Dict[str, Any]]:
+def safe_load_json(text: str) -> Optional[Any]:
     blob = _extract_json_blob(text)
     if not blob:
         return None
     try:
-        obj = json.loads(blob)
-        return obj if isinstance(obj, dict) else None
+        return json.loads(blob)
     except Exception:
         return None
-
 
 def _is_hms(ts: str) -> bool:
     return bool(re.fullmatch(r"\d{2}:\d{2}:\d{2}", (ts or "").strip()))
 
+# --- Client unit parsing helpers (back-compat) ---
+_CLIENT_UNIT_RE = re.compile(r"\[\s*單元\s*(\d+)\s*[:：]")
+
+def _extract_client_unit_no_from_title(title: str) -> Optional[int]:
+    m = _CLIENT_UNIT_RE.search(title or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
 
 def normalize_suggested_units(
     suggested_units: Any,
@@ -355,19 +396,25 @@ def normalize_suggested_units(
     Normalize SuggestedUnits list:
     - enforce fields
     - ensure Time is HH:MM:SS
-    - ensure ParentUnitNo is valid if units provided
+    - ParentUnitNo is optional and used ONLY for chapter hierarchy (do not validate it vs client Units)
+    - If client units are provided:
+        - validate ClientUnitNo against Units[].UnitNo
+        - fill ClientUnitTitle from Units[].Title
     - sort by Time
     - renumber UnitNo sequentially
     """
     if not isinstance(suggested_units, list):
         return []
 
-    valid_parent_set = None
+    valid_client_units = None
+    unit_title_by_no: Dict[int, str] = {}
     if units:
-        valid_parent_set = set()
+        valid_client_units = set()
         for u in units:
             try:
-                valid_parent_set.add(int(u.get("UnitNo")))
+                uno = int(u.get("UnitNo"))
+                valid_client_units.add(uno)
+                unit_title_by_no[uno] = str(u.get("Title") or "").strip()
             except Exception:
                 pass
 
@@ -378,57 +425,80 @@ def normalize_suggested_units(
 
         title = str(su.get("Title") or "").strip()
         ts = str(su.get("Time") or "").strip()
-
         if not title or not _is_hms(ts):
             continue
 
+        # If title already starts with a unit prefix, strip it to avoid double-prefixing later
+        title = re.sub(r'^\s*\[\s*單元\s*\d+\s*(?:[:：][^\]]+)?\]\s*', '', title).strip()
+
+        # ParentUnitNo is chapter-hierarchy only now (optional; sanitize int/null)
         parent = su.get("ParentUnitNo", None)
-        if not units:
-            parent = None
-        else:
-            if parent is not None:
-                try:
-                    parent = int(parent)
-                except Exception:
-                    parent = None
-            if valid_parent_set is not None and parent is not None and parent not in valid_parent_set: 
+        if parent is not None:
+            try:
+                parent = int(parent)
+            except Exception:
                 parent = None
+
+        # NEW: ClientUnitNo mapping (validate vs client Units if provided)
+        client_unit_no = su.get("ClientUnitNo", None)
+        if client_unit_no is not None:
+            try:
+                client_unit_no = int(client_unit_no)
+            except Exception:
+                client_unit_no = None
+
+        # Back-compat fallback: parse from title "[單元N：...]"
+        if client_unit_no is None:
+            client_unit_no = _extract_client_unit_no_from_title(title)
+
+        if valid_client_units is None:
+            # No client Units provided => allow null mapping
+            client_unit_no = None
+            client_unit_title = None
+        else:
+            if client_unit_no not in valid_client_units:
+                client_unit_no = None
+            client_unit_title = unit_title_by_no.get(client_unit_no) if client_unit_no else None
 
         out.append({
             "UnitNo": 0,  # will renumber
             "ParentUnitNo": parent,
             "Title": title,
             "Time": ts,
+            "ClientUnitNo": client_unit_no,
+            "ClientUnitTitle": client_unit_title,
         })
 
-    # sort and renumber
     out.sort(key=lambda x: x["Time"])
     for i, su in enumerate(out, 1):
         su["UnitNo"] = i
     return out
 
-
 def suggested_units_to_chapters_dict(
     suggested_units: List[Dict[str, Any]],
     *,
     duration_sec: Optional[int] = None,
-    bump_limit_sec: int = 59,   # keep within the “±60s” spirit
+    bump_limit_sec: int = 120,  # allow a bit more room than 59s
 ) -> Dict[str, str]:
     """
-    Convert SuggestedUnits -> chapters dict, while preventing timestamp key collisions.
+    Convert SuggestedUnits -> chapters dict, preventing timestamp key collisions
+    WITHOUT producing non-HH:MM:SS keys (so later validation won't drop them).
 
-    If duplicate timestamps exist, we bump later ones forward by +1s (up to bump_limit_sec)
-    so we don't overwrite earlier chapters.
-
-    This does NOT try to re-snap to ASR; it just guarantees uniqueness for dict keys.
+    Strategy:
+    - Prefer the original HH:MM:SS.
+    - If already used, bump forward by +1..+bump_limit_sec.
+    - If still used, bump backward by -1..-bump_limit_sec.
+    - If still impossible, drop the duplicate with a warning.
     """
-    def bump_ts(ts: str, delta: int) -> str:
+
+    def bump_ts(ts: str, delta: int) -> Optional[str]:
         base = ts_to_seconds_hms(ts)
         if base < 0:
-            return ts
+            return None
         bumped = base + delta
         if duration_sec is not None:
-            bumped = min(bumped, max(0, duration_sec - 1))
+            if bumped < 0 or bumped > duration_sec - 1:
+                return None  # <-- don't clamp; reject
         return sec_to_hms(bumped)
 
     chapters: Dict[str, str] = {}
@@ -437,26 +507,41 @@ def suggested_units_to_chapters_dict(
     for su in suggested_units:
         ts = str(su.get("Time") or "").strip()
         title = str(su.get("Title") or "").strip()
-        p = su.get("ParentUnitNo")
-        prefix = f"[單元{p}] " if p is not None else ""
+        cu = su.get("ClientUnitNo")
+        cut = su.get("ClientUnitTitle")
+        prefix = f"[單元{cu}：{cut}] " if cu and cut else (f"[單元{cu}] " if cu else "")
 
         if not _is_hms(ts) or not title:
             continue
 
         candidate = ts
+
         if candidate in used:
-            # bump forward until free (within bump_limit_sec)
             placed = False
+
+            # 1) bump forward
             for d in range(1, bump_limit_sec + 1):
                 cand2 = bump_ts(ts, d)
-                if cand2 not in used:
+                if cand2 and cand2 not in used:
                     candidate = cand2
                     placed = True
                     break
+
+            # 2) bump backward if forward didn't work
             if not placed:
-                # last resort: append a tiny suffix to keep uniqueness (won't be HH:MM:SS)
-                # Better than silent overwrite; and you'll SEE it in logs/debug.
-                candidate = f"{ts}#{len(used)}"
+                for d in range(1, bump_limit_sec + 1):
+                    cand2 = bump_ts(ts, -d)
+                    if cand2 and cand2 not in used:
+                        candidate = cand2
+                        placed = True
+                        break
+
+            if not placed:
+                logger.warning(
+                    "⚠️ Could not place unique HH:MM:SS timestamp for chapter (ts=%s, title=%s). Dropping.",
+                    ts, title[:80]
+                )
+                continue  # drop rather than create invalid key
 
         used.add(candidate)
         chapters[candidate] = prefix + title
@@ -852,19 +937,27 @@ def build_prompt_body(
     transcript: str,
     duration_sec: int,
     ocr_context: str = "",
-    video_title: Optional[str] = None,  # ADD THIS
+    video_title: Optional[str] = None,
+    first_ts_override: Optional[str] = None,
+    last_ts_override: Optional[str] = None,
 ) -> str:
     duration_hms = sec_to_hms(int(duration_sec))
     min_gap_sec, (t_low, t_high), max_caps = chapter_policy(int(duration_sec))
     
-    # Extract first and last REAL ASR timestamps (lines like "HH:MM:SS: ...")
-    timestamps = []
+    # Extract first/last REAL ASR timestamps using the same matcher as the rest of the pipeline.
+    # This supports:
+    #   00:00:12: text
+    #   00:00:12 - text
+    #   [00:00:12] text
+    #   00:00:12 text
+    timestamps: List[str] = []
     for line in transcript.splitlines():
-        m = TS_IN_LINE.match(line)
+        m = ASR_TS_RE.match(line)
         if m:
             timestamps.append(_normalize_ts(m.group(1)))
-    first_ts = timestamps[0] if timestamps else "00:00:00"
-    last_ts = timestamps[-1] if timestamps else duration_hms
+    first_ts = first_ts_override or (timestamps[0] if timestamps else "00:00:00")
+    last_ts  = last_ts_override  or (timestamps[-1] if timestamps else duration_hms)
+
 
     video_title_context = ""
     if video_title:
@@ -1082,6 +1175,9 @@ def hierarchical_multipass_generation(
     asr_ts_sorted = extract_asr_timestamps_sorted(raw_asr_text)  # use RAW, not truncated
     asr_end_ts = asr_ts_sorted[-1] if asr_ts_sorted else sec_to_hms(int(duration))
     asr_end_sec = ts_to_seconds_hms(asr_end_ts)
+    if asr_end_sec <= 0:
+        asr_end_sec = int(duration)
+        asr_end_ts = sec_to_hms(asr_end_sec)
     anchors = pick_anchor_timestamps(asr_ts_sorted, k=14)
 
     logger.info(f"🧾 ASR time coverage: first={asr_ts_sorted[0] if asr_ts_sorted else 'N/A'} "
@@ -1370,32 +1466,35 @@ def hierarchical_multipass_generation(
 【輸出格式要求（重要：只輸出 JSON，不要輸出任何其他文字）】
 請輸出一個 JSON 物件，格式如下：
 
-{{
+{
   "SuggestedUnits": [
-    {{
+    {
       "UnitNo": 1,
       "ParentUnitNo": null,
       "Title": "章節標題（繁體中文）",
-      "Time": "HH:MM:SS"
-    }}
+      "Time": "HH:MM:SS",
+      "ClientUnitNo": 2,
+      "ClientUnitTitle": "（對應到客戶提供的 Units 中該 UnitNo 的 Title）"
+    }
   ],
-  "CourseSummary": {{
+  "CourseSummary": {
     "topic": "...",
     "core_content": "...",
     "learning_objectives": "...",
     "target_audience": "...",
     "difficulty": "..."
-  }}
-}}
+  }
+}
 
 規則：
 1) Time 必須是逐字稿中存在或非常接近（±60 秒內）的 HH:MM:SS
-2) SuggestedUnits 需依時間遞增排序
-3) 若有提供「預定教學單元 Units」，每一個 SuggestedUnit 必須填 ParentUnitNo，值必須是 Units 裡的 UnitNo
-4) 若未提供 Units，ParentUnitNo 必須為 null
+2) SuggestedUnits 需依 Time 遞增排序
+3) 若有提供客戶 Units：
+   - 每一個 SuggestedUnit 必須包含 ClientUnitNo（必須等於 Units 裡某個 UnitNo）
+   - 每一個 SuggestedUnit 必須包含 ClientUnitTitle（必須與該 UnitNo 的 Title 相同或非常接近）
+   - ParentUnitNo 僅用於章節階層（可選），不得用來表示 ClientUnitNo
+4) 若未提供 Units：ClientUnitNo 與 ClientUnitTitle 允許為 null 或省略
 5) 只輸出 JSON，禁止 ```、禁止多餘解釋、禁止條列文字
-
-
 """
     
     logger.info(f"📤 PASS 3 prompt: ~{count_tokens_llama(chapters_prompt):,} tokens")
@@ -1441,7 +1540,8 @@ def hierarchical_multipass_generation(
     suggested_units_structured: List[Dict[str, Any]] = []
     course_summary: Dict[str, Any] = {}
 
-    if data:
+    # 1) Only treat dict-shaped JSON as valid for your schema
+    if isinstance(data, dict):
         suggested_units_structured = normalize_suggested_units(
             data.get("SuggestedUnits"),
             units=units
@@ -1449,24 +1549,31 @@ def hierarchical_multipass_generation(
         cs = data.get("CourseSummary")
         if isinstance(cs, dict):
             course_summary = cs
-            
         # Optional: keep summary consistent with chapters (Traditional)
         if _opencc and course_summary:
             for k, v in list(course_summary.items()):
                 if isinstance(v, str):
                     course_summary[k] = to_traditional(v)
-    # Optional: warn if client provided Units but model did not map all SuggestedUnits
-    if units and suggested_units_structured:
-        missing = sum(
-            1 for x in suggested_units_structured
-            if x.get("ParentUnitNo") is None
-        )
-        if missing:
+    elif isinstance(data, list):
+        # Fallback behavior if model outputs a top-level list.
+        # You can either ignore it or try to interpret it as SuggestedUnits directly.
+        # This tries to interpret it as SuggestedUnits:
+        suggested_units_structured = normalize_suggested_units(data, units=units)
+        
+    # 2) Warning should be outside the "if isinstance(data, dict)" block
+    if units:
+        if not suggested_units_structured:
             logger.warning(
-                f"⚠️ {missing}/{len(suggested_units_structured)} SuggestedUnits missing ParentUnitNo "
-                f"(client provided {len(units)} Units)"
+                 f"⚠️ Client provided {len(units)} Units but SuggestedUnits is empty/invalid after normalization."
             )
-
+        else:
+            missing = sum(1 for x in suggested_units_structured if x.get("ClientUnitNo") is None)
+            if missing:
+                logger.warning(
+                    f"⚠️ {missing}/{len(suggested_units_structured)} SuggestedUnits missing ClientUnitNo "
+                    f"(client provided {len(units)} Units)"
+                )
+            
     # -------------------------
     # Coverage Guardrail (CRITICAL)
     # If chapters only cover early part of ASR, re-run PASS3 once with anchors.
@@ -1510,26 +1617,42 @@ def hierarchical_multipass_generation(
                 else retry_resp.choices[0].message.content
             )
             data_retry = safe_load_json(final_text_retry)
-            if data_retry:
+
+            suggested_retry: List[Dict[str, Any]] = []
+            course_summary_retry: Dict[str, Any] = {}
+            if isinstance(data_retry, dict):
                 suggested_retry = normalize_suggested_units(data_retry.get("SuggestedUnits"), units=units)
-                if suggested_retry:
-                    suggested_units_structured = suggested_retry
-                    cs2 = data_retry.get("CourseSummary")
-                    if isinstance(cs2, dict):
-                        course_summary = cs2
-                    final_text = final_text_retry  # keep raw text for debugging
-                    logger.info(f"✅ PASS3 retry succeeded: SuggestedUnits={len(suggested_units_structured)}")
-                else:
-                    logger.warning("⚠️ PASS3 retry JSON parsed but SuggestedUnits empty; keeping first result")
+                cs2 = data_retry.get("CourseSummary")
+                if isinstance(cs2, dict):
+                    course_summary_retry = cs2
+            elif isinstance(data_retry, list):
+                # interpret top-level list as SuggestedUnits
+                suggested_retry = normalize_suggested_units(data_retry, units=units)
             else:
-                logger.warning("⚠️ PASS3 retry JSON parse failed; keeping first result")
+                suggested_retry = []
+            if suggested_retry:
+                suggested_units_structured = suggested_retry
+                if course_summary_retry:
+                    course_summary = course_summary_retry
+                # Optional: keep summary Traditional
+                if _opencc and course_summary:
+                    for k, v in list(course_summary.items()):
+                        if isinstance(v, str):
+                            course_summary[k] = to_traditional(v)
+                final_text = final_text_retry  # keep raw text for debugging
+                logger.info(f"✅ PASS3 retry succeeded: SuggestedUnits={len(suggested_units_structured)}")
+            else:
+                if data_retry is None:
+                    logger.warning("⚠️ PASS3 retry JSON parse failed; keeping first result")
+                else:
+                    logger.warning("⚠️ PASS3 retry JSON parsed but SuggestedUnits empty/invalid; keeping first result")
                     
     # Build chapters_raw from SuggestedUnits if available, else fallback to text parsing
     if suggested_units_structured:
         chapters_raw = suggested_units_to_chapters_dict(
             suggested_units_structured,
             duration_sec=int(duration),
-            bump_limit_sec=59
+            bump_limit_sec=120
         )
         logger.info(f"📊 Parsed {len(suggested_units_structured)} SuggestedUnits from JSON")
     else:
@@ -1746,9 +1869,14 @@ def generate_chapters_debug(
         else:
             if progress_callback:
                 progress_callback("single_pass_processing", 30)
-            
+
+            first_ts, last_ts = get_first_last_asr_ts(raw_asr_text, int(duration))
             # Use original single-pass generation
-            prompt_template = build_prompt_body("", int(duration), ocr_context, video_title)
+            prompt_template = build_prompt_body(
+                "", int(duration), ocr_context, video_title,
+                first_ts_override=first_ts,
+                last_ts_override=last_ts,
+            )
             template_tokens = count_tokens_llama(prompt_template)
 
             CONTEXT_BUDGET = 128_000
@@ -1766,8 +1894,12 @@ def generate_chapters_debug(
                     f"⚠️ Truncating ASR (template={template_tokens:,}, asr={asr_tokens:,}, "
                     f"budget={CONTEXT_BUDGET:,}, allowed_asr={max_transcript_tokens:,})"
                 )
-            full_prompt = build_prompt_body(transcript_for_prompt, int(duration), ocr_context, video_title)
-
+            full_prompt = build_prompt_body(
+                transcript_for_prompt, int(duration), ocr_context, video_title,
+                first_ts_override=first_ts,
+                last_ts_override=last_ts,
+            )
+                
             with open(run_dir / "full_prompt.txt", "w", encoding="utf-8") as f:
                 f.write(full_prompt)
 
