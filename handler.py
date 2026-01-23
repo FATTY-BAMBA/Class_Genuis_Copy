@@ -220,6 +220,7 @@ def handler(job: dict) -> dict:
     
     start_time = time.time()
     file_path = None
+    webhook_url = job_input.get("webhook_url")
     
     try:
         # Check imports
