@@ -18,7 +18,12 @@ from dotenv import load_dotenv
 # Use the ONE shared Celery instance
 from app.celery_app import celery
 
-from app.runpod_controller import get_pod_status, start_pod
+try:
+    from app.runpod_controller import get_pod_status, start_pod
+except ImportError:
+    get_pod_status = None
+    start_pod = None
+    
 from tasks.file_maintenance import clean_old_files
 from app.chapter_generation import generate_chapters  # (aka app/video_chaptering.py wrapper)
 
