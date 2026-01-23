@@ -1,0 +1,26 @@
+{
+  "name": "class-genius-api",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker proxy for Class Genius Video Processing API",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "test": "echo \"No tests yet\""
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240117.0",
+    "typescript": "^5.3.3",
+    "wrangler": "^3.24.0"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "api",
+    "proxy",
+    "video-processing"
+  ],
+  "author": "",
+  "license": "MIT"
+}
