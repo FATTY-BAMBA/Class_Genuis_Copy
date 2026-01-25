@@ -168,4 +168,11 @@ RUN mkdir -p /workspace/models /workspace/uploads /workspace/runs /workspace/log
 
 # -------------------- Serverless Entry Point --------------------
 # RunPod Serverless expects the handler to be run directly
+# -------------------- Debug: Verify app structure --------------------
+RUN echo "🔍 Verifying app structure..." && \
+    ls -la /code/ && \
+    ls -la /code/app/ && \
+    python -c "import sys; print('Python path:', sys.path)" && \
+    python -c "import app; print('app module location:', app.__file__)"
+
 CMD ["python", "-u", "handler.py"]
