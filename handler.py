@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Ensure paths are set up for imports
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
-sys.path.insert(0, os.path.join(BASE_DIR, "app"))
+# sys.path.insert(0, os.path.join(BASE_DIR, "app"))  # REMOVED - breaks package imports
 
 # Load environment variables
 from dotenv import load_dotenv
