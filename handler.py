@@ -106,56 +106,80 @@ except ImportError as e:
 def validate_input(job_input: dict) -> tuple[bool, str]:
     """Validate the job input has required fields."""
     
-    # For video processing, we need either video_url or play_url
-    video_url = job_input.get("video_url") or job_input.get("play_url") or job_input.get("PlayUrl")
-    if not video_url:
-        return False, "Missing required field: video_url or play_url"
+    # Check for old format (fields at root level)
+    is_old_format = "PlayUrl" in job_input and "video_info" not in job_input
     
-    # video_info is required for processing
-    video_info = job_input.get("video_info") or job_input.get("VideoInfo")
-    if not video_info:
-        return False, "Missing required field: video_info"
-    
-    # Check required video_info fields
-    required_fields = ["Id", "TeamId", "SectionNo"]
-    for field in required_fields:
-        if field not in video_info:
-            return False, f"Missing required field in video_info: {field}"
+    if is_old_format:
+        # Old format validation
+        if not job_input.get("PlayUrl"):
+            return False, "Missing required field: PlayUrl"
+        required_fields = ["Id", "TeamId", "SectionNo"]
+        for field in required_fields:
+            if field not in job_input:
+                return False, f"Missing required field: {field}"
+    else:
+        # New format validation
+        video_url = job_input.get("video_url") or job_input.get("play_url") or job_input.get("PlayUrl")
+        if not video_url:
+            return False, "Missing required field: video_url or play_url"
+        
+        video_info = job_input.get("video_info") or job_input.get("VideoInfo")
+        if not video_info:
+            return False, "Missing required field: video_info"
+        
+        required_fields = ["Id", "TeamId", "SectionNo"]
+        for field in required_fields:
+            if field not in video_info:
+                return False, f"Missing required field in video_info: {field}"
     
     return True, ""
-
-
 def normalize_input(job_input: dict) -> dict:
     """Normalize input field names to match internal expectations."""
     
-    # Normalize video URL
-    video_url = (
-        job_input.get("video_url") or 
-        job_input.get("play_url") or 
-        job_input.get("PlayUrl")
-    )
+    # Check if old format (fields at root level)
+    is_old_format = "PlayUrl" in job_input and "video_info" not in job_input
     
-    # Normalize video_info
-    video_info = job_input.get("video_info") or job_input.get("VideoInfo") or {}
-    
-    # Ensure all expected fields exist with defaults
-    normalized_video_info = {
-        "Id": video_info.get("Id"),
-        "TeamId": video_info.get("TeamId"),
-        "SectionNo": video_info.get("SectionNo"),
-        "CreatedAt": video_info.get("CreatedAt", datetime.now(timezone.utc).isoformat()),
-        "OriginalFilename": video_info.get("OriginalFilename", "video.mp4"),
-        "SectionTitle": video_info.get("SectionTitle"),
-        "Units": video_info.get("Units", []),
-    }
+    if is_old_format:
+        # Convert old format to new format
+        logger.info("📋 Detected OLD input format - converting...")
+        video_url = job_input.get("PlayUrl")
+        normalized_video_info = {
+            "Id": job_input.get("Id"),
+            "TeamId": job_input.get("TeamId"),
+            "SectionNo": job_input.get("SectionNo"),
+            "SectionTitle": job_input.get("SectionTitle", ""),
+            "Units": job_input.get("Units", []),
+            "CreatedAt": job_input.get("CreatedAt", datetime.now(timezone.utc).isoformat()),
+            "OriginalFilename": job_input.get("OriginalFilename", "video.mp4"),
+        }
+    else:
+        # New format
+        logger.info("📋 Detected NEW input format")
+        video_url = (
+            job_input.get("video_url") or 
+            job_input.get("play_url") or 
+            job_input.get("PlayUrl")
+        )
+        
+        video_info = job_input.get("video_info") or job_input.get("VideoInfo") or {}
+        
+        normalized_video_info = {
+            "Id": video_info.get("Id"),
+            "TeamId": video_info.get("TeamId"),
+            "SectionNo": video_info.get("SectionNo"),
+            "CreatedAt": video_info.get("CreatedAt", datetime.now(timezone.utc).isoformat()),
+            "OriginalFilename": video_info.get("OriginalFilename", "video.mp4"),
+            "SectionTitle": video_info.get("SectionTitle"),
+            "Units": video_info.get("Units", []),
+        }
     
     return {
         "video_url": video_url,
         "video_info": normalized_video_info,
         "num_questions": job_input.get("num_questions", 10),
         "num_pages": job_input.get("num_pages", 3),
-        "webhook_url": job_input.get("webhook_url"),  # Optional: for async notifications
-        "skip_client_post": job_input.get("skip_client_post", False),  # For testing
+        "webhook_url": job_input.get("webhook_url"),
+        "skip_client_post": job_input.get("skip_client_post", False),
     }
 
 
