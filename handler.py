@@ -428,20 +428,10 @@ def handler(job: dict) -> dict:
         # Send to client API
         if not skip_client_post:
             post_to_client_api(client_payload)
-        
+
         # Send webhook if provided
-        send_webhook(webhook_url, {
-            "status": "success",
-            "output": client_payload,
-            "processing_time": total_time
-        })
-        
-        return {
-            "status": "success",
-            "output": client_payload,
-            "processing_time": total_time,
-            "run_dir": run_dir
-        }
+        send_webhook(webhook_url, client_payload)
+        return client_payload
         
     except Exception as e:
         error_time = time.time() - start_time
