@@ -10,6 +10,7 @@ import logging
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import OrderedDict  # ← ADD THIS IMPORT
 
 import runpod
 
@@ -24,7 +25,6 @@ logger = logging.getLogger(__name__)
 # Ensure paths are set up for imports
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
-# sys.path.insert(0, os.path.join(BASE_DIR, "app"))  # REMOVED - breaks package imports
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -63,7 +63,7 @@ try:
     from tasks.tasks import (
         download_video,
         chapter_llama_asr_processing_fn,
-        generate_qa_and_notes as generate_qa_and_notes_task,  # This is a Celery task
+        generate_qa_and_notes as generate_qa_and_notes_task,
         post_to_client_api,
         transform_chapters_to_units,
         fill_unit_times_from_suggested_units,
@@ -85,12 +85,9 @@ try:
     )
     
     # Unwrap Celery task to get the underlying function
-    # This ensures we call it synchronously, not as a Celery task
     if hasattr(generate_qa_and_notes_task, 'run'):
-        # Celery task - get the underlying function
         generate_qa_and_notes = generate_qa_and_notes_task.run
     else:
-        # Already a regular function
         generate_qa_and_notes = generate_qa_and_notes_task
     
     IMPORTS_OK = True
@@ -106,11 +103,9 @@ except ImportError as e:
 def validate_input(job_input: dict) -> tuple[bool, str]:
     """Validate the job input has required fields."""
     
-    # Check for old format (fields at root level)
     is_old_format = "PlayUrl" in job_input and "video_info" not in job_input
     
     if is_old_format:
-        # Old format validation
         if not job_input.get("PlayUrl"):
             return False, "Missing required field: PlayUrl"
         required_fields = ["Id", "TeamId", "SectionNo"]
@@ -118,7 +113,6 @@ def validate_input(job_input: dict) -> tuple[bool, str]:
             if field not in job_input:
                 return False, f"Missing required field: {field}"
     else:
-        # New format validation
         video_url = job_input.get("video_url") or job_input.get("play_url") or job_input.get("PlayUrl")
         if not video_url:
             return False, "Missing required field: video_url or play_url"
@@ -133,14 +127,14 @@ def validate_input(job_input: dict) -> tuple[bool, str]:
                 return False, f"Missing required field in video_info: {field}"
     
     return True, ""
+
+
 def normalize_input(job_input: dict) -> dict:
     """Normalize input field names to match internal expectations."""
     
-    # Check if old format (fields at root level)
     is_old_format = "PlayUrl" in job_input and "video_info" not in job_input
     
     if is_old_format:
-        # Convert old format to new format
         logger.info("📋 Detected OLD input format - converting...")
         video_url = job_input.get("PlayUrl")
         normalized_video_info = {
@@ -153,7 +147,6 @@ def normalize_input(job_input: dict) -> dict:
             "OriginalFilename": job_input.get("OriginalFilename", "video.mp4"),
         }
     else:
-        # New format
         logger.info("📋 Detected NEW input format")
         video_url = (
             job_input.get("video_url") or 
@@ -206,33 +199,6 @@ def send_webhook(webhook_url: str, payload: dict):
 def handler(job: dict) -> dict:
     """
     RunPod Serverless Handler for Class Genius Video Processing.
-    
-    Input Schema:
-    {
-        "input": {
-            "video_url": "https://...",  # or "play_url" or "PlayUrl"
-            "video_info": {
-                "Id": "video-123",
-                "TeamId": "team-456", 
-                "SectionNo": 1,
-                "SectionTitle": "Optional title",
-                "Units": [{"UnitNo": 1, "Title": "..."}],
-                "OriginalFilename": "lecture.mp4"
-            },
-            "num_questions": 10,  # optional, default 10
-            "num_pages": 3,       # optional, default 3
-            "webhook_url": "https://...",  # optional
-            "skip_client_post": false  # optional, for testing
-        }
-    }
-    
-    Output Schema:
-    {
-        "status": "success" | "error",
-        "output": { ... client payload ... },
-        "processing_time": 123.4,
-        "error": "..." (if status == "error")
-    }
     """
     
     job_id = job.get("id", "unknown")
@@ -302,7 +268,6 @@ def handler(job: dict) -> dict:
             error_code = processing_result.get("error", "unknown")
             error_msg = processing_result.get("error_message", error_code)
             
-            # Handle no-audio case specially
             if error_code == "no_valid_audio":
                 logger.error("❌ Video has no usable audio")
                 result = {
@@ -326,18 +291,15 @@ def handler(job: dict) -> dict:
         logger.info("📑 STAGE 3: CHAPTER GENERATION")
         logger.info("="*60)
         
-        # Create run directory
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = os.path.join(RUNS_BASE, f"{video_info['Id']}_{ts}")
         os.makedirs(run_dir, exist_ok=True)
         
-        # Get ASR text
         asr_file_path = processing_result.get("asr_file")
         if asr_file_path and Path(asr_file_path).is_file():
             with open(asr_file_path, encoding="utf-8") as f:
                 raw_asr_text = f.read()
         else:
-            # Fallback to segments
             audio_segs = processing_result.get("audio_segments", [])
             raw_asr_text = "\n".join(
                 f"{sec_to_hms(int(s.get('start', 0)))}: {s.get('text','')}"
@@ -347,11 +309,9 @@ def handler(job: dict) -> dict:
         ocr_filtered = processing_result.get("ocr_segments_filtered", [])
         duration = processing_result.get("duration")
         
-        # Extract educational metadata
         section_title = video_info.get("SectionTitle")
         units = video_info.get("Units", [])
         
-        # Generate chapters
         chaptering_result = generate_chapters(
             raw_asr_text=raw_asr_text,
             ocr_segments=ocr_filtered,
@@ -363,7 +323,6 @@ def handler(job: dict) -> dict:
             run_dir=Path(run_dir)
         )
         
-        # Extract chapters and metadata
         if isinstance(chaptering_result, tuple) and len(chaptering_result) == 2:
             chapters_dict, chapter_metadata = chaptering_result
         else:
@@ -398,25 +357,25 @@ def handler(job: dict) -> dict:
         # Transform chapters to units
         navigation_units = transform_chapters_to_units(chapters_dict or {}) or []
         
-        # Process units from API
+        # Process units from API with explicit order
         units_from_api = []
         for idx, unit in enumerate(units or [], start=1):
             if isinstance(unit, dict):
-                units_from_api.append({
-                    "UnitNo": unit.get("UnitNo", idx),
-                    "Title": clean_client_title(unit.get("Title", "")),
-                    "Time": unit.get("Time", "")
-                })
+                units_from_api.append(OrderedDict([
+                    ("UnitNo", unit.get("UnitNo", idx)),
+                    ("Title", clean_client_title(unit.get("Title", ""))),
+                    ("Time", unit.get("Time", ""))
+                ]))
         
         # Fill unit times from chapter metadata if available
         if chapter_metadata and chapter_metadata.get("client_units_with_timestamps"):
             enriched_units = chapter_metadata["client_units_with_timestamps"]
             units_from_api = [
-                {
-                    "UnitNo": unit.get("UnitNo"),
-                    "Title": clean_client_title(unit.get("Title", "")),
-                    "Time": unit.get("Time", "")
-                }
+                OrderedDict([
+                    ("UnitNo", unit.get("UnitNo")),
+                    ("Title", clean_client_title(unit.get("Title", ""))),
+                    ("Time", unit.get("Time", ""))
+                ])
                 for unit in enriched_units
             ]
         elif chapter_metadata and chapter_metadata.get("suggested_units_structured"):
@@ -425,24 +384,43 @@ def handler(job: dict) -> dict:
                 chapter_metadata["suggested_units_structured"],
                 only_fill_if_empty=True
             )
+            # Re-wrap with OrderedDict to ensure order
+            units_from_api = [
+                OrderedDict([
+                    ("UnitNo", u.get("UnitNo") if isinstance(u, dict) else u["UnitNo"]),
+                    ("Title", u.get("Title") if isinstance(u, dict) else u["Title"]),
+                    ("Time", u.get("Time", "") if isinstance(u, dict) else u.get("Time", ""))
+                ])
+                for u in units_from_api
+            ]
         
-        # Build client payload
-        client_payload = {
-            "Id": qa_result["Id"],
-            "TeamId": qa_result["TeamId"],
-            "SectionNo": qa_result["SectionNo"],
-            "CreatedAt": qa_result["CreatedAt"],
-            "Questions": qa_result["Questions"],
-            "CourseNote": qa_result["CourseNote"],
-            "Units": units_from_api,
-            "SuggestedUnits": navigation_units
-        }
+        # Build SuggestedUnits with explicit order
+        ordered_navigation_units = [
+            OrderedDict([
+                ("UnitNo", u.get("UnitNo")),
+                ("Title", u.get("Title")),
+                ("Time", u.get("Time", ""))
+            ])
+            for u in navigation_units
+        ]
+        
+        # Build client payload with EXPLICIT field order
+        client_payload = OrderedDict([
+            ("Id", qa_result["Id"]),
+            ("TeamId", qa_result["TeamId"]),
+            ("SectionNo", qa_result["SectionNo"]),
+            ("CreatedAt", qa_result["CreatedAt"]),
+            ("Questions", qa_result["Questions"]),  # Already OrderedDict from qa_generation.py
+            ("CourseNote", qa_result["CourseNote"]),
+            ("Units", units_from_api),
+            ("SuggestedUnits", ordered_navigation_units)
+        ])
         
         total_time = time.time() - start_time
         
         # Save artifacts
         with open(os.path.join(run_dir, "client_payload.json"), "w", encoding="utf-8") as f:
-            json.dump(client_payload, f, indent=2, ensure_ascii=False)
+            json.dump(client_payload, f, indent=2, ensure_ascii=False, sort_keys=False)
         
         logger.info(f"✅ Processing complete in {total_time:.1f}s")
         logger.info(f"📊 Questions: {len(client_payload['Questions'])}")
@@ -452,9 +430,10 @@ def handler(job: dict) -> dict:
         # Send to client API
         if not skip_client_post:
             post_to_client_api(client_payload)
-
+        
         # Send webhook if provided
         send_webhook(webhook_url, client_payload)
+        
         return client_payload
         
     except Exception as e:
@@ -505,5 +484,5 @@ if __name__ == "__main__":
     
     runpod.serverless.start({
         "handler": handler,
-        "return_aggregate_stream": True  # For long-running jobs
+        "return_aggregate_stream": True
     })
