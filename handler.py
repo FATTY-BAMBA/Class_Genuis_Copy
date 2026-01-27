@@ -418,23 +418,29 @@ def handler(job: dict) -> dict:
         
         total_time = time.time() - start_time
         
+        # Pre-serialize to JSON string to preserve field order
+        # (RunPod's internal serialization sorts keys alphabetically)
+        client_payload_json = json.dumps(client_payload, ensure_ascii=False, sort_keys=False)
+        
         # Save artifacts
         with open(os.path.join(run_dir, "client_payload.json"), "w", encoding="utf-8") as f:
-            json.dump(client_payload, f, indent=2, ensure_ascii=False, sort_keys=False)
+            f.write(client_payload_json)
         
         logger.info(f"✅ Processing complete in {total_time:.1f}s")
         logger.info(f"📊 Questions: {len(client_payload['Questions'])}")
         logger.info(f"📊 Units: {len(client_payload['Units'])}")
         logger.info(f"📊 SuggestedUnits: {len(client_payload['SuggestedUnits'])}")
         
-        # Send to client API
+        # Send to client API (send the dict for proper JSON serialization)
         if not skip_client_post:
             post_to_client_api(client_payload)
         
         # Send webhook if provided
         send_webhook(webhook_url, client_payload)
         
-        return client_payload
+        # Return as JSON string to preserve field order
+        # Client must parse: JSON.parse(response.output)
+        return client_payload_json
         
     except Exception as e:
         error_time = time.time() - start_time
