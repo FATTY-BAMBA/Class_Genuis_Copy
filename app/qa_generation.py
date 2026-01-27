@@ -1865,33 +1865,38 @@ def result_to_legacy_client_format(
         "medium": "中等",
         "hard": "困難"
     }
-    
+
+    from collections import OrderedDict
+
     # Transform questions to client format
     client_questions = []
     for i, mcq in enumerate(result.mcqs, start=1):
         # Ensure we have tags (fallback if needed)
         tags = mcq.tags if hasattr(mcq, 'tags') and mcq.tags else []
         if not tags and mcq.topic:
-            # Fallback: extract from topic if no tags
             tags = [mcq.topic]
-        
+            
         # Ensure we have course_type
         course_type = mcq.course_type if hasattr(mcq, 'course_type') else '其他'
         
-        client_questions.append({
-            "QuestionId": f"Q{str(i).zfill(3)}",
-            "QuestionText": mcq.question,
-            "Options": [
-                {"Label": label, "Text": text}
-                for label, text in zip(["A", "B", "C", "D"], mcq.options)
-            ],
-            "CorrectAnswer": mcq.correct_answer,
-            "Explanation": mcq.explanation,
-            "Tags": tags[:5],  # Limit to 5 tags
-            "Difficulty": difficulty_map.get(mcq.difficulty, mcq.difficulty),
-            "CourseType": course_type
-        })
-    
+        # Build Options with explicit order
+        options = [  
+            OrderedDict([("Label", label), ("Text", text)])
+            for label, text in zip(["A", "B", "C", "D"], mcq.options)
+        ]
+        # Build question with EXPLICIT field order (client's expected format)
+        question = OrderedDict([
+            ("QuestionId", f"Q{str(i).zfill(3)}"),
+            ("QuestionText", mcq.question),
+            ("Options", options),
+            ("CorrectAnswer", mcq.correct_answer),
+            ("Explanation", mcq.explanation),
+            ("Tags", tags[:5]),
+            ("Difficulty", difficulty_map.get(mcq.difficulty, mcq.difficulty)),
+            ("CourseType", course_type)
+        ])
+        client_questions.append(question)
+            
     # Build lecture notes markdown
     markdown_lines = []
     for section in result.lecture_notes:
