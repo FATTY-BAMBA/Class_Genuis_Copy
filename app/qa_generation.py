@@ -2028,6 +2028,8 @@ def generate_educational_content(
     hierarchical_metadata: Optional[Dict] = None,  # ← ADD THIS! Full metadata from chapter generation
     section_title: Optional[str] = None,      # ← ADD THIS
     units: Optional[List[Dict]] = None,       # ← ADD THIS
+    num_questions: Optional[int] = None,  # ← ADD THIS
+    num_pages: Optional[int] = None,      # ← ADD THIS
     # Existing parameters
     shuffle_options: bool = False,
     regenerate_explanations: bool = False,
@@ -2066,6 +2068,9 @@ def generate_educational_content(
             logger.info("=" * 60)
 
         config = EducationalContentConfig()
+        # Use passed values or fall back to config defaults
+        actual_num_questions = num_questions if num_questions is not None else config.max_questions
+        actual_num_pages = num_pages if num_pages is not None else config.max_notes_pages
 
         if not validate_config(config):
             raise RuntimeError("Configuration validation failed")
@@ -2084,7 +2089,7 @@ def generate_educational_content(
                 if (seg.get("text") or "").strip()
             )
         
-        logger.info(f"ASR-first policy active. Generating {config.max_questions} MCQs and {config.max_notes_pages}p notes.")
+        logger.info(f"ASR-first policy active. Generating {actual_num_questions} MCQs and {actual_num_pages}p notes.")
         logger.info(f"Preprocessed transcript chars: {len(transcript)}, OCR context chars: {len(ocr_context)}")
 
         # Save input files
@@ -2304,7 +2309,7 @@ Key Takeaways:
             transcript=mcq_transcript,
             ocr_context=ocr_context,
             video_title=video_title,  # ← ADD THIS
-            num_questions=config.max_questions,
+            num_questions=actual_num_questions,
             chapters=formatted_chapters,
             global_summary=global_summary, 
             hierarchical_metadata=hierarchical_metadata,
@@ -2313,7 +2318,8 @@ Key Takeaways:
         )
 
         logger.info(f"MCQ prompt approx tokens: {count_tokens_llama(final_mcq_prompt):,}")
-        logger.info(f"📚 Generating {config.max_questions} MCQs with ASR-first policy, chapters, and topic context")
+        logger.info(f"📚 Generating {actual_num_questions} MCQs with ASR-first policy, chapters, and topic context")
+        
 
         mcq_response = call_llm(
             service_type=service_type,
@@ -2362,7 +2368,7 @@ Key Takeaways:
             transcript=notes_transcript,
             ocr_context=ocr_context,
             video_title=video_title,  # ← ADD THIS
-            num_pages=config.max_notes_pages,
+            num_pages=actual_num_pages,
             chapters=formatted_chapters,
             topics=topics_list,
             global_summary=global_summary,
@@ -2370,7 +2376,7 @@ Key Takeaways:
             section_title=section_title,      # ← ADD
             units=units                        # ← ADD
         )
-        logger.info(f"📘 Generating {config.max_notes_pages} pages of lecture notes with validation")
+        logger.info(f"📘 Generating {actual_num_pages} pages of lecture notes with validation")
 
         # Call LLM with JSON format enforcement (if using OpenAI)
         notes_response = call_llm(
@@ -2502,6 +2508,8 @@ def process_text_for_qa_and_notes(
             hierarchical_metadata=hierarchical_metadata,
             section_title=section_title,      # ← ADD
             units=units,                       # ← ADD
+            num_questions=num_questions,  # ← ADD THIS
+            num_pages=num_pages,          # ← ADD THIS
             run_dir=None,
             progress_callback=None,
             shuffle_options=False,
