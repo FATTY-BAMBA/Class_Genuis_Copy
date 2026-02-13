@@ -1782,6 +1782,7 @@ def hierarchical_multipass_generation(
             data.get("SuggestedUnits"),
             units=units
         )
+
         cs = data.get("CourseSummary")
         if isinstance(cs, dict):
             course_summary = cs
@@ -1809,6 +1810,73 @@ def hierarchical_multipass_generation(
                     f"⚠️ {missing}/{len(suggested_units_structured)} SuggestedUnits missing ClientUnitNo "
                     f"(client provided {len(units)} Units)"
                 )
+    
+    # ==================== VALIDATE CLIENT UNITS (BEFORE MAPPING) ====================
+    unit_validation_result = None
+    validated_units = units  # Default: assume valid
+    
+    if units and isinstance(units, list) and len(units) > 0:
+        logger.info("\n" + "=" * 60)
+        logger.info("🔍 VALIDATING CLIENT UNITS (PRE-MAPPING)")
+        logger.info("=" * 60)
+        
+        try:
+            # Import validation function
+            from app.qa_generation import validate_units_relevance, UNIT_VALIDATION_THRESHOLD
+            
+            # Extract BARE titles only (no enriched data!)
+            bare_units = [
+                {"UnitNo": u.get("UnitNo"), "Title": u.get("Title")}
+                for u in units
+            ]
+            
+            logger.info(f"Validating {len(bare_units)} client units against video content...")
+            
+            # Validate against actual video content
+            is_valid, score, reason = validate_units_relevance(
+                units=bare_units,
+                content_analysis=course_summary,  # Pass 1 analysis
+                chapters={},  # Don't pass AI chapters - compare titles only!
+                video_title=video_title or "",
+                threshold=UNIT_VALIDATION_THRESHOLD
+            )
+            
+            unit_validation_result = {
+                "is_valid": is_valid,
+                "score": score,
+                "reason": reason,
+                "threshold": UNIT_VALIDATION_THRESHOLD,
+                "units_provided": len(units)
+            }
+            
+            if is_valid:
+                logger.info(f"✅ CLIENT UNITS VALIDATED AND ACCEPTED")
+                logger.info(f"   • Score: {score:.2f} (threshold: {UNIT_VALIDATION_THRESHOLD})")
+                logger.info(f"   • Reason: {reason}")
+                logger.info(f"   • Will proceed with unit-to-timestamp mapping")
+                validated_units = units  # Keep original units
+            else:
+                logger.warning(f"❌ CLIENT UNITS REJECTED")
+                logger.warning(f"   • Score: {score:.2f} (threshold: {UNIT_VALIDATION_THRESHOLD})")
+                logger.warning(f"   • Reason: {reason}")
+                logger.warning(f"   • SKIPPING unit-to-timestamp mapping")
+                logger.warning(f"   • Will return AI-generated chapters only")
+                validated_units = None  # Reject units - don't map!
+            
+        except Exception as e:
+            logger.error(f"Unit validation error: {e}", exc_info=True)
+            logger.warning("Proceeding without validation (fail-open)")
+            unit_validation_result = {
+                "is_valid": True,
+                "score": 1.0,
+                "reason": f"Validation error: {str(e)[:50]}",
+                "threshold": UNIT_VALIDATION_THRESHOLD,
+                "units_provided": len(units),
+                "error": str(e)
+            }
+            validated_units = units  # Fail-open: accept on error
+        
+        logger.info("=" * 60 + "\n")
             
     # -------------------------
     # Coverage Guardrail (CRITICAL)
@@ -1877,12 +1945,26 @@ def hierarchical_multipass_generation(
                             course_summary[k] = to_traditional(v)
                 final_text = final_text_retry  # keep raw text for debugging
                 logger.info(f"✅ PASS3 retry succeeded: SuggestedUnits={len(suggested_units_structured)}")
-                # ✅ NEW: Recalculate enriched units after retry
-                if units:
+
+                # ==================== CONDITIONAL MAPPING (ONLY IF VALIDATED) ====================
+                enriched_units = None
+                unit_diagnostics = None
+    
+                if validated_units:  # ← Only map if validation passed!
+                    logger.info("📍 Back-calculating Unit timestamps (validation passed)")
                     enriched_units, unit_diagnostics = back_calculate_unit_timestamps(
                         suggested_units_structured=suggested_units_structured,
-                        client_units=units
+                        client_units=validated_units
                     )
+                else:
+                    logger.info("⏭️  Skipping Unit timestamp back-calculation (validation failed)")
+                    unit_diagnostics = {
+                        "units_provided": True,
+                        "validation_passed": False,
+                        "units_rejected": True,
+                        "message": "Units failed validation - not mapped to timestamps"
+                    }
+                
                     logger.info(f"🔄 Recalculated Unit timestamps after retry")
 
             else:
@@ -1960,6 +2042,7 @@ def hierarchical_multipass_generation(
         'educational_quality_score': quality_score,
         'course_summary': course_summary,
         'content_analysis': course_summary,
+        'unit_validation': unit_validation_result,
         'token_usage': {
             'original': {
                 'asr_tokens': asr_tokens,
@@ -1985,6 +2068,7 @@ def hierarchical_multipass_generation(
     metadata["suggested_units_structured"] = suggested_units_structured
     # ✅ NEW: Add enriched units and diagnostics
     metadata["client_units_original"] = units
+    metadata["client_units_validated"] = validated_units
     metadata["client_units_with_timestamps"] = enriched_units
     metadata["unit_diagnostics"] = unit_diagnostics
 
