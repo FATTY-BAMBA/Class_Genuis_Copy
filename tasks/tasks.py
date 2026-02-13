@@ -29,6 +29,7 @@ from app.chapter_generation import generate_chapters  # (aka app/video_chapterin
 
 from .cleaning import *  # re-export tasks so autodiscover finds them
 from app.qa_generation import process_text_for_qa_and_notes, result_to_legacy_client_format
+from app.s3_storage import upload_video_artifacts
 
 # ---------- Optional NumPy patch for old code paths ----------
 import numpy as np
@@ -1788,7 +1789,20 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 logger.error("   chapters_times=%s", chapters_times)
                 logger.error("   nav_times=%s", nav_times)
                 raise RuntimeError("Refusing to send mismatched navigation SuggestedUnits")
-     
+
+            # ========== UPLOAD TO S3 ==========
+            try:
+                upload_video_artifacts(
+                    run_dir=run_dir,
+                    video_info=video_info,
+                    processing_result=processing_result,
+                    chapters_dict=chapters_dict,
+                    chapter_metadata=chapter_metadata,
+                    client_payload=client_payload,
+                    raw_asr_text=raw_asr_text,
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ S3 upload failed (non-fatal): {e}")
             # ========== SEND CLEAN PAYLOAD TO CLIENT API ==========
             post_to_client_api(client_payload)  # ← Only send clean data
             logger.info(f"✅ Complete pipeline finished in {total_processing_time:.1f}s")
