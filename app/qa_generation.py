@@ -18,6 +18,7 @@ import os
 import re
 import time
 import random
+from datetime import datetime, timezone  # ← ADD THIS LINE
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable, Any
@@ -36,6 +37,200 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# UNIT VALIDATION SYSTEM
+# ============================================================================
+
+# Load threshold from environment
+UNIT_VALIDATION_THRESHOLD = float(os.getenv("UNIT_VALIDATION_THRESHOLD", "0.35"))
+
+def validate_units_relevance(
+    units: List[Dict],
+    content_analysis: Dict,
+    chapters: Dict[str, str],
+    video_title: str,
+    threshold: float = None
+) -> Tuple[bool, float, str]:
+    """
+    Validate if client-provided units are relevant to video content.
+    
+    Uses LLM to compare units against actual video content to prevent
+    wrong/irrelevant units from poisoning Q&A and lecture notes.
+    
+    Args:
+        units: Client-provided learning units
+        content_analysis: From Pass 1 (topics, concepts, terms)
+        chapters: AI-generated chapters
+        video_title: Video title
+        threshold: Minimum similarity score (defaults to env var)
+    
+    Returns:
+        Tuple of (is_valid, similarity_score, reason)
+        
+    Examples:
+        >>> # Good match
+        >>> validate_units_relevance(
+        ...     units=[{"Title": "Photoshop圖層"}],
+        ...     content_analysis={"main_topics": ["圖層合成", "遮色片"]},
+        ...     chapters={"00:05:00": "圖層基礎"},
+        ...     video_title="Photoshop教學"
+        ... )
+        (True, 0.92, "學習單元與影片內容高度相關")
+        
+        >>> # Bad match
+        >>> validate_units_relevance(
+        ...     units=[{"Title": "廚具規劃"}],
+        ...     content_analysis={"main_topics": ["圖層合成", "遮色片"]},
+        ...     chapters={"00:05:00": "圖層基礎"},
+        ...     video_title="Photoshop教學"
+        ... )
+        (False, 0.15, "學習單元主題為室內設計，與影片Photoshop技術內容完全不相關")
+    """
+    if threshold is None:
+        threshold = UNIT_VALIDATION_THRESHOLD
+    
+    # No units provided = automatically valid
+    if not units or not isinstance(units, list):
+        logger.info("ℹ️  No units provided for validation")
+        return True, 1.0, "No units provided"
+    
+    # Extract unit titles
+    unit_titles = [u.get("Title", "").strip() for u in units if u.get("Title")]
+    if not unit_titles:
+        logger.warning("⚠️  Units provided but have no titles")
+        return True, 1.0, "Units have no titles"
+    
+    # Build content summary from Pass 1 analysis
+    main_topics = content_analysis.get("main_topics", [])[:5]  # Top 5
+    key_concepts = content_analysis.get("key_concepts", [])[:10]  # Top 10
+    technical_terms = content_analysis.get("technical_terms", [])[:10]  # Top 10
+    
+    # Sample chapter titles
+    chapter_titles = []
+    if chapters:
+        chapter_titles = [title for title in list(chapters.values())[:5]]
+    
+    content_summary = {
+        "video_title": video_title or "未提供",
+        "main_topics": main_topics,
+        "key_concepts": key_concepts,
+        "technical_terms": technical_terms,
+        "chapter_samples": chapter_titles
+    }
+    
+    # Build validation prompt
+    prompt = f"""你是教育內容驗證專家。請評估提供的學習單元是否與影片實際內容相關。
+
+影片內容摘要：
+{json.dumps(content_summary, ensure_ascii=False, indent=2)}
+
+提供的學習單元：
+{chr(10).join(f"{i+1}. {title}" for i, title in enumerate(unit_titles))}
+
+請分析：
+1. 學習單元的主題是否與影片內容相符？
+2. 相關度評分（0-1之間的小數）
+   - 0.0-0.2: 完全不相關（例如：影片講Photoshop，單元是廚房設計）
+   - 0.2-0.35: 相關性很弱（例如：主題相近但內容不符）
+   - 0.35-0.6: 中等相關（例如：同領域但重點不同）
+   - 0.6-0.8: 高度相關（例如：主題一致，內容吻合）
+   - 0.8-1.0: 完美匹配（例如：單元精確對應影片章節）
+3. 簡短原因說明（30字內）
+
+請務必以 JSON 格式回答（不要包含其他文字）：
+{{
+    "is_relevant": true,
+    "relevance_score": 0.85,
+    "reason": "學習單元與影片內容高度相關，涵蓋了主要主題"
+}}"""
+    
+    try:
+        # Use project's configured model instead of hardcoded GPT-4
+        config = EducationalContentConfig()
+        service_type, model, validation_client = initialize_and_get_client(config)
+        
+        logger.debug(f"Using {model} for unit validation")
+
+        response = call_llm(
+            service_type=service_type,
+            client=validation_client,
+            system_message="你是教育內容驗證專家。",
+            user_message=prompt,
+            model=model,
+            max_tokens=200,
+            temperature=0.2,
+            top_p=0.9
+        )
+
+        result_text = extract_text_from_response(response, service_type).strip()
+        
+        # Extract JSON (handle markdown code blocks)
+        result_text = result_text.replace("```json", "").replace("```", "").strip()
+        
+        # Find JSON object
+        json_match = re.search(r'\{[^{}]*\}', result_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            is_relevant = result.get("is_relevant", False)
+            score = float(result.get("relevance_score", 0.0))
+            reason = result.get("reason", "未提供原因")
+            
+            # Apply threshold
+            is_valid = is_relevant and score >= threshold
+            
+            # Log validation result
+            logger.info(f"📊 Unit Validation Results:")
+            logger.info(f"   • Units Provided: {len(unit_titles)}")
+            logger.info(f"   • Relevance Score: {score:.2f}")
+            logger.info(f"   • Threshold: {threshold:.2f}")
+            logger.info(f"   • Status: {'✅ ACCEPTED' if is_valid else '❌ REJECTED'}")
+            logger.info(f"   • Reason: {reason}")
+            
+            return is_valid, score, reason
+        else:
+            logger.error("❌ Could not parse validation JSON response")
+            logger.error(f"   Response: {result_text[:200]}")
+            # Fail open - assume valid to avoid blocking legitimate content
+            return True, 1.0, "Validation parsing failed (assumed valid)"
+            
+    except Exception as e:
+        logger.error(f"❌ Unit validation error: {e}", exc_info=True)
+        # Fail open - assume valid to avoid blocking legitimate content
+        return True, 1.0, f"Validation error: {str(e)[:50]}"
+
+
+def log_validation_metrics(
+    video_id: str,
+    units_provided: int,
+    validation_score: float,
+    accepted: bool,
+    threshold: float
+):
+    """
+    Log validation metrics for monitoring and analysis.
+    
+    Saves to /workspace/logs/unit_validations.jsonl for later analysis.
+    """
+    try:
+        log_dir = "/workspace/logs"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        validation_summary = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "video_id": str(video_id),
+            "units_provided": units_provided,
+            "validation_score": round(validation_score, 3),
+            "accepted": accepted,
+            "threshold": threshold
+        }
+        
+        log_file = os.path.join(log_dir, "unit_validations.jsonl")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(validation_summary, ensure_ascii=False) + "\n")
+            
+    except Exception as e:
+        logger.warning(f"⚠️  Failed to log validation metrics: {e}")
+        
 # ==================== PROGRESS ====================
 STAGES = {
     "initializing": 5,
@@ -113,8 +308,9 @@ class EducationalContentResult:
     mcqs: List[MCQ]
     lecture_notes: List[LectureNoteSection]
     summary: str
-    topics: List[Dict] = field(default_factory=list)          # ← NEW
-    key_takeaways: List[str] = field(default_factory=list)    # ← NEW
+    topics: List[Dict] = field(default_factory=list)          
+    key_takeaways: List[str] = field(default_factory=list)    
+    metadata: Dict = field(default_factory=dict)
 # ==================== PYDANTIC MODELS FOR VALIDATION ====================
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
@@ -2460,11 +2656,11 @@ def process_text_for_qa_and_notes(
     raw_asr_text: str = "",
     audio_segments: Optional[List[Dict]] = None,
     ocr_segments: Optional[List[Dict]] = None,
-    video_title: Optional[str] = None,  # ← ADD THIS
-    chapters: Optional[Dict[str, str]] = None,  # ← ADD THIS
+    video_title: Optional[str] = None,
+    chapters: Optional[Dict[str, str]] = None,
     hierarchical_metadata: Optional[Dict] = None,
-    section_title: Optional[str] = None,      # ← ADD
-    units: Optional[List[Dict]] = None,       # ← ADD
+    section_title: Optional[str] = None,
+    units: Optional[List[Dict]] = None,
     num_questions: int = 10,
     num_pages: int = 3,
     id: str = "",
@@ -2478,6 +2674,75 @@ def process_text_for_qa_and_notes(
     - Else, we reconstruct a raw ASR string from audio_segments ("HH:MM:SS: text" per line).
     Returns the raw EducationalContentResult object (not the pipeline format).
     """
+    
+    # ========== VALIDATE CLIENT-PROVIDED UNITS ==========
+    validated_units = None
+    unit_validation_info = {
+        "units_provided": bool(units and isinstance(units, list) and len(units) > 0),
+        "units_count": len(units) if units else 0,
+        "units_validated": False,
+        "validation_score": 0.0,
+        "validation_reason": "",
+        "units_accepted": False
+    }
+    
+    if units and isinstance(units, list) and len(units) > 0 and hierarchical_metadata:
+        logger.info("=" * 60)
+        logger.info("🔍 VALIDATING CLIENT-PROVIDED UNITS")
+        logger.info("=" * 60)
+        
+        # Extract content analysis from Pass 1
+        content_analysis = hierarchical_metadata.get("content_analysis", {})
+        
+        if content_analysis:
+            # Validate units against actual video content
+            is_valid, score, reason = validate_units_relevance(
+                units=units,
+                content_analysis=content_analysis,
+                chapters=chapters or {},
+                video_title=video_title or "",
+                threshold=UNIT_VALIDATION_THRESHOLD
+            )
+            
+            # Update validation info
+            unit_validation_info.update({
+                "units_validated": True,
+                "validation_score": score,
+                "validation_reason": reason,
+                "units_accepted": is_valid
+            })
+            
+            # Log to metrics file
+            log_validation_metrics(
+                video_id=id or "unknown",
+                units_provided=len(units),
+                validation_score=score,
+                accepted=is_valid,
+                threshold=UNIT_VALIDATION_THRESHOLD
+            )
+            
+            # Decide whether to use units
+            if is_valid:
+                validated_units = units
+                logger.info(f"✅ Client units VALIDATED and ACCEPTED")
+                logger.info(f"   These units will be used in Q&A and lecture notes generation")
+            else:
+                validated_units = None
+                logger.warning(f"⚠️  Client units REJECTED - too low relevance")
+                logger.warning(f"   Q&A and notes will rely on AI-generated chapters only")
+        else:
+            logger.warning("⚠️  No content_analysis in metadata - cannot validate units")
+            logger.warning("   Using units without validation (assuming valid)")
+            validated_units = units
+    
+    elif units and isinstance(units, list) and len(units) > 0:
+        logger.warning("⚠️  Units provided but no hierarchical_metadata - cannot validate")
+        logger.warning("   Using units without validation (assuming valid)")
+        validated_units = units
+    
+    logger.info("=" * 60)
+    
+    # Rest of function continues...
     ocr_segments = ocr_segments or []
 
     # 1) Choose ASR source
@@ -2498,18 +2763,18 @@ def process_text_for_qa_and_notes(
     os.environ["MAX_NOTES_PAGES"] = str(num_pages)
 
     try:
-        # Just return the raw result object, not the pipeline format
+        # Call with validated_units instead of units
         result = generate_educational_content(
-            raw_asr_text=asr_text_for_prompt,   # ← ASR-first (raw string)
-            ocr_segments=ocr_segments,          # ← simple OCR (list or string)
+            raw_asr_text=asr_text_for_prompt,
+            ocr_segments=ocr_segments,
             video_id=id or "video",
-            video_title=video_title,  # ← ADD THIS
-            chapters=chapters,  # ← ADD THIS
+            video_title=video_title,
+            chapters=chapters,
             hierarchical_metadata=hierarchical_metadata,
-            section_title=section_title,      # ← ADD
-            units=units,                       # ← ADD
-            num_questions=num_questions,  # ← ADD THIS
-            num_pages=num_pages,          # ← ADD THIS
+            section_title=section_title,
+            units=validated_units,  # ← USE VALIDATED UNITS HERE!
+            num_questions=num_questions,
+            num_pages=num_pages,
             run_dir=None,
             progress_callback=None,
             shuffle_options=False,
@@ -2518,8 +2783,13 @@ def process_text_for_qa_and_notes(
             shuffle_seed=None,
             ocr_text_override=None,
         )
+        # ========== ADD VALIDATION METADATA TO RESULT ==========
+        # Add validation metadata to result (for tracking)
+        if not hasattr(result, 'metadata'):
+            result.metadata = {}
+        result.metadata['unit_validation'] = unit_validation_info
         
-        return result  # ← Return the EducationalContentResult object directly
+        return result
 
     finally:
         if old_max_q is not None:
@@ -2530,6 +2800,7 @@ def process_text_for_qa_and_notes(
             os.environ["MAX_NOTES_PAGES"] = old_max_p
         else:
             os.environ.pop("MAX_NOTES_PAGES", None)
+  
 
 # ==================== USAGE EXAMPLE ====================
 if __name__ == "__main__":
