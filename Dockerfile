@@ -103,6 +103,7 @@ RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
 # -------------------- Additional dependencies --------------------
 RUN python -m pip install --no-cache-dir \
+    boto3 \
     sentencepiece \
     torchmetrics \
     lightning \
