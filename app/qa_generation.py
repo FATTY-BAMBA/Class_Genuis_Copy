@@ -2674,8 +2674,8 @@ def process_text_for_qa_and_notes(
     - Else, we reconstruct a raw ASR string from audio_segments ("HH:MM:SS: text" per line).
     Returns the raw EducationalContentResult object (not the pipeline format).
     """
-    
-    # ========== VALIDATE CLIENT-PROVIDED UNITS ==========
+
+# ========== CHECK IF UNITS ALREADY VALIDATED ==========
     validated_units = None
     unit_validation_info = {
         "units_provided": bool(units and isinstance(units, list) and len(units) > 0),
@@ -2686,63 +2686,102 @@ def process_text_for_qa_and_notes(
         "units_accepted": False
     }
     
-    if units and isinstance(units, list) and len(units) > 0 and hierarchical_metadata:
+    # Check if validation already happened in chapter generation
+    if hierarchical_metadata and "unit_validation" in hierarchical_metadata:
         logger.info("=" * 60)
-        logger.info("🔍 VALIDATING CLIENT-PROVIDED UNITS")
+        logger.info("📋 USING PRE-VALIDATED UNITS FROM CHAPTER GENERATION")
         logger.info("=" * 60)
         
-        # Extract content analysis from Pass 1
+        prior_validation = hierarchical_metadata["unit_validation"]
+        unit_validation_info = {
+            "units_provided": bool(units and isinstance(units, list) and len(units) > 0),
+            "units_count": len(units) if units else 0,
+            "units_validated": True,
+            "validation_score": prior_validation.get("score", 0.0),
+            "validation_reason": prior_validation.get("reason", ""),
+            "units_accepted": prior_validation.get("is_valid", False),
+            "validated_in": "chapter_generation"
+        }
+        
+        if prior_validation.get("is_valid"):
+            validated_units = hierarchical_metadata.get("client_units_validated")
+            logger.info(f"✅ Units pre-validated in chapter generation")
+            logger.info(f"   • Score: {prior_validation.get('score', 0):.2f}")
+            logger.info(f"   • Using {len(validated_units) if validated_units else 0} validated units")
+        else:
+            validated_units = None
+            logger.warning(f"❌ Units rejected in chapter generation")
+            logger.warning(f"   • Score: {prior_validation.get('score', 0):.2f}")
+            logger.warning(f"   • Reason: {prior_validation.get('reason', '')}")
+            logger.warning(f"   • Using AI-generated chapters only")
+        
+        logger.info("=" * 60)
+    
+    # Fallback: Validate here if not already validated
+    elif units and isinstance(units, list) and len(units) > 0 and hierarchical_metadata:
+        logger.info("=" * 60)
+        logger.info("🔍 VALIDATING CLIENT-PROVIDED UNITS (FALLBACK)")
+        logger.info("=" * 60)
+        
         content_analysis = hierarchical_metadata.get("content_analysis", {})
         
         if content_analysis:
-            # Validate units against actual video content
-            is_valid, score, reason = validate_units_relevance(
-                units=units,
-                content_analysis=content_analysis,
-                chapters=chapters or {},
-                video_title=video_title or "",
-                threshold=UNIT_VALIDATION_THRESHOLD
-            )
+            try:
+                # Strip to bare titles (no enriched data!)
+                bare_units = [
+                    {"UnitNo": u.get("UnitNo"), "Title": u.get("Title")}
+                    for u in units
+                ]
+                
+                is_valid, score, reason = validate_units_relevance(
+                    units=bare_units,  # ← BARE TITLES ONLY
+                    content_analysis=content_analysis,
+                    chapters=chapters or {},
+                    video_title=video_title or "",
+                    threshold=UNIT_VALIDATION_THRESHOLD
+                )
+                
+                unit_validation_info.update({
+                    "units_validated": True,
+                    "validation_score": score,
+                    "validation_reason": reason,
+                    "units_accepted": is_valid,
+                    "validated_in": "qa_generation"
+                })
+                
+                log_validation_metrics(
+                    video_id=id or "unknown",
+                    units_provided=len(units),
+                    validation_score=score,
+                    accepted=is_valid,
+                    threshold=UNIT_VALIDATION_THRESHOLD
+                )
+                
+                if is_valid:
+                    validated_units = units
+                    logger.info(f"✅ Client units VALIDATED and ACCEPTED")
+                    logger.info(f"   • Score: {score:.2f}")
+                else:
+                    validated_units = None
+                    logger.warning(f"⚠️  Client units REJECTED")
+                    logger.warning(f"   • Score: {score:.2f} < threshold {UNIT_VALIDATION_THRESHOLD}")
+                    logger.warning(f"   • Reason: {reason}")
             
-            # Update validation info
-            unit_validation_info.update({
-                "units_validated": True,
-                "validation_score": score,
-                "validation_reason": reason,
-                "units_accepted": is_valid
-            })
-            
-            # Log to metrics file
-            log_validation_metrics(
-                video_id=id or "unknown",
-                units_provided=len(units),
-                validation_score=score,
-                accepted=is_valid,
-                threshold=UNIT_VALIDATION_THRESHOLD
-            )
-            
-            # Decide whether to use units
-            if is_valid:
+            except Exception as e:
+                logger.error(f"Validation error: {e}", exc_info=True)
                 validated_units = units
-                logger.info(f"✅ Client units VALIDATED and ACCEPTED")
-                logger.info(f"   These units will be used in Q&A and lecture notes generation")
-            else:
-                validated_units = None
-                logger.warning(f"⚠️  Client units REJECTED - too low relevance")
-                logger.warning(f"   Q&A and notes will rely on AI-generated chapters only")
+                unit_validation_info["validation_reason"] = f"Error: {str(e)[:50]}"
         else:
             logger.warning("⚠️  No content_analysis in metadata - cannot validate units")
-            logger.warning("   Using units without validation (assuming valid)")
             validated_units = units
+        
+        logger.info("=" * 60)
     
     elif units and isinstance(units, list) and len(units) > 0:
-        logger.warning("⚠️  Units provided but no hierarchical_metadata - cannot validate")
-        logger.warning("   Using units without validation (assuming valid)")
+        logger.warning("⚠️  No hierarchical metadata available - using units without validation")
         validated_units = units
-    
-    logger.info("=" * 60)
-    
-    # Rest of function continues...
+
+    # ========== REST OF FUNCTION CONTINUES ==========
     ocr_segments = ocr_segments or []
 
     # 1) Choose ASR source
@@ -2783,8 +2822,8 @@ def process_text_for_qa_and_notes(
             shuffle_seed=None,
             ocr_text_override=None,
         )
+        
         # ========== ADD VALIDATION METADATA TO RESULT ==========
-        # Add validation metadata to result (for tracking)
         if not hasattr(result, 'metadata'):
             result.metadata = {}
         result.metadata['unit_validation'] = unit_validation_info
@@ -2800,8 +2839,8 @@ def process_text_for_qa_and_notes(
             os.environ["MAX_NOTES_PAGES"] = old_max_p
         else:
             os.environ.pop("MAX_NOTES_PAGES", None)
-  
 
+  
 # ==================== USAGE EXAMPLE ====================
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
