@@ -1959,6 +1959,7 @@ def hierarchical_multipass_generation(
         'modules_analysis': modules_text,
         'educational_quality_score': quality_score,
         'course_summary': course_summary,
+        'content_analysis': course_summary,
         'token_usage': {
             'original': {
                 'asr_tokens': asr_tokens,
