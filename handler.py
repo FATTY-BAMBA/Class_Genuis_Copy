@@ -83,6 +83,8 @@ try:
         extract_suggested_units_from_chapters,
         extract_suggested_units_from_topics,
     )
+    from app.s3_storage import upload_video_artifacts
+    from app.rag_chunking import chunk_and_embed_video
     
     # Unwrap Celery task to get the underlying function
     if hasattr(generate_qa_and_notes_task, 'run'):
@@ -425,6 +427,34 @@ def handler(job: dict) -> dict:
         # Save artifacts
         with open(os.path.join(run_dir, "client_payload.json"), "w", encoding="utf-8") as f:
             f.write(client_payload_json)
+
+        # ========== UPLOAD TO S3 ==========
+        try:
+            upload_video_artifacts(
+                run_dir=run_dir,
+                video_info=video_info,
+                processing_result=processing_result,
+                chapters_dict=chapters_dict,
+                chapter_metadata=chapter_metadata,
+                client_payload=client_payload,
+                raw_asr_text=raw_asr_text,
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ S3 upload failed (non-fatal): {e}")
+
+        # ========== RAG: CHUNK + EMBED + PINECONE ==========
+        try:
+            chunk_and_embed_video(
+                transcript_text=raw_asr_text,
+                chapters_dict=chapters_dict,
+                team_id=video_info["TeamId"],
+                video_id=video_info["Id"],
+                section_title=video_info.get("SectionTitle", ""),
+                section_no=video_info.get("SectionNo"),
+                video_duration=processing_result.get("duration"),
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ RAG pipeline failed (non-fatal): {e}")
         
         logger.info(f"✅ Processing complete in {total_time:.1f}s")
         logger.info(f"📊 Questions: {len(client_payload['Questions'])}")
