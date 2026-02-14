@@ -29,7 +29,9 @@ from app.chapter_generation import generate_chapters  # (aka app/video_chapterin
 
 from .cleaning import *  # re-export tasks so autodiscover finds them
 from app.qa_generation import process_text_for_qa_and_notes, result_to_legacy_client_format
+
 from app.s3_storage import upload_video_artifacts
+from app.rag_chunking import chunk_and_embed_video
 
 # ---------- Optional NumPy patch for old code paths ----------
 import numpy as np
@@ -1594,24 +1596,27 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
 
             logger.info("=" * 60)
 
-    
-            # ========== ✅ NEW: USE ENRICHED UNITS FROM CHAPTER GENERATION ==========
-            if chapter_metadata and chapter_metadata.get("client_units_with_timestamps"):
-                # Best approach: Use pre-calculated enriched units from chapter generation
+            # ========== ✅ CORRECTED: CHECK VALIDATION BEFORE USING ENRICHED UNITS ==========
+            # Check if units were validated and accepted
+            unit_validation = chapter_metadata.get("unit_validation", {}) if chapter_metadata else {}
+            units_were_accepted = unit_validation.get("is_valid", False)
+
+            if units_were_accepted and chapter_metadata and chapter_metadata.get("client_units_with_timestamps"):
+                # ✅ Units validated AND accepted - use enriched versions
                 enriched_units = chapter_metadata["client_units_with_timestamps"]
                 unit_diagnostics = chapter_metadata.get("unit_diagnostics", {})
-    
+
                 logger.info("=" * 60)
-                logger.info("✅ USING ENRICHED UNITS FROM CHAPTER GENERATION")
+                logger.info("✅ USING VALIDATED ENRICHED UNITS FROM CHAPTER GENERATION")
                 logger.info("=" * 60)
-    
+
                 # Replace units_from_api with enriched versions
                 units_from_api = []
                 for unit in enriched_units:
                     units_from_api.append({
                         "UnitNo": unit.get("UnitNo"),
                         "Title": clean_client_title(unit.get("Title", "")),
-                        "Time": unit.get("Time", "")  # Already back-calculated!
+                        "Time": unit.get("Time", "")  # ✅ Safe - units were validated!
                     })
                 # Build stats for logging compatibility
                 unit_time_stats = {
@@ -1621,13 +1626,38 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                     "unmatched_suggested": unit_diagnostics.get("unmapped_suggested_units", 0),
                     "invalid_suggested_times": 0,
                 }
+                logger.info(f"✅ Enriched {len(units_from_api)} validated Units with timestamps")
+                logger.info("   Method: Back-calculation from validated chapter generation")
+            elif chapter_metadata and "unit_validation" in chapter_metadata:
+                # ❌ Units were validated but REJECTED - return originals WITHOUT timestamps
+                logger.warning("=" * 60)
+                logger.warning("⚠️ UNITS REJECTED - RETURNING ORIGINALS WITHOUT TIMESTAMPS")
+                logger.warning("=" * 60)
+                logger.warning(f"   • Validation score: {unit_validation.get('score', 0):.2f}")
+                logger.warning(f"   • Reason: {unit_validation.get('reason', '')}")
+                logger.warning(f"   • Client will receive original units with Time=''")
 
-                logger.info(f"✅ Enriched {len(units_from_api)} Units with timestamps")
-                logger.info("   Method: Back-calculation from chapter generation")
-
+                # Return original units WITHOUT timestamps
+                units_from_api = []
+                for unit in units:  # Use original units from API request
+                    if isinstance(unit, dict):
+                        units_from_api.append({
+                            "UnitNo": unit.get("UnitNo"),
+                            "Title": clean_client_title(unit.get("Title", "")),
+                            "Time": ""  # ← NO TIMESTAMP because validation failed!
+                        })
+                unit_time_stats = {
+                    "filled_count": 0,
+                    "skipped_existing_time": 0,
+                    "unmatched_units": len(units_from_api),
+                    "unmatched_suggested": 0,
+                    "invalid_suggested_times": 0,
+                }
+                logger.warning(f"⚠️ Returned {len(units_from_api)} units WITHOUT timestamps (validation failed)")
+                    
             elif suggested_structured:
-                # Fallback: Use legacy fill method
-                logger.warning("⚠️ Enriched units not available; using legacy fill method")
+                # ⚠️ Fallback: No validation data available - use legacy fill method
+                logger.warning("⚠️ No validation metadata available; using legacy fill method")
                 units_from_api, unit_time_stats = fill_unit_times_from_suggested_units(
                     units_from_api,
                     suggested_structured,
@@ -1644,7 +1674,7 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                     "invalid_suggested_times": 0,
                 }
                 logger.info("ℹ️ No structured SuggestedUnits available; skipping Units Time fill")
-                
+                  
             # Log results
             logger.info(
                 "🕒 Unit Time Fill Results: filled=%d skipped_existing=%d unmatched_units=%d unmatched_suggested=%d invalid_suggested_times=%d",
@@ -1803,6 +1833,22 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
                 )
             except Exception as e:
                 logger.warning(f"⚠️ S3 upload failed (non-fatal): {e}")
+                
+            # ========== RAG: CHUNK + EMBED + PINECONE ==========
+            try:
+                chunk_and_embed_video(
+                    transcript_text=raw_asr_text,
+                    chapters_dict=chapters_dict,
+                    team_id=video_info["TeamId"],
+                    video_id=video_info["Id"],
+                    section_title=video_info.get("SectionTitle", ""),
+                    section_no=video_info.get("SectionNo"),
+                    video_duration=processing_result.get("duration"),
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ RAG pipeline failed (non-fatal): {e}")
+
+
             # ========== SEND CLEAN PAYLOAD TO CLIENT API ==========
             post_to_client_api(client_payload)  # ← Only send clean data
             logger.info(f"✅ Complete pipeline finished in {total_processing_time:.1f}s")
