@@ -669,8 +669,9 @@ def build_educational_metadata_context(
     Returns:
         Formatted context string for prompt enhancement
     """
-    if not section_title and not units:
-        return ""
+    # ✅ ONLY show metadata if units are provided AND valid
+    if not units or len(units) == 0:
+        return ""  # ← Don't show section title if no units
     
     context_parts = []
     
