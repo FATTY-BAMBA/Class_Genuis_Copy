@@ -112,6 +112,7 @@ def upload_video_artifacts(
     chapter_metadata=None,
     client_payload=None,
     raw_asr_text="",
+    video_url="",
 ):
     """
     Upload all artifacts for one processed video to S3.
@@ -234,6 +235,8 @@ def upload_video_artifacts(
         "team_id": team_id,
         "section_no": video_info.get("SectionNo"),
         "section_title": video_info.get("SectionTitle", ""),
+        "video_url": video_url or "",
+        "original_filename": video_info.get("OriginalFilename", ""),
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "pipeline_version": "1.0.0",
         "asr_model": "whisper-large-v2",
@@ -307,6 +310,8 @@ def _update_manifest(team_id, video_id, processing_meta):
     manifest["videos"][str(video_id)] = {
         "section_no": processing_meta.get("section_no"),
         "section_title": processing_meta.get("section_title", ""),
+        "video_url": processing_meta.get("video_url", ""),
+        "original_filename": processing_meta.get("original_filename", ""),
         "processed_at": processing_meta.get("processed_at"),
         "pipeline_version": processing_meta.get("pipeline_version"),
         "video_duration_seconds": processing_meta.get("video_duration_seconds"),
