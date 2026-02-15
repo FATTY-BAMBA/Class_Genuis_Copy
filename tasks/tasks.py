@@ -1775,11 +1775,13 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             # Validation check
             missing_times = sum(1 for u in client_payload['Units'] if not u.get('Time'))
             if missing_times > 0:
-                logger.error(f"❌ CRITICAL: {missing_times}/{len(client_payload['Units'])} Units have NO timestamps!")
-                logger.error("   This may indicate chapter generation mapping failure")
+                if not units_were_accepted:
+                    logger.info(f"ℹ️ {missing_times}/{len(client_payload['Units'])} Units have no timestamps (units were rejected by validation — this is expected)")
+                else:
+                    logger.error(f"❌ CRITICAL: {missing_times}/{len(client_payload['Units'])} Units have NO timestamps!")
+                    logger.error("   This may indicate chapter generation mapping failure")
             else:
                 logger.info(f"✅ All {len(client_payload['Units'])} Units have timestamps")
-
             logger.info("=" * 60)
 
             # Save clean client payload
@@ -1802,7 +1804,10 @@ def process_video_task(self, play_url_or_path, video_info, num_questions=10, num
             logger.info(f"💾 Saved transcript to {transcript_path}")
 
             # ---- Guardrail: SuggestedUnits must exactly reflect chapters_dict ----
-            chapters_sorted = sorted((chapters_dict or {}).items(), key=lambda x: _hms_to_sec(x[0]) or 10**12)
+            chapters_sorted = sorted(
+                (chapters_dict or {}).items(),
+                key=lambda x: (_hms_to_sec(x[0]) if _hms_to_sec(x[0]) is not None else 10**12)
+            )
             nav_sorted = [(u.get("Time"), u.get("Title")) for u in (navigation_units or [])]
 
             if len(nav_sorted) != len(chapters_sorted):
