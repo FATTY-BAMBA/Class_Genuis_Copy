@@ -750,7 +750,7 @@ def handler(job: dict) -> dict:
                 run_dir=run_dir, video_info=video_info,
                 processing_result=processing_result, chapters_dict=chapters_dict,
                 chapter_metadata=chapter_metadata, client_payload=client_payload,
-                raw_asr_text=raw_asr_text,
+                raw_asr_text=raw_asr_text, video_url=video_url,
             )
         except Exception as e:
             logger.warning(f"⚠️ S3 upload failed (non-fatal): {e}")
