@@ -1877,7 +1877,9 @@ def hierarchical_multipass_generation(
             validated_units = units  # Fail-open: accept on error
         
         logger.info("=" * 60 + "\n")
-            
+    # Initialize variables that may be set by coverage retry or later back-calculation
+    enriched_units = None
+    unit_diagnostics = None       
     # -------------------------
     # Coverage Guardrail (CRITICAL)
     # If chapters only cover early part of ASR, re-run PASS3 once with anchors.
@@ -1985,31 +1987,40 @@ def hierarchical_multipass_generation(
         logger.warning("⚠️ PASS 3 JSON parse failed; falling back to text chapter parsing")
         chapters_raw = parse_chapters_from_output(final_text)
         course_summary = parse_summary_from_output(final_text)
-    # ✅ NEW: Back-calculate Unit timestamps (if client provided Units)
-    enriched_units = None
-    unit_diagnostics = None
-    if units:
-        enriched_units, unit_diagnostics = back_calculate_unit_timestamps(
-            suggested_units_structured=suggested_units_structured,
-            client_units=units
-        )
-        logger.info("\n" + "=" * 60)
-        logger.info("📍 UNIT TIMESTAMP BACK-CALCULATION RESULTS")
-        logger.info("=" * 60)
-        if enriched_units:
-            for unit in enriched_units:
-                if unit.get("Time"):
-                    logger.info(
-                        f"✅ Unit {unit['UnitNo']}: {unit['Title']}\n"
-                        f"   → Starts at: {unit['Time']}\n"
-                        f"   → First chapter: {unit.get('FirstChapter', 'N/A')}"
-                    )
-                else:
-                    logger.info(
-                        f"⚠️ Unit {unit['UnitNo']}: {unit['Title']}\n"
-                        f"   → Not found in video!"
-                    )
-        logger.info("=" * 60 + "\n")
+
+    # ✅ Back-calculate Unit timestamps ONLY if validation passed
+    # (Skip if enriched_units was already set by the coverage-retry block above)
+    if enriched_units is None and unit_diagnostics is None:
+        if validated_units:
+            enriched_units, unit_diagnostics = back_calculate_unit_timestamps(
+                suggested_units_structured=suggested_units_structured,
+                client_units=validated_units
+                )
+            logger.info("\n" + "=" * 60)
+            logger.info("📍 UNIT TIMESTAMP BACK-CALCULATION RESULTS")
+            logger.info("=" * 60)
+            if enriched_units:
+                for unit in enriched_units:
+                    if unit.get("Time"):
+                        logger.info(
+                            f"✅ Unit {unit['UnitNo']}: {unit['Title']}\n"
+                            f"   → Starts at: {unit['Time']}\n"
+                            f"   → First chapter: {unit.get('FirstChapter', 'N/A')}"
+                        )
+                    else:
+                        logger.info(
+                            f"⚠️ Unit {unit['UnitNo']}: {unit['Title']}\n"
+                            f"   → Not found in video!"
+                        )
+            logger.info("=" * 60 + "\n")
+        elif units:
+            logger.info("⏭️  Skipping Unit timestamp back-calculation (units rejected by validation)")
+            unit_diagnostics = {
+                "units_provided": True,
+                "validation_passed": False,
+                "units_rejected": True,
+                "message": "Units failed validation - not mapped to timestamps"
+            }
  
     # ✅ ALWAYS build `chapters` from `chapters_raw`
     chapters = validate_and_normalize_timestamps(
