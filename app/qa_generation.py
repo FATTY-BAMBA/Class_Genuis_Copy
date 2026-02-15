@@ -812,8 +812,11 @@ def parse_modules_to_topics(modules_analysis: str) -> List[Dict]:
     """
     Parse modules_analysis from chapter generation into topics format.
     
-    Args:
-        modules_analysis: Text like "模塊1：基礎工具操作 ~ 00:00-00:25 ~ 介面、工具 ~ 理論+演示"
+    Handles two LLM output formats:
+    - Tilde-separated: "模塊1：基礎工具操作 ~ 00:00-00:25 ~ 介面、工具 ~ 理論+演示"
+    - At-sign-separated: "1. Adobe 軟體介紹 @ 00:00:00"
+    
+    Also filters out header rows the LLM sometimes echoes back.
     
     Returns:
         List of topic dicts compatible with topics_list format
@@ -823,6 +826,9 @@ def parse_modules_to_topics(modules_analysis: str) -> List[Dict]:
     if not modules_analysis or not modules_analysis.strip():
         return topics
     
+    # Header keywords to skip (LLM sometimes echoes the prompt template headers)
+    HEADER_KEYWORDS = {"模塊名稱", "起始時間戳", "結束時間戳", "核心學習點", "教學方法"}
+    
     # Parse each line
     lines = modules_analysis.strip().split('\n')
     
@@ -831,17 +837,32 @@ def parse_modules_to_topics(modules_analysis: str) -> List[Dict]:
         if not line or line.startswith('#') or line.startswith('-'):
             continue
         
-        # Try to parse format: "模塊名稱 ~ 時間範圍 ~ 核心學習點 ~ 教學方法"
-        parts = [p.strip() for p in line.split('~')]
+        # Skip header rows that contain template keywords
+        if any(kw in line for kw in HEADER_KEYWORDS):
+            logger.debug(f"Skipping header row: {line[:60]}")
+            continue
         
-        if len(parts) >= 3:
+        # Detect separator: try ~ first, then @
+        if '~' in line:
+            parts = [p.strip() for p in line.split('~')]
+        elif '@' in line:
+            parts = [p.strip() for p in line.split('@')]
+        else:
+            parts = [line.strip()]
+        
+        if len(parts) >= 2:
             module_name = parts[0]
             time_range = parts[1] if len(parts) > 1 else ""
             learning_points = parts[2] if len(parts) > 2 else ""
             teaching_method = parts[3] if len(parts) > 3 else ""
             
-            # Clean module name (remove "模塊1：" prefix if present)
+            # Clean module name (remove "模塊1：" or "1." prefix if present)
             module_name = re.sub(r'^模塊\d+[：:]\s*', '', module_name)
+            module_name = re.sub(r'^\d+\.\s*', '', module_name)
+            
+            # Skip if module_name is empty after cleaning
+            if not module_name.strip():
+                continue
             
             # Extract keywords from learning points
             keywords = [kw.strip() for kw in learning_points.split('、') if kw.strip()][:5]
@@ -852,28 +873,38 @@ def parse_modules_to_topics(modules_analysis: str) -> List[Dict]:
                 summary_parts.append(learning_points)
             if teaching_method:
                 summary_parts.append(f"教學方式：{teaching_method}")
-            summary = '，'.join(summary_parts)
+            summary = '，'.join(summary_parts) if summary_parts else module_name
             
             topics.append({
-                "id": str(i).zfill(2),
-                "title": module_name,
+                "id": str(len(topics) + 1).zfill(2),
+                "title": module_name.strip(),
                 "summary": summary,
                 "keywords": keywords,
-                "time_range": time_range  # Extra info for context
+                "time_range": time_range
             })
+        else:
+            # Single item (no separator) — use as title
+            clean_title = re.sub(r'^\d+\.\s*', '', parts[0])
+            if clean_title.strip():
+                topics.append({
+                    "id": str(len(topics) + 1).zfill(2),
+                    "title": clean_title.strip()[:100],
+                    "summary": "從章節模塊提取的教學主題",
+                    "keywords": []
+                })
     
-    # If parsing failed, try simpler format
+    # If parsing produced nothing, try simple fallback
     if not topics:
         for i, line in enumerate(lines, 1):
             line = line.strip()
             if line and not line.startswith('#') and not line.startswith('-'):
-                # Use the whole line as title
-                topics.append({
-                    "id": str(i).zfill(2),
-                    "title": line[:100],  # Limit length
-                    "summary": "從章節模塊提取的教學主題",
-                    "keywords": []
-                })
+                if not any(kw in line for kw in HEADER_KEYWORDS):
+                    topics.append({
+                        "id": str(len(topics) + 1).zfill(2),
+                        "title": line[:100],
+                        "summary": "從章節模塊提取的教學主題",
+                        "keywords": []
+                    })
     
     logger.info(f"Parsed {len(topics)} topics from modules_analysis")
     return topics
