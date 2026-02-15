@@ -1463,14 +1463,11 @@ def hierarchical_multipass_generation(
             for unit in units:
                 logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
         logger.info("=" * 60)
-    
-    educational_context = build_educational_context(section_title, units)
-    
+        
     structure_prompt = f"""
 作為資深教學設計專家，分析這個{sec_to_hms(int(duration))}教學影片的整體架構：
 
 {video_info}
-{educational_context}
 
 【核心學習目標】
 1. 學生完成本課程後應掌握哪些關鍵能力？
@@ -1540,14 +1537,6 @@ def hierarchical_multipass_generation(
     modules_prompt = f"""
 基於課程結構分析：
 {structure_text}
-
-{educational_context}
-
-【與預定單元的對應關係】
-如果提供了預定教學單元，請特別注意：
-- 講師如何在實際教學中涵蓋這些預定單元
-- 實際教學模塊與預定單元的對應關係
-- 可能的單元合併、拆分或順序調整
 
 現在識別具體的學習模塊（7-12個），每個模塊應滿足：
 1. 有明確的學習目標
@@ -1621,8 +1610,93 @@ def hierarchical_multipass_generation(
     except Exception as e:
         logger.error(f"❌ PASS 2 failed: {e}", exc_info=True)
         raise
+
+    # ==================== VALIDATE CLIENT UNITS (AFTER PASS 2, BEFORE PASS 3) ====================
+    unit_validation_result = None
+    validated_units = units  # Default: assume valid
     
+    if units and isinstance(units, list) and len(units) > 0:
+        logger.info("\n" + "=" * 60)
+        logger.info("🔍 VALIDATING CLIENT UNITS (POST-PASS2, PRE-PASS3)")
+        logger.info("=" * 60)
+        
+        try:
+            from app.qa_generation import validate_units_relevance, UNIT_VALIDATION_THRESHOLD
+            
+            bare_units = [
+                {"UnitNo": u.get("UnitNo"), "Title": u.get("Title")}
+                for u in units
+            ]
+            
+            logger.info(f"Validating {len(bare_units)} client units against video content...")
+            
+            # Build a lightweight content dict from PASS 1+2 output
+            # (course_summary doesn't exist yet — it comes from PASS 3)
+            content_from_passes = {
+                "topic": section_title or video_title or "",
+                "core_content": structure_text[:500] if structure_text else "",
+                "learning_objectives": modules_text[:500] if modules_text else "",
+            }
+            
+            is_valid, score, reason = validate_units_relevance(
+                units=bare_units,
+                content_analysis=content_from_passes,
+                chapters={},
+                video_title=video_title or "",
+                threshold=UNIT_VALIDATION_THRESHOLD
+            )
+            
+            unit_validation_result = {
+                "is_valid": is_valid,
+                "score": score,
+                "reason": reason,
+                "threshold": UNIT_VALIDATION_THRESHOLD,
+                "units_provided": len(units)
+            }
+            
+            if is_valid:
+                logger.info(f"✅ CLIENT UNITS VALIDATED AND ACCEPTED")
+                logger.info(f"   • Score: {score:.2f} (threshold: {UNIT_VALIDATION_THRESHOLD})")
+                logger.info(f"   • Reason: {reason}")
+                logger.info(f"   • Will include units in PASS 3 prompt")
+                validated_units = units
+            else:
+                logger.warning(f"❌ CLIENT UNITS REJECTED")
+                logger.warning(f"   • Score: {score:.2f} (threshold: {UNIT_VALIDATION_THRESHOLD})")
+                logger.warning(f"   • Reason: {reason}")
+                logger.warning(f"   • PASS 3 will run WITHOUT client unit context")
+                logger.warning(f"   • Will return AI-generated chapters only")
+                validated_units = None
+            
+        except Exception as e:
+            logger.error(f"Unit validation error: {e}", exc_info=True)
+            logger.warning("Proceeding without validation (fail-open)")
+            unit_validation_result = {
+                "is_valid": True,
+                "score": 1.0,
+                "reason": f"Validation error: {str(e)[:50]}",
+                "threshold": UNIT_VALIDATION_THRESHOLD,
+                "units_provided": len(units),
+                "error": str(e)
+            }
+            validated_units = units
+        
+        logger.info("=" * 60 + "\n")
+    
+    # ==================== BUILD EDUCATIONAL CONTEXT (CONDITIONAL) ====================
+    # Only include client units in PASS 3 if they passed validation
+    if validated_units:
+        educational_context = build_educational_context(section_title, validated_units)
+        logger.info(f"✅ Educational context included in PASS 3 ({len(validated_units)} validated units)")
+    else:
+        educational_context = ""
+        if units:
+            logger.info("ℹ️  Educational context EXCLUDED from PASS 3 (units rejected)")
+        else:
+            logger.info("ℹ️  No educational context (no units provided)")
+
     # ==================== PASS 3: Detailed Chapter Generation ====================
+    
     logger.info("\n" + "-" * 60)
     logger.info("📑 PASS 3: Detailed Chapter Generation")
     logger.info("   Goal: Create 15-30 precise chapter timestamps with titles")
@@ -1780,7 +1854,7 @@ def hierarchical_multipass_generation(
     if isinstance(data, dict):
         suggested_units_structured = normalize_suggested_units(
             data.get("SuggestedUnits"),
-            units=units
+            units=validated_units
         )
 
         cs = data.get("CourseSummary")
@@ -1795,7 +1869,7 @@ def hierarchical_multipass_generation(
         # Fallback behavior if model outputs a top-level list.
         # You can either ignore it or try to interpret it as SuggestedUnits directly.
         # This tries to interpret it as SuggestedUnits:
-        suggested_units_structured = normalize_suggested_units(data, units=units)
+        suggested_units_structured = normalize_suggested_units(data, units=validated_units)
         
     # 2) Warning should be outside the "if isinstance(data, dict)" block
     if units:
@@ -1811,75 +1885,10 @@ def hierarchical_multipass_generation(
                     f"(client provided {len(units)} Units)"
                 )
     
-    # ==================== VALIDATE CLIENT UNITS (BEFORE MAPPING) ====================
-    unit_validation_result = None
-    validated_units = units  # Default: assume valid
-    
-    if units and isinstance(units, list) and len(units) > 0:
-        logger.info("\n" + "=" * 60)
-        logger.info("🔍 VALIDATING CLIENT UNITS (PRE-MAPPING)")
-        logger.info("=" * 60)
-        
-        try:
-            # Import validation function
-            from app.qa_generation import validate_units_relevance, UNIT_VALIDATION_THRESHOLD
-            
-            # Extract BARE titles only (no enriched data!)
-            bare_units = [
-                {"UnitNo": u.get("UnitNo"), "Title": u.get("Title")}
-                for u in units
-            ]
-            
-            logger.info(f"Validating {len(bare_units)} client units against video content...")
-            
-            # Validate against actual video content
-            is_valid, score, reason = validate_units_relevance(
-                units=bare_units,
-                content_analysis=course_summary,  # Pass 1 analysis
-                chapters={},  # Don't pass AI chapters - compare titles only!
-                video_title=video_title or "",
-                threshold=UNIT_VALIDATION_THRESHOLD
-            )
-            
-            unit_validation_result = {
-                "is_valid": is_valid,
-                "score": score,
-                "reason": reason,
-                "threshold": UNIT_VALIDATION_THRESHOLD,
-                "units_provided": len(units)
-            }
-            
-            if is_valid:
-                logger.info(f"✅ CLIENT UNITS VALIDATED AND ACCEPTED")
-                logger.info(f"   • Score: {score:.2f} (threshold: {UNIT_VALIDATION_THRESHOLD})")
-                logger.info(f"   • Reason: {reason}")
-                logger.info(f"   • Will proceed with unit-to-timestamp mapping")
-                validated_units = units  # Keep original units
-            else:
-                logger.warning(f"❌ CLIENT UNITS REJECTED")
-                logger.warning(f"   • Score: {score:.2f} (threshold: {UNIT_VALIDATION_THRESHOLD})")
-                logger.warning(f"   • Reason: {reason}")
-                logger.warning(f"   • SKIPPING unit-to-timestamp mapping")
-                logger.warning(f"   • Will return AI-generated chapters only")
-                validated_units = None  # Reject units - don't map!
-            
-        except Exception as e:
-            logger.error(f"Unit validation error: {e}", exc_info=True)
-            logger.warning("Proceeding without validation (fail-open)")
-            unit_validation_result = {
-                "is_valid": True,
-                "score": 1.0,
-                "reason": f"Validation error: {str(e)[:50]}",
-                "threshold": UNIT_VALIDATION_THRESHOLD,
-                "units_provided": len(units),
-                "error": str(e)
-            }
-            validated_units = units  # Fail-open: accept on error
-        
-        logger.info("=" * 60 + "\n")
     # Initialize variables that may be set by coverage retry or later back-calculation
     enriched_units = None
-    unit_diagnostics = None       
+    unit_diagnostics = None  
+    
     # -------------------------
     # Coverage Guardrail (CRITICAL)
     # If chapters only cover early part of ASR, re-run PASS3 once with anchors.
@@ -1927,13 +1936,13 @@ def hierarchical_multipass_generation(
             suggested_retry: List[Dict[str, Any]] = []
             course_summary_retry: Dict[str, Any] = {}
             if isinstance(data_retry, dict):
-                suggested_retry = normalize_suggested_units(data_retry.get("SuggestedUnits"), units=units)
+                suggested_retry = normalize_suggested_units(data_retry.get("SuggestedUnits"), units=validated_units)
                 cs2 = data_retry.get("CourseSummary")
                 if isinstance(cs2, dict):
                     course_summary_retry = cs2
             elif isinstance(data_retry, list):
                 # interpret top-level list as SuggestedUnits
-                suggested_retry = normalize_suggested_units(data_retry, units=units)
+                suggested_retry = normalize_suggested_units(data_retry, units=validated_units)
             else:
                 suggested_retry = []
             if suggested_retry:
