@@ -9,7 +9,7 @@ Can run:
   1. Inline after S3 upload (add to process_video_task)
   2. As a standalone batch job for existing S3 data
   3. As a one-time backfill for all videos in S3
-
+  
 Required env vars:
     S3_BUCKET                - Your S3 bucket
     AWS_ACCESS_KEY_ID        - IAM credentials
