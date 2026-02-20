@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg redis-server redis-tools \
       libsndfile1 libgl1 libgomp1 libglib2.0-0 \
       libsm6 libxext6 libxrender1 libcairo2 \
-      curl aria2 netcat-openbsd procps net-tools lsof patchelf \
+      curl aria2 netcat-openbsd procps net-tools lsof patchelf patchelf ttyd \
       libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
 
