@@ -63,7 +63,7 @@ RUN pip3 install --no-cache-dir --force-reinstall \
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
 # -------------------- Core App Dependencies --------------------
-RUN python -m pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir -c constraints.txt \
     Flask==2.3.3 \
     gunicorn==23.0.0 \
     celery \
@@ -80,29 +80,30 @@ RUN python -m pip install --no-cache-dir \
 
 # -------------------- Whisper stack (CUDA 11.8 + cuDNN 8) --------------------
 # CRITICAL: Install in EXACT order to avoid dependency conflicts
-RUN python -m pip install --no-cache-dir --only-binary=:all: av==12.3.0
+RUN python -m pip install --no-cache-dir -c constraints.txt --only-binary=:all: av==12.3.0
 
-RUN python -m pip install --no-cache-dir ctranslate2==3.24.0
+RUN python -m pip install --no-cache-dir -c constraints.txt ctranslate2==3.24.0
 
 RUN python -m pip install --no-cache-dir --no-deps faster-whisper==0.10.1
 
-RUN python -m pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir -c constraints.txt \
     onnxruntime \
     "huggingface-hub>=0.13"
 
-RUN python -m pip install --no-cache-dir "tokenizers>=0.14,<0.15"
+RUN python -m pip install --no-cache-dir -c constraints.txt "tokenizers>=0.14,<0.15"
 
-RUN python -m pip install --no-cache-dir transformers==4.36.2
+RUN python -m pip install --no-cache-dir -c constraints.txt transformers==4.36.2
 
 # -------------------- EasyOCR (cuDNN 8.7 Compatible) --------------------
 # Version 1.7.0: Last version compatible with cuDNN 8.7 - FIXES GPU OCR!
-RUN python -m pip install --no-cache-dir easyocr==1.7.0
+RUN python -m pip install --no-cache-dir -c constraints.txt easyocr==1.7.0
 
 # CRITICAL: EasyOCR upgrades numpy to 2.x, force it back to 1.26.4
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
-# -------------------- Additional dependencies --------------------
-RUN python -m pip install --no-cache-dir \
+# -------------------- Additional dependencies (CONSTRAINED) --------------------
+# -c constraints.txt prevents lightning/optimum/etc from upgrading torch
+RUN python -m pip install --no-cache-dir -c constraints.txt \
     boto3 \
     pinecone \
     sentencepiece \
@@ -139,10 +140,14 @@ RUN python -m pip install --no-cache-dir \
 RUN python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
 
 # -------------------- Verify installations --------------------
+# CRITICAL: cuDNN gate — fails the build if anything upgraded torch behind our back
 RUN echo "🔍 Verifying package installations..." && \
     echo "================================================" && \
     python -c "import torch; print('✅ PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'cuDNN:', torch.backends.cudnn.version())" && \
+    python -c "import torch; v=torch.backends.cudnn.version(); assert v < 8900, f'❌ BUILD FAILED: cuDNN {v} detected — a dependency upgraded PyTorch! Expected <8900'" && \
+    python -c "import torch; assert torch.__version__ == '2.1.2', f'❌ BUILD FAILED: torch {torch.__version__} — expected 2.1.2'" && \
     python -c "import numpy; print('✅ NumPy:', numpy.__version__)" && \
+    python -c "import numpy; assert numpy.__version__ == '1.26.4', f'❌ BUILD FAILED: numpy {numpy.__version__} — expected 1.26.4'" && \
     python -c "import flask; print('✅ Flask:', flask.__version__)" && \
     python -c "import celery; print('✅ Celery:', celery.__version__)" && \
     python -c "import tenacity; print('✅ Tenacity: installed')" && \
@@ -151,7 +156,7 @@ RUN echo "🔍 Verifying package installations..." && \
     python -c "import easyocr; print('✅ EasyOCR:', easyocr.__version__)" && \
     python -c "import faster_whisper; print('✅ faster-whisper:', faster_whisper.__version__)" && \
     echo "================================================" && \
-    echo "✅ All packages verified successfully!"
+    echo "✅ All packages verified — cuDNN 8.7 confirmed!"
 
 # -------------------- Optional: legacy numpy.int shim --------------------
 RUN python -c "import sys, pathlib, site; \
