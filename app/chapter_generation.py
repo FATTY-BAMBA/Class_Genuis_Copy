@@ -1428,6 +1428,127 @@ def build_educational_context(section_title: Optional[str], units: Optional[List
     return "\n".join(context_parts)
 
 # ─────────────────────────
+# Unit-Aware PASS 3 Helpers
+# ─────────────────────────
+
+def determine_chapters_per_unit(num_units: int) -> Tuple[int, int]:
+    """
+    Determine min/max sub-chapters per unit based on unit count.
+    Returns (min_per_unit, max_per_unit).
+    
+    Rules:
+    - 1-4 units  → 3-4 sub-chapters each
+    - 5-8 units  → 2-3 sub-chapters each
+    - 9+ units   → 1-2 sub-chapters each (just find timestamps)
+    """
+    if num_units <= 4:
+        return 3, 4
+    elif num_units <= 8:
+        return 2, 3
+    else:
+        return 1, 2
+
+
+def parse_unit_aware_response(
+    data: Any,
+    validated_units: List[Dict],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Parse the unit-grouped JSON response into flat suggested_units_structured
+    with ClientUnitNo already set by construction.
+    
+    Input format:
+    {
+      "UnitChapters": [
+        {
+          "ClientUnitNo": 1,
+          "ClientUnitTitle": "...",
+          "Chapters": [
+            {"Title": "...", "Time": "HH:MM:SS"},
+            ...
+          ]
+        }
+      ],
+      "CourseSummary": { ... }
+    }
+    
+    Output: (flat_suggested_units, course_summary)
+    """
+    if not isinstance(data, dict):
+        return [], {}
+    
+    course_summary = data.get("CourseSummary", {})
+    if not isinstance(course_summary, dict):
+        course_summary = {}
+    
+    unit_chapters_list = data.get("UnitChapters", [])
+    if not isinstance(unit_chapters_list, list):
+        return [], course_summary
+    
+    # Build title lookup from validated_units
+    unit_title_by_no = {}
+    for u in validated_units:
+        try:
+            unit_title_by_no[int(u["UnitNo"])] = str(u.get("Title", "")).strip()
+        except Exception:
+            pass
+    
+    flat_units = []
+    unit_no_counter = 1
+    
+    for uc in unit_chapters_list:
+        if not isinstance(uc, dict):
+            continue
+        
+        client_unit_no = uc.get("ClientUnitNo")
+        if client_unit_no is not None:
+            try:
+                client_unit_no = int(client_unit_no)
+            except Exception:
+                client_unit_no = None
+        
+        # Validate ClientUnitNo exists in our validated_units
+        if client_unit_no not in unit_title_by_no:
+            logger.warning(
+                f"⚠️ UnitChapters contains ClientUnitNo={client_unit_no} "
+                f"which is not in validated units. Skipping."
+            )
+            continue
+        
+        client_unit_title = unit_title_by_no.get(client_unit_no, "")
+        chapters = uc.get("Chapters", [])
+        if not isinstance(chapters, list):
+            continue
+        
+        for ch in chapters:
+            if not isinstance(ch, dict):
+                continue
+            title = str(ch.get("Title", "")).strip()
+            ts = str(ch.get("Time", "")).strip()
+            if not title or not _is_hms(ts):
+                continue
+            
+            flat_units.append({
+                "UnitNo": unit_no_counter,
+                "ParentUnitNo": None,
+                "Title": title,
+                "Time": ts,
+                "ClientUnitNo": client_unit_no,
+                "ClientUnitTitle": client_unit_title,
+            })
+            unit_no_counter += 1
+    
+    # Sort by time
+    flat_units.sort(key=lambda x: ts_to_seconds_hms(x["Time"]))
+    # Renumber
+    for i, su in enumerate(flat_units, 1):
+        su["UnitNo"] = i
+    
+    logger.info(f"📊 Parsed unit-aware response: {len(flat_units)} chapters across {len(unit_chapters_list)} units")
+    
+    return flat_units, course_summary
+
+# ─────────────────────────
 # Hierarchical Multi-Pass Generation (NEW)
 # ─────────────────────────
 
@@ -1798,19 +1919,170 @@ def hierarchical_multipass_generation(
             logger.info("ℹ️  Educational context EXCLUDED from PASS 3 (units rejected)")
         else:
             logger.info("ℹ️  No educational context (no units provided)")
-
     # ==================== PASS 3: Detailed Chapter Generation ====================
     
     logger.info("\n" + "-" * 60)
     logger.info("📑 PASS 3: Detailed Chapter Generation")
-    logger.info("   Goal: Create 15-30 precise chapter timestamps with titles")
+    logger.info("   Goal: Create precise chapter timestamps with titles")
     logger.info("   Approach: ASR-primary (timing) + OCR-supporting (detail)")
     logger.info("-" * 60)
     
     if progress_callback:
         progress_callback("generating_detailed_chapters", 80)
+
+    # ==================== BRANCH: Unit-Aware vs Original PASS 3 ====================
+    if validated_units:
+        # ────────── UNIT-AWARE PASS 3 ──────────
+        num_units = len(validated_units)
+        min_per, max_per = determine_chapters_per_unit(num_units)
+        total_min = num_units * min_per
+        total_max = num_units * max_per
+        
+        logger.info(f"🎯 UNIT-AWARE PASS 3: {num_units} validated units")
+        logger.info(f"   Sub-chapters per unit: {min_per}-{max_per}")
+        logger.info(f"   Total chapters target: {total_min}-{total_max}")
+        
+        # Build the unit list for the prompt
+        units_json_for_prompt = json.dumps(
+            [{"ClientUnitNo": u["UnitNo"], "ClientUnitTitle": u["Title"]} for u in validated_units],
+            ensure_ascii=False, indent=2
+        )
+        
+        chapters_prompt = f"""
+【課程整體結構】
+{structure_text}
+
+【學習模塊規劃】  
+{modules_text}
+
+【客戶預定教學單元（已驗證）】
+{units_json_for_prompt}
+
+你的任務：為上面每個教學單元找到對應的章節時間點。
+
+【章節設計原則】
+1. 每個單元必須有 {min_per}-{max_per} 個章節
+2. 章節時間必須對應逐字稿中講師實際講解該單元內容的時間戳（±60秒內）
+3. 在逐字稿中搜尋與每個單元主題相關的教學內容
+4. 章節標題用繁體中文，具體描述該時間點的教學內容
+5. 所有章節按時間遞增排序
+
+【如何為每個單元找到正確的時間點】
+- 閱讀逐字稿，找到講師開始講解該單元主題的位置
+- 第一個章節 = 該單元主題首次被詳細講解的時間點
+- 後續章節 = 該單元內的子主題、範例、練習等轉換點
+- 如果某個單元的內容在影片中分佈不連續，以第一次出現為主要章節
+
+完整逐字稿（含精確時間戳）：
+{asr_text}
+
+視覺輔助內容：
+{ocr_text if ocr_text else "（無螢幕內容參考）"}
+
+總時長：{sec_to_hms(int(duration))}
+
+【輸出格式要求（重要：只輸出 JSON，不要輸出任何其他文字）】
+{{
+  "UnitChapters": [
+    {{
+      "ClientUnitNo": 1,
+      "ClientUnitTitle": "單元名稱",
+      "Chapters": [
+        {{"Title": "具體章節標題", "Time": "HH:MM:SS"}},
+        {{"Title": "具體章節標題", "Time": "HH:MM:SS"}}
+      ]
+    }}
+  ],
+  "CourseSummary": {{
+    "topic": "課程主題",
+    "core_content": "核心內容摘要",
+    "learning_objectives": "學習目標",
+    "target_audience": "適合對象",
+    "difficulty": "難度級別"
+  }}
+}}
+
+規則：
+1) 每個 ClientUnitNo 必須完全對應上面提供的教學單元
+2) 每個單元的 Chapters 必須有 {min_per}-{max_per} 個章節
+3) Time 必須是逐字稿中實際存在或非常接近（±60秒內）的 HH:MM:SS
+4) 所有 Chapters 的 Time 必須全域遞增（跨單元也要遞增）
+5) 只輸出 JSON，禁止 ```、禁止多餘解釋
+"""
+        
+        logger.info(f"📤 PASS 3 (unit-aware) prompt: ~{count_tokens_llama(chapters_prompt):,} tokens")
+        logger.info("🤖 Calling LLM for unit-aware chapter generation...")
+        t0 = time.time()
+        
+        try:
+            final_response = call_llm(
+                service_type=config.service_type,
+                client=client,
+                system_message=(
+                    "你是細心的章節設計師。"
+                    "你會根據提供的教學單元結構，為每個單元找到逐字稿中對應的章節時間點。"
+                    "章節時間以 ASR 時間戳為準。"
+                    "請只輸出 JSON，禁止任何其他文字。"
+                ),
+                user_message=chapters_prompt,
+                model=config.openai_model if config.service_type == "openai" else config.azure_model,
+                max_tokens=3000,
+                temperature=0.1
+            )
+            
+            elapsed = time.time() - t0
+            logger.info(f"✅ PASS 3 (unit-aware) completed in {elapsed:.1f}s")
+            
+            final_text = (final_response.choices[0].message.content 
+                         if config.service_type == "openai" 
+                         else final_response.choices[0].message.content)
+            
+            logger.info(f"📝 Final output: {len(final_text)} characters")
+            
+        except Exception as e:
+            logger.error(f"❌ PASS 3 (unit-aware) failed: {e}", exc_info=True)
+            raise
+        
+        # Parse unit-aware response
+        data = safe_load_json(final_text)
+        suggested_units_structured, course_summary = parse_unit_aware_response(
+            data, validated_units
+        )
+        suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
+        
+        # Fallback: if unit-aware parse failed, try original SuggestedUnits schema
+        if not suggested_units_structured and isinstance(data, dict):
+            logger.warning("⚠️ Unit-aware parse returned 0 chapters, trying SuggestedUnits fallback...")
+            suggested_units_structured = normalize_suggested_units(
+                data.get("SuggestedUnits"), units=validated_units
+            )
+            suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
+            cs = data.get("CourseSummary")
+            if isinstance(cs, dict):
+                course_summary = cs
+        
+        if not suggested_units_structured:
+            logger.warning("⚠️ Unit-aware PASS 3 produced no chapters, falling back to original PASS 3")
+            validated_units_for_pass3 = None  # trigger original path below
+        else:
+            validated_units_for_pass3 = validated_units
+            
+            # Log mapping results
+            mapped_units = set(su.get("ClientUnitNo") for su in suggested_units_structured if su.get("ClientUnitNo"))
+            logger.info(f"✅ Unit-aware chapters: {len(suggested_units_structured)} chapters across {len(mapped_units)} units")
+            for vu in validated_units:
+                uno = vu["UnitNo"]
+                count = sum(1 for su in suggested_units_structured if su.get("ClientUnitNo") == uno)
+                logger.info(f"   • Unit {uno} ({vu['Title']}): {count} chapters")
+    else:
+        validated_units_for_pass3 = None
     
-    chapters_prompt = f"""
+    # ────────── ORIGINAL PASS 3 (no units, units rejected, or unit-aware failed) ──────────
+    if validated_units_for_pass3 is None:
+        if validated_units:
+            logger.info("ℹ️ Falling back to original PASS 3 (unit-aware produced no results)")
+        
+        chapters_prompt = f"""
 【課程整體結構】
 {structure_text}
 
@@ -1818,11 +2090,6 @@ def hierarchical_multipass_generation(
 {modules_text}
 
 {educational_context}
-
-【單元對應建議（如適用）】
-如果提供了預定教學單元，章節標題可使用格式：
-- [單元N：單元名稱] 具體章節內容
-- 這樣可以幫助學生理解章節與整體課程結構的關係
 
 現在為每個模塊生成具體的章節時間點（總共15-30個章節），並提供課程摘要。
 
@@ -1833,162 +2100,106 @@ def hierarchical_multipass_generation(
 4. 標記練習題或互動環節
 5. 標記重點回顧或總結處
 
-【章節時間點定位策略（重要性排序）】
+【章節時間點定位策略】
+**第一優先：ASR語言時間戳（主要依據）**
+- 講師的明確主題宣告
+- 教學轉換信號
+- 重要概念的首次解釋開始點
 
-**第一優先：ASR語言時間戳（主要依據 - 決定章節開始時間）**
-- 講師的明確主題宣告："接下來我們要講..."、"現在進入..."、"首先..."
-- 教學轉換信號："好的，這部分完成了"、"現在來看..."、"我們來示範..."
-- 重要概念的首次詳細解釋開始點
-- 實例演示的明確開始："我們來實際操作一下..."
-- 練習或互動的開始："大家試試看..."
+**第二優先：內容邏輯轉換**
+- 理論到演示的轉換
+- 新工具/技術的首次介紹
 
-**第二優先：內容邏輯轉換（ASR內容分析）**
-- 從理論講解到實際演示的自然轉換點
-- 新工具/技術的首次詳細介紹
-- 從簡單範例到複雜應用的過渡
-- 階段性小結後開始新的子主題
+**第三優先：OCR視覺輔助**
+- 投影片主題確認
+- 專業術語補充
 
-**第三優先：OCR視覺輔助（補充確認 - 提供章節標題細節）**
-- 確認當前討論的具體主題（投影片標題提供準確名稱）
-- 提供精確的技術術語（當講師說"這個工具"時，OCR顯示"矩形工具"）
-- 補充視覺內容描述（圖表標題、代碼片段、操作步驟）
-- 當ASR表述不夠明確時，參考螢幕內容來補充細節
-
-【標題命名規範】
-- **優先使用講師的自然表述**（來自ASR，更口語化、易懂）
-- **結合投影片的專業術語**（來自OCR，提供準確的技術名稱）
-- 使用具體、可操作的描述（避免"介紹"、"說明"等模糊詞彙）
-- 包含所屬模塊標籤（如：[基礎工具]、[進階技巧]、[實戰案例]）
-- 標題格式：[模塊標籤] 動作/對象/目標
-
-【時間點選擇的黃金原則】
-⚠️ ASR時間戳記錄了講師實際開始講解新主題的時間 - 這是最自然、最符合學習節奏的章節起點
-⚠️ 投影片（OCR）通常在講師宣告主題之後才出現，用於確認內容和提供術語，而非決定時間點
-⚠️ 優先選擇講師明確宣告新主題的時間點（從ASR）作為章節開始時間
-⚠️ 使用投影片內容（從OCR）來豐富和精確化章節標題
-
-完整逐字稿（含精確時間戳 - 主要用於確定章節時間）：
+完整逐字稿（含精確時間戳）：
 {asr_text}
 
-視覺輔助內容（投影片/螢幕文字 - 主要用於豐富章節標題）：
+視覺輔助內容：
 {ocr_text if ocr_text else "無視覺輔助內容"}
 
 總時長：{sec_to_hms(int(duration))}
 
-【輸出格式要求（重要：只輸出 JSON，不要輸出任何其他文字）】
-請輸出一個 JSON 物件，格式如下：
-
+【輸出格式要求（重要：只輸出 JSON）】
 {PASS3_JSON_SCHEMA}
-
-{{ 
-  "SuggestedUnits": [
-    {{ 
-      "UnitNo": 1,
-      "ParentUnitNo": null,
-      "Title": "章節標題（繁體中文）",
-      "Time": "HH:MM:SS",
-      "ClientUnitNo": 2,
-      "ClientUnitTitle": "（對應到客戶提供的 Units 中該 UnitNo 的 Title）"
-    }}
-  ],
-  "CourseSummary": {{
-    "topic": "...",
-    "core_content": "...",
-    "learning_objectives": "...",
-    "target_audience": "...",
-    "difficulty": "..."
-  }}
-}}
 
 規則：
 1) Time 必須是逐字稿中存在或非常接近（±60 秒內）的 HH:MM:SS
 2) SuggestedUnits 需依 Time 遞增排序
-3) 若有提供客戶 Units：
-   - 每一個 SuggestedUnit 必須包含 ClientUnitNo（必須等於 Units 裡某個 UnitNo）
-   - 每一個 SuggestedUnit 必須包含 ClientUnitTitle（必須與該 UnitNo 的 Title 相同或非常接近）
-   - ParentUnitNo 僅用於章節階層（可選），不得用來表示 ClientUnitNo
-4) 若未提供 Units：ClientUnitNo 與 ClientUnitTitle 允許為 null 或省略
-5) 只輸出 JSON，禁止 ```、禁止多餘解釋、禁止條列文字
+3) 只輸出 JSON，禁止 ```、禁止多餘解釋
 """
-    
-    logger.info(f"📤 PASS 3 prompt: ~{count_tokens_llama(chapters_prompt):,} tokens")
-    logger.info("🤖 Calling LLM for final chapter generation...")
-    t0 = time.time()
-    
-    try:
-        final_response = call_llm(
-            service_type=config.service_type,
-            client=client,
-            system_message=(
-                "你是細心的章節設計師。"
-                "章節時間以 ASR 時間戳為準，章節標題可用 OCR 補充專業術語。"
-                "請只輸出一個 JSON 物件，且 JSON 必須包含 SuggestedUnits 與 CourseSummary。"
-                "禁止輸出任何其他文字、禁止 ```。"
-            ),
-            user_message=chapters_prompt,
-            model=config.openai_model if config.service_type == "openai" else config.azure_model,
-            max_tokens=3000,
-            temperature=0.1
-        )
         
-        elapsed = time.time() - t0
-        logger.info(f"✅ PASS 3 completed in {elapsed:.1f}s")
+        logger.info(f"📤 PASS 3 (original) prompt: ~{count_tokens_llama(chapters_prompt):,} tokens")
+        logger.info("🤖 Calling LLM for chapter generation...")
+        t0 = time.time()
         
-        final_text = (final_response.choices[0].message.content 
-                     if config.service_type == "openai" 
-                     else final_response.choices[0].message.content)
-        
-        logger.info(f"📝 Final output: {len(final_text)} characters")
-        
-    except Exception as e:
-        logger.error(f"❌ PASS 3 failed: {e}", exc_info=True)
-        raise
-    
-    # ==================== Parse Results ====================
-    logger.info("\n" + "-" * 60)
-    logger.info("🔍 Parsing Generated Content")
-    logger.info("-" * 60)
-
-    data = safe_load_json(final_text)
-
-    suggested_units_structured: List[Dict[str, Any]] = []
-    course_summary: Dict[str, Any] = {}
-
-    # 1) Only treat dict-shaped JSON as valid for your schema
-    # 1) Only treat dict-shaped JSON as valid for your schema
-    if isinstance(data, dict):
-        suggested_units_structured = normalize_suggested_units(
-            data.get("SuggestedUnits"),
-            units=validated_units
-        )
-        suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
-
-        cs = data.get("CourseSummary")
-        if isinstance(cs, dict):
-            course_summary = cs
-        # Optional: keep summary consistent with chapters (Traditional)
-        if _opencc and course_summary:
-            for k, v in list(course_summary.items()):
-                if isinstance(v, str):
-                    course_summary[k] = to_traditional(v)
-    elif isinstance(data, list):
-        # Fallback behavior if model outputs a top-level list.
-        suggested_units_structured = normalize_suggested_units(data, units=validated_units)
-        suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
-        
-    # 2) Warning should be outside the "if isinstance(data, dict)" block
-    if units:
-        if not suggested_units_structured:
-            logger.warning(
-                 f"⚠️ Client provided {len(units)} Units but SuggestedUnits is empty/invalid after normalization."
+        try:
+            final_response = call_llm(
+                service_type=config.service_type,
+                client=client,
+                system_message=(
+                    "你是細心的章節設計師。"
+                    "章節時間以 ASR 時間戳為準，章節標題可用 OCR 補充專業術語。"
+                    "請只輸出一個 JSON 物件，且 JSON 必須包含 SuggestedUnits 與 CourseSummary。"
+                    "禁止輸出任何其他文字、禁止 ```。"
+                ),
+                user_message=chapters_prompt,
+                model=config.openai_model if config.service_type == "openai" else config.azure_model,
+                max_tokens=3000,
+                temperature=0.1
             )
-        else:
-            missing = sum(1 for x in suggested_units_structured if x.get("ClientUnitNo") is None)
-            if missing:
-                logger.warning(
-                    f"⚠️ {missing}/{len(suggested_units_structured)} SuggestedUnits missing ClientUnitNo "
-                    f"(client provided {len(units)} Units)"
-                )
+            
+            elapsed = time.time() - t0
+            logger.info(f"✅ PASS 3 (original) completed in {elapsed:.1f}s")
+            
+            final_text = (final_response.choices[0].message.content 
+                         if config.service_type == "openai" 
+                         else final_response.choices[0].message.content)
+            
+            logger.info(f"📝 Final output: {len(final_text)} characters")
+            
+        except Exception as e:
+            logger.error(f"❌ PASS 3 failed: {e}", exc_info=True)
+            raise
+        
+        # Parse original schema
+        data = safe_load_json(final_text)
+        suggested_units_structured = []
+        course_summary = {}
+        
+        if isinstance(data, dict):
+            suggested_units_structured = normalize_suggested_units(
+                data.get("SuggestedUnits"), units=validated_units
+            )
+            suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
+            cs = data.get("CourseSummary")
+            if isinstance(cs, dict):
+                course_summary = cs
+        elif isinstance(data, list):
+            suggested_units_structured = normalize_suggested_units(data, units=validated_units)
+            suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
+    
+    # Apply Traditional Chinese to course summary
+    if _opencc and course_summary:
+        for k, v in list(course_summary.items()):
+            if isinstance(v, str):
+                course_summary[k] = to_traditional(v)
+    
+    # Log warnings about missing ClientUnitNo (only relevant for original path)
+    if units and suggested_units_structured:
+        missing = sum(1 for x in suggested_units_structured if x.get("ClientUnitNo") is None)
+        if missing:
+            logger.warning(
+                f"⚠️ {missing}/{len(suggested_units_structured)} SuggestedUnits missing ClientUnitNo "
+                f"(client provided {len(units)} Units)"
+            )
+    elif units and not suggested_units_structured:
+        logger.warning(
+            f"⚠️ Client provided {len(units)} Units but SuggestedUnits is empty/invalid after normalization."
+        )
+
     
     # Initialize variables that may be set by coverage retry or later back-calculation
     enriched_units = None
@@ -2041,17 +2252,26 @@ def hierarchical_multipass_generation(
             suggested_retry: List[Dict[str, Any]] = []
             course_summary_retry: Dict[str, Any] = {}
             if isinstance(data_retry, dict):
-                suggested_retry = normalize_suggested_units(data_retry.get("SuggestedUnits"), units=validated_units)
-                suggested_retry = clean_all_suggested_units(suggested_retry)
-                cs2 = data_retry.get("CourseSummary")
-                if isinstance(cs2, dict):
-                    course_summary_retry = cs2
+                # Try unit-aware schema first if we used unit-aware PASS 3
+                if validated_units and "UnitChapters" in data_retry:
+                    suggested_retry, course_summary_retry = parse_unit_aware_response(
+                        data_retry, validated_units
+                    )
+                    suggested_retry = clean_all_suggested_units(suggested_retry)
+                
+                # Fallback to original SuggestedUnits schema
+                if not suggested_retry:
+                    suggested_retry = normalize_suggested_units(data_retry.get("SuggestedUnits"), units=validated_units)
+                    suggested_retry = clean_all_suggested_units(suggested_retry)
+                    cs2 = data_retry.get("CourseSummary")
+                    if isinstance(cs2, dict):
+                        course_summary_retry = cs2
             elif isinstance(data_retry, list):
-                # interpret top-level list as SuggestedUnits
                 suggested_retry = normalize_suggested_units(data_retry, units=validated_units)
                 suggested_retry = clean_all_suggested_units(suggested_retry)
             else:
                 suggested_retry = []
+                
             if suggested_retry:
                 suggested_units_structured = suggested_retry
                 if course_summary_retry:
