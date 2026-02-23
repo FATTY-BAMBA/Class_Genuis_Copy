@@ -2597,12 +2597,17 @@ Key Takeaways:
             system_message=MCQ_SYSTEM_MESSAGE,
             user_message=final_mcq_prompt,
             model=model,
-            max_tokens=4096,
+            max_tokens=12000,
             temperature=0.2,
             top_p=0.9
         )
         mcq_output = extract_text_from_response(mcq_response, service_type)
         mcqs = parse_mcq_response(mcq_output, force_traditional=config.force_traditional)
+        if len(mcqs) < actual_num_questions:
+            logger.warning(
+                f"⚠️ Generated {len(mcqs)}/{actual_num_questions} MCQs "
+                f"(possible output truncation or LLM undergeneration)"
+            )
 
         # Post-processing
         mcqs = postprocess_mcqs(
