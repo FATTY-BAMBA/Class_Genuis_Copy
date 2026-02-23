@@ -49,7 +49,10 @@ def validate_units_relevance(
     content_analysis: Dict,
     chapters: Dict[str, str],
     video_title: str,
-    threshold: float = None
+    threshold: float = None,
+    structure_analysis: str = None,
+    modules_analysis: str = None,
+    section_title: str = None,
 ) -> Tuple[bool, float, str]:
     """
     Validate if client-provided units are relevant to video content.
@@ -100,29 +103,53 @@ def validate_units_relevance(
         logger.warning("⚠️  Units provided but have no titles")
         return True, 1.0, "Units have no titles"
     
-    # Build content summary from Pass 1 analysis
-    main_topics = content_analysis.get("main_topics", [])[:5]  # Top 5
-    key_concepts = content_analysis.get("key_concepts", [])[:10]  # Top 10
-    technical_terms = content_analysis.get("technical_terms", [])[:10]  # Top 10
+    # Build rich content description from ALL available sources
+    main_topics = content_analysis.get("main_topics", [])[:8] if content_analysis else []
+    key_concepts = content_analysis.get("key_concepts", [])[:10] if content_analysis else []
+    technical_terms = content_analysis.get("technical_terms", [])[:10] if content_analysis else []
+    chapter_titles = list(chapters.values())[:8] if chapters else []
     
-    # Sample chapter titles
-    chapter_titles = []
-    if chapters:
-        chapter_titles = [title for title in list(chapters.values())[:5]]
+    # Build multi-source content description
+    content_parts = []
+    if video_title:
+        content_parts.append(f"影片標題: {video_title}")
+    if section_title:
+        content_parts.append(f"課程章節: {section_title}")
+    if main_topics:
+        content_parts.append(f"主要主題: {', '.join(str(t) for t in main_topics)}")
+    if key_concepts:
+        content_parts.append(f"核心概念: {', '.join(str(c) for c in key_concepts)}")
+    if technical_terms:
+        content_parts.append(f"專業術語: {', '.join(str(t) for t in technical_terms)}")
+    if chapter_titles:
+        content_parts.append(f"章節樣本: {', '.join(chapter_titles[:5])}")
     
-    content_summary = {
-        "video_title": video_title or "未提供",
-        "main_topics": main_topics,
-        "key_concepts": key_concepts,
-        "technical_terms": technical_terms,
-        "chapter_samples": chapter_titles
-    }
+    # Include raw Pass 1/2 analysis text (the real content signal!)
+    if structure_analysis:
+        content_parts.append(f"課程結構分析:\n{structure_analysis[:1200]}")
+    if modules_analysis:
+        content_parts.append(f"學習模組分析:\n{modules_analysis[:1200]}")
     
-    # Build validation prompt
+    # Fallback: use any summary-like fields from content_analysis
+    if not content_parts or len(''.join(content_parts)) < 50:
+        for key in ("topic", "core_content", "learning_objectives",
+                     "structure_summary", "modules_summary"):
+            val = content_analysis.get(key, "") if content_analysis else ""
+            if val and isinstance(val, str):
+                content_parts.append(val[:500])
+    
+    content_description = "\n\n".join(content_parts)
+    
+    # Guard: don't waste an LLM call on empty content — fail open
+    if not content_description.strip() or len(content_description) < 30:
+        logger.warning("⚠️ Insufficient content for validation — accepting units (fail-open)")
+        return True, 0.75, "Insufficient content for validation"
+    
+    # Build validation prompt with rich content
     prompt = f"""你是教育內容驗證專家。請評估提供的學習單元是否與影片實際內容相關。
 
-影片內容摘要：
-{json.dumps(content_summary, ensure_ascii=False, indent=2)}
+影片內容資訊：
+{content_description}
 
 提供的學習單元：
 {chr(10).join(f"{i+1}. {title}" for i, title in enumerate(unit_titles))}
@@ -136,6 +163,9 @@ def validate_units_relevance(
    - 0.6-0.8: 高度相關（例如：主題一致，內容吻合）
    - 0.8-1.0: 完美匹配（例如：單元精確對應影片章節）
 3. 簡短原因說明（30字內）
+
+重要：即使學習單元只涵蓋影片的部分內容（例如影片有8個主題，單元只涵蓋其中3個），
+只要單元確實與影片內容相關，就應給予較高評分（0.6+）。
 
 請務必以 JSON 格式回答（不要包含其他文字）：
 {{
@@ -1184,8 +1214,11 @@ def build_mcq_prompt_v2(
 你是一位資深的教學設計專家，負責為「{global_summary.splitlines()[0] if global_summary else "各種科目"}」課程設計高品質的多選題（MCQ）。請嚴格依照下列規則出題，並**僅**輸出 JSON。
 
 ### 核心原則
-- **問題必須基於對逐字稿的整體理解**，而非孤立的單句。首先分析整段文本的 5-8 個核心主題與教學目標，再據此設計題目。
-- **測試深度理解**：問題應促使學生應用、分析、評估所學，而不僅是回憶事實。
+### 核心原則（嚴格遵守）
+- **問題必須基於講師實際說過的內容**。禁止憑一般知識出題。每道題的正確答案必須能在逐字稿中找到明確依據。
+- **測試深度理解**：問題應促使學生應用、分析、評估所學，而非僅回憶孤立事實。
+- **禁止泛用題**：不接受可以在任何同類課程中使用的通用題目。每題必須包含本講座特有的術語、案例、數字或觀點。
+- **引用講師原話**：在解釋 (explanation) 中，明確指出「講師提到…」或「根據逐字稿…」來錨定答案來源。
 
 ### 資料來源優先序
 1) **ASR 逐字稿（主要依據）**：所有題目必須基於此內容。
@@ -1204,7 +1237,10 @@ def build_mcq_prompt_v2(
 ### 題目品質指引
 - **選項設計**：生成 4 個具備「迷惑性」的選項。錯誤選項必須基於**常見的學生錯誤、實務上的誤解或容易混淆的概念**。避免無關或明顯錯誤的玩笑式選項。
 - **難度比例**：30% easy / 40% medium / 30% hard。
-- **解釋說明**：每題的解釋必須包含「為何正確」以及「常見的錯誤選擇及其原因」。
+- **解釋說明**：每題的解釋必須包含：
+  1) 「為何正確」— 引用逐字稿中的具體內容（如「講師在 XX:XX 提到…」或「根據課程中的說明…」）
+  2) 「常見的錯誤選擇及其原因」— 至少說明 1 個干擾項為何看似正確但不是
+  3) 補充知識（可選）— 幫助學生延伸理解
 - **主題標籤**：`topic` 字段應標明該題測驗的具體知識點（e.g., `Python列表索引`, `色彩理論`, `Facebook廣告受眾設定`）。
 - **標籤生成**：為每題生成 3-5 個相關標籤（tags），涵蓋核心概念、技術、應用場景。標籤應具體且有助於分類和搜索。
 - **課程類型判斷**：根據題目內容自動判斷並標記課程類型（course_type）。
@@ -1234,6 +1270,12 @@ def build_mcq_prompt_v2(
     }}
   ]
 }}
+
+### ⚠️ 出題品質自我檢查（生成每題前自問）
+1. 這個問題的答案能在逐字稿中找到嗎？（必須能 → 否則刪除此題）
+2. 這題是否只適用於本講座？（必須是 → 若任何同類課程都能回答，則太泛用）
+3. 干擾選項是否基於真實的學生錯誤？（必須是 → 非隨機或玩笑式選項）
+4. 解釋是否引用了逐字稿內容？（必須有 → 不可純粹依賴一般知識）
 
 ### 輸入資料
 ## ASR 逐字稿（主要依據）
