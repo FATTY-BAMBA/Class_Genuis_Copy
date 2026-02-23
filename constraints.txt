@@ -6,6 +6,7 @@
 packaging>=20.0
 
 # Torch stack - CRITICAL: PyTorch 2.1.2 for EasyOCR + CUDA 11.8 + cuDNN 8.7 compatibility
+# These constraints PREVENT any dependency from silently upgrading torch
 torch==2.1.2
 torchvision==0.16.2
 torchaudio==2.1.2
@@ -20,7 +21,6 @@ accelerate>=1.1.1
 optimum>=1.22.0
 peft>=0.17.1
 safetensors>=0.4.5
-
 openai==1.55.3
 # faster-whisper==0.10.1  # Commented out - installed separately in Dockerfile
 google-generativeai==0.8.3
@@ -32,7 +32,8 @@ rich==13.9.4
 # Imaging / vision
 opencv-python-headless==4.7.0.72
 pillow==9.5.0
-easyocr==1.7.1
+# CRITICAL: easyocr 1.7.0 — matches Dockerfile, compatible with cuDNN 8.7
+easyocr==1.7.0
 imgaug==0.4.0
 
 # OCR / misc deps
@@ -45,7 +46,7 @@ openpyxl==3.1.5
 pdf2docx==0.5.8
 premailer==3.10.0
 rapidfuzz==3.13.0
-visualdl==2.5.3
+# REMOVED: visualdl==2.5.3 — pulls PaddlePaddle deps causing cuDNN 9 mismatch
 
 # Critical pins to avoid segfaults / ABI issues - ALIGNED WITH REQUIREMENTS
 # CRITICAL: NumPy 1.26.4 is required for PyTorch 2.1.2 (will crash with NumPy 2.x)
@@ -68,7 +69,6 @@ redis==6.0.0
 celery==5.5.2
 billiard==4.2.1
 vine==5.1.0
-
 ffmpeg-python==0.2.0
 pydub==0.25.1
 pytz==2023.3.post1
