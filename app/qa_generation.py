@@ -2599,7 +2599,8 @@ Key Takeaways:
             model=model,
             max_tokens=12000,
             temperature=0.2,
-            top_p=0.9
+            top_p=0.9,
+            force_json=(service_type == "openai")  # Prevent early stopping
         )
         mcq_output = extract_text_from_response(mcq_response, service_type)
         mcqs = parse_mcq_response(mcq_output, force_traditional=config.force_traditional)
