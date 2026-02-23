@@ -227,6 +227,91 @@ def clean_chapter_titles(chapters: Dict[str, str]) -> Dict[str, str]:
         cleaned[ts] = title 
     return cleaned
 
+def clean_suggested_unit_title(title: str, max_length: int = 50) -> str:
+    """
+    Clean a SuggestedUnit title for client delivery.
+    Removes raw ASR fragments, verbose descriptions, and redundant repetitions.
+    """
+    if not title or not isinstance(title, str):
+        return title or ""
+    
+    title = title.strip()
+    
+    if " - " in title:
+        parts = title.split(" - ", 1)
+        category = parts[0].strip()
+        subtitle = parts[1].strip()
+        
+        # Raw ASR speech markers → drop subtitle
+        raw_markers = [
+            '會跟你', '跟你們', '我們來', '我們要', '你們要',
+            '今天是', '第一天', '第一次', '接下來',
+            '那個', '這個', '就是', '所以', '然後',
+            '好的', '好了', '對不對', '是不是',
+            '老師', '大家', '開賣',
+        ]
+        has_raw = any(m in subtitle for m in raw_markers)
+        
+        # Verbose instructional phrases → drop subtitle
+        verbose_markers = ['學生', '應能', '在課堂上', '將所學', '進行',
+                           '深入講解', '掌握基本', '利用']
+        has_verbose = any(m in subtitle for m in verbose_markers)
+        
+        # Category repeats in subtitle → redundant
+        has_redundancy = category in subtitle
+        
+        # Short clean subtitle (≤12 chars, no markers) → keep as-is
+        is_clean = (len(subtitle) <= 12
+                    and not has_raw
+                    and not has_verbose
+                    and not has_redundancy)
+        
+        if is_clean:
+            title = f"{category} - {subtitle}"
+        elif has_raw:
+            title = category
+        elif has_redundancy:
+            remainder = subtitle.replace(category, '').strip()
+            remainder = re.sub(r'^[的與和及：:]+', '', remainder).strip()
+            remainder = re.sub(r'[的與和及]+$', '', remainder).strip()
+            if remainder and 2 <= len(remainder) <= 10:
+                title = f"{category} - {remainder}"
+            else:
+                title = category
+        elif has_verbose or len(subtitle) > 15:
+            title = category
+        else:
+            title = f"{category} - {subtitle}"
+    
+    # Pure raw ASR sentence (no " - " prefix)
+    elif len(title) > 15:
+        markers = ['，', '。', '同學', '老師', '今天', '第一天',
+                   '你們', '我們', '上課']
+        if any(m in title for m in markers):
+            for delim in ['，', '、', '。']:
+                if delim in title:
+                    first = title.split(delim)[0].strip()
+                    if 4 <= len(first) <= max_length:
+                        title = first
+                        break
+    
+    if len(title) > max_length:
+        title = title[:max_length - 1] + "…"
+    
+    return title or "章節"
+
+
+def clean_all_suggested_units(suggested_units: list) -> list:
+    """Clean all SuggestedUnit titles. Call before building client payload."""
+    if not suggested_units:
+        return suggested_units
+    cleaned = [
+        {**unit, "Title": clean_suggested_unit_title(unit.get("Title", ""))}
+        for unit in suggested_units
+    ]
+    logger.info(f"🧹 Cleaned {len(cleaned)} SuggestedUnit titles")
+    return cleaned
+
 def count_tokens_llama(text: str) -> int:
     """Approximate token counting for mixed Chinese/English (≈1 token per CJK char; 1/4 per other chars)"""
     if not text:
@@ -1630,12 +1715,28 @@ def hierarchical_multipass_generation(
             
             logger.info(f"Validating {len(bare_units)} client units against video content...")
             
-            # Build a lightweight content dict from PASS 1+2 output
-            # (course_summary doesn't exist yet — it comes from PASS 3)
+            # Build content dict with the SAME KEYS that validate_units_relevance reads
+            # Also extract topic names from modules_text for main_topics list
+            _module_topics = []
+            for _line in (modules_text or "").splitlines():
+                _line_s = _line.strip()
+                if "~" in _line_s:
+                    _parts = _line_s.split("~")
+                    _topic = _parts[0].strip()
+                    _topic = re.sub(r'^模塊\d+[：:]\s*', '', _topic)
+                    _topic = re.sub(r'^\d+\.\s*', '', _topic)
+                    if _topic and len(_topic) >= 2:
+                        _module_topics.append(_topic)
+                elif "@" in _line_s:
+                    _parts = _line_s.split("@")
+                    _topic = re.sub(r'^\d+\.\s*', '', _parts[0].strip())
+                    if _topic and len(_topic) >= 2:
+                        _module_topics.append(_topic)
+            
             content_from_passes = {
-                "topic": section_title or video_title or "",
-                "core_content": structure_text[:500] if structure_text else "",
-                "learning_objectives": modules_text[:500] if modules_text else "",
+                "main_topics": _module_topics[:8],
+                "key_concepts": [],
+                "technical_terms": [],
             }
             
             is_valid, score, reason = validate_units_relevance(
@@ -1643,7 +1744,10 @@ def hierarchical_multipass_generation(
                 content_analysis=content_from_passes,
                 chapters={},
                 video_title=video_title or "",
-                threshold=UNIT_VALIDATION_THRESHOLD
+                threshold=UNIT_VALIDATION_THRESHOLD,
+                structure_analysis=structure_text,
+                modules_analysis=modules_text,
+                section_title=section_title,
             )
             
             unit_validation_result = {
@@ -1851,11 +1955,13 @@ def hierarchical_multipass_generation(
     course_summary: Dict[str, Any] = {}
 
     # 1) Only treat dict-shaped JSON as valid for your schema
+    # 1) Only treat dict-shaped JSON as valid for your schema
     if isinstance(data, dict):
         suggested_units_structured = normalize_suggested_units(
             data.get("SuggestedUnits"),
             units=validated_units
         )
+        suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
 
         cs = data.get("CourseSummary")
         if isinstance(cs, dict):
@@ -1867,9 +1973,8 @@ def hierarchical_multipass_generation(
                     course_summary[k] = to_traditional(v)
     elif isinstance(data, list):
         # Fallback behavior if model outputs a top-level list.
-        # You can either ignore it or try to interpret it as SuggestedUnits directly.
-        # This tries to interpret it as SuggestedUnits:
         suggested_units_structured = normalize_suggested_units(data, units=validated_units)
+        suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
         
     # 2) Warning should be outside the "if isinstance(data, dict)" block
     if units:
@@ -1937,12 +2042,14 @@ def hierarchical_multipass_generation(
             course_summary_retry: Dict[str, Any] = {}
             if isinstance(data_retry, dict):
                 suggested_retry = normalize_suggested_units(data_retry.get("SuggestedUnits"), units=validated_units)
+                suggested_retry = clean_all_suggested_units(suggested_retry)
                 cs2 = data_retry.get("CourseSummary")
                 if isinstance(cs2, dict):
                     course_summary_retry = cs2
             elif isinstance(data_retry, list):
                 # interpret top-level list as SuggestedUnits
                 suggested_retry = normalize_suggested_units(data_retry, units=validated_units)
+                suggested_retry = clean_all_suggested_units(suggested_retry)
             else:
                 suggested_retry = []
             if suggested_retry:
