@@ -51,7 +51,7 @@ rapidfuzz==3.13.0
 # Critical pins to avoid segfaults / ABI issues - ALIGNED WITH REQUIREMENTS
 # CRITICAL: NumPy 1.26.4 is required for PyTorch 2.1.2 (will crash with NumPy 2.x)
 numpy==1.26.4
-PyMuPDF==1.19.0
+PyMuPDF>=1.23.0
 python-docx==1.2.0
 protobuf>=3.20.0,<4
 
