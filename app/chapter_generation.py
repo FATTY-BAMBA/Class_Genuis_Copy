@@ -114,7 +114,7 @@ def get_content_hash(transcript: str, ocr_context: str, duration: float) -> str:
 CHAPTER_LINE_RE = re.compile(
     r"""
     ^\s*
-    (?:[\-\*\u2022]\s*)?
+    (?:[\-\*•]\s*)?
     \[?(?P<ts>\d{1,2}:\d{2}(?::\d{2})?)\]?\s*
     (?:[\-–—:]\s*)?
     (?P<title>.+?)
@@ -204,7 +204,7 @@ def sec_to_hms(sec: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def _is_cjk(ch: str) -> bool:
-    return '\u4e00' <= ch <= '\u9fff'
+    return '一' <= ch <= '鿿'
 
 def clean_chapter_titles(chapters: Dict[str, str]) -> Dict[str, str]:
     """
@@ -218,7 +218,7 @@ def clean_chapter_titles(chapters: Dict[str, str]) -> Dict[str, str]:
         title = original_title
         for word in filler_words:
             title = title.replace(word, '')
-        title = re.sub(r'[。，“”、！？\.!?,]+$', '', title.strip())
+        title = re.sub(r'[。，""、！？\.!?,]+$', '', title.strip())
         title = re.sub(r'\s+', ' ', title)
 
         # If cleaning made it too short, revert to the original
@@ -338,6 +338,171 @@ def truncate_text_by_tokens(text: str, max_tokens: int = 120_000) -> str:
         truncated += sentence
         current_tokens += sentence_tokens
     return truncated
+
+def stratified_sample_asr(
+    raw_asr_text: str,
+    duration_sec: int,
+    token_budget: int = 100_000,
+    bucket_sec: int = 300,
+    lines_per_bucket: int = 3,
+    head_tail_sec: int = 120,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Time-bucket sampling of ASR transcript for full timeline coverage.
+    Instead of truncating from the beginning, selects representative lines
+    from each time bucket across the entire video.
+    
+    Returns: (sampled_asr_text, sampler_stats)
+    """
+    if not raw_asr_text:
+        return "", {"method": "empty", "lines_selected": 0}
+    
+    # If already within budget, return as-is
+    if count_tokens_llama(raw_asr_text) <= token_budget:
+        return raw_asr_text, {
+            "method": "full_transcript",
+            "lines_selected": len(raw_asr_text.splitlines()),
+            "within_budget": True,
+        }
+    
+    # Parse ASR lines into (seconds, full_line_text)
+    parsed_lines: List[Tuple[int, str]] = []
+    for line in raw_asr_text.splitlines():
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        m = ASR_TS_RE.match(line_stripped)
+        if m:
+            ts = _normalize_ts(m.group(1))
+            sec = ts_to_seconds_hms(ts)
+            if sec >= 0:
+                parsed_lines.append((sec, line_stripped))
+        else:
+            # Non-timestamped line — attach to previous timestamp
+            if parsed_lines:
+                prev_sec, prev_text = parsed_lines[-1]
+                parsed_lines[-1] = (prev_sec, prev_text + "\n" + line_stripped)
+    
+    if not parsed_lines:
+        return truncate_text_by_tokens(raw_asr_text, token_budget), {
+            "method": "fallback_truncate",
+            "reason": "no_timestamps_found",
+        }
+    
+    # Cue phrases that signal topic transitions (high-value lines)
+    CUE_PATTERNS = re.compile(
+        r'接下來|總結|重點|小結|我們來看|現在開始|休息|'
+        r'第[一二三四五六七八九十\d]+[個部章節]|'
+        r'Q\s*&?\s*A|問[與和]答|'
+        r'首先|其次|最後|'
+        r'這個部分|下一個|進入'
+    )
+    
+    # Create time buckets
+    max_sec = max(sec for sec, _ in parsed_lines)
+    effective_duration = max(max_sec, duration_sec)
+    num_buckets = max(1, effective_duration // bucket_sec + 1)
+    
+    # Assign lines to buckets
+    buckets: Dict[int, List[Tuple[int, str, bool]]] = {}
+    for sec, text in parsed_lines:
+        bucket_idx = min(sec // bucket_sec, num_buckets - 1)
+        is_cue = bool(CUE_PATTERNS.search(text))
+        if bucket_idx not in buckets:
+            buckets[bucket_idx] = []
+        buckets[bucket_idx].append((sec, text, is_cue))
+    
+    # Select lines from each bucket
+    selected: List[Tuple[int, str]] = []
+    head_cutoff = head_tail_sec
+    tail_cutoff = max(0, effective_duration - head_tail_sec)
+    
+    for bucket_idx in sorted(buckets.keys()):
+        bucket_lines = buckets[bucket_idx]
+        bucket_start_sec = bucket_idx * bucket_sec
+        
+        # Always include first line in bucket (anchor)
+        picks: List[Tuple[int, str]] = [(bucket_lines[0][0], bucket_lines[0][1])]
+        
+        # Add cue lines (topic transitions)
+        cue_lines = [(sec, text) for sec, text, is_cue in bucket_lines if is_cue]
+        for cl in cue_lines[:2]:  # max 2 cue lines per bucket
+            if cl not in picks:
+                picks.append(cl)
+        
+        # If in head or tail window, include more lines
+        if bucket_start_sec < head_cutoff or bucket_start_sec >= tail_cutoff:
+            for sec, text, _ in bucket_lines[:lines_per_bucket + 2]:
+                entry = (sec, text)
+                if entry not in picks:
+                    picks.append(entry)
+        
+        # Cap per bucket
+        for p in picks[:lines_per_bucket + 2]:
+            selected.append(p)
+    
+    # Sort by time, deduplicate
+    selected.sort(key=lambda x: x[0])
+    seen_texts = set()
+    deduped: List[Tuple[int, str]] = []
+    for sec, text in selected:
+        # Normalize for dedup (first 50 chars)
+        norm = text[:50].strip()
+        if norm not in seen_texts:
+            seen_texts.add(norm)
+            deduped.append((sec, text))
+    
+    # Trim to token budget (drop from middle if needed, keep head + tail)
+    result_text = "\n".join(text for _, text in deduped)
+    if count_tokens_llama(result_text) <= token_budget:
+        sampler_stats = {
+            "method": "stratified_time_bucket",
+            "duration_sec": effective_duration,
+            "bucket_sec": bucket_sec,
+            "num_buckets": num_buckets,
+            "buckets_with_data": len(buckets),
+            "lines_selected": len(deduped),
+            "head_tail_sec": head_tail_sec,
+            "final_tokens": count_tokens_llama(result_text),
+        }
+        return result_text, sampler_stats
+    
+    # Still over budget — trim from middle, preserve head and tail
+    head_count = len(deduped) // 4
+    tail_count = len(deduped) // 4
+    head_lines = deduped[:head_count]
+    tail_lines = deduped[-tail_count:] if tail_count > 0 else []
+    middle_lines = deduped[head_count:len(deduped) - tail_count if tail_count > 0 else len(deduped)]
+    
+    # Keep adding middle lines until we hit budget
+    final_lines = list(head_lines)
+    remaining_budget = token_budget - count_tokens_llama("\n".join(t for _, t in head_lines)) - count_tokens_llama("\n".join(t for _, t in tail_lines))
+    
+    for sec, text in middle_lines:
+        line_tokens = count_tokens_llama(text)
+        if remaining_budget - line_tokens < 0:
+            break
+        final_lines.append((sec, text))
+        remaining_budget -= line_tokens
+    
+    final_lines.extend(tail_lines)
+    final_lines.sort(key=lambda x: x[0])
+    
+    result_text = "\n".join(text for _, text in final_lines)
+    
+    sampler_stats = {
+        "method": "stratified_time_bucket",
+        "duration_sec": effective_duration,
+        "bucket_sec": bucket_sec,
+        "num_buckets": num_buckets,
+        "buckets_with_data": len(buckets),
+        "lines_selected": len(final_lines),
+        "head_tail_sec": head_tail_sec,
+        "final_tokens": count_tokens_llama(result_text),
+        "trimmed_from_middle": True,
+    }
+    return result_text, sampler_stats
+
 
 # ─────────────────────────
 # Chapter policy & parsing
@@ -581,58 +746,25 @@ def normalize_suggested_units(
         su["UnitNo"] = i
     return out
 
+
+# ─── FIX 4: Multi-Segment Unit Timestamps ───
 def back_calculate_unit_timestamps(
     suggested_units_structured: List[Dict[str, Any]],
-    client_units: Optional[List[Dict[str, Any]]]
+    client_units: Optional[List[Dict[str, Any]]],
+    gap_merge_sec: int = 900,  # 15 min: merge segments closer than this
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Back-calculate timestamps for client's Units based on SuggestedUnits mapping.
-    Also validates logical order and provides diagnostics.
+    Back-calculate timestamps for client Units, supporting multi-segment/interleaving.
     
-    Args:
-        suggested_units_structured: AI-generated chapters with ClientUnitNo mapping
-        client_units: Original Units from client (can be None/empty)
-        
+    A client unit can appear in multiple non-contiguous segments of the video.
+    Each segment is a continuous run of chapters tagged to that unit.
+    
     Returns:
         Tuple of:
-        - enriched_units: Units with timestamps and metadata
+        - enriched_units: Units with Time, Segments, and metadata
         - diagnostics: Validation results and statistics
-        
-    Example:
-        Input client_units:
-        [
-            {"UnitNo": 1, "Title": "廚具規劃"},
-            {"UnitNo": 2, "Title": "天花板大樣圖"},
-            {"UnitNo": 3, "Title": "冷氣配置"}
-        ]
-        
-        Input suggested_units_structured:
-        [
-            {UnitNo: 1, Title: "廚房三角原理", Time: "00:05:10", ClientUnitNo: 1},
-            {UnitNo: 2, Title: "廚具尺寸標準", Time: "00:18:30", ClientUnitNo: 1},
-            {UnitNo: 3, Title: "大樣圖規範", Time: "00:32:15", ClientUnitNo: 2},
-            ...
-        ]
-        
-        Output enriched_units:
-        [
-            {
-                "UnitNo": 1,
-                "Title": "廚具規劃",
-                "Time": "00:05:10",  # First SuggestedUnit with ClientUnitNo=1
-                "EndTime": "00:32:15",
-                "Duration": "00:27:05",
-                "SuggestedUnitCount": 2,
-                "FirstChapter": "廚房工作三角原理與動線設計",
-                "LastChapter": "廚具尺寸標準與人體工學考量"
-            },
-            ...
-        ]
     """
-    
-    # Handle case where no Units provided
     if not client_units:
-        logger.info("ℹ️ No client Units provided - skipping Unit timestamp back-calculation")
         return [], {
             "units_provided": False,
             "validation_passed": True,
@@ -640,160 +772,155 @@ def back_calculate_unit_timestamps(
         }
     
     if not suggested_units_structured:
-        logger.warning("⚠️ No SuggestedUnits generated - cannot back-calculate Unit timestamps")
         return client_units, {
             "units_provided": True,
             "validation_passed": False,
             "error": "No SuggestedUnits available for mapping"
         }
     
-    # Build mapping: ClientUnitNo -> list of SuggestedUnits
+    # Build mapping: ClientUnitNo -> list of chapter times (sorted)
     unit_chapters_map: Dict[int, List[Dict[str, Any]]] = {}
-    unmapped_chapters: List[Dict[str, Any]] = []
+    unmapped_chapters = 0
+    ext_chapters = 0
+    admin_chapters = 0
     
     for su in suggested_units_structured:
         client_unit_no = su.get("ClientUnitNo")
-        
         if client_unit_no is None:
-            unmapped_chapters.append(su)
-            continue
-        
-        if client_unit_no not in unit_chapters_map:
-            unit_chapters_map[client_unit_no] = []
-        
-        unit_chapters_map[client_unit_no].append(su)
+            unmapped_chapters += 1
+        elif client_unit_no == 0:
+            ext_chapters += 1
+        elif client_unit_no == -1:
+            admin_chapters += 1
+        elif client_unit_no > 0:
+            if client_unit_no not in unit_chapters_map:
+                unit_chapters_map[client_unit_no] = []
+            unit_chapters_map[client_unit_no].append(su)
     
-    # Sort chapters within each Unit by time
+    # Sort chapters within each unit by time
     for unit_no in unit_chapters_map:
-        unit_chapters_map[unit_no].sort(
-            key=lambda x: ts_to_seconds_hms(x["Time"])
-        )
+        unit_chapters_map[unit_no].sort(key=lambda x: ts_to_seconds_hms(x.get("Time", "")))
     
-    # Enrich client units with timestamps and metadata
+    # Enrich client units
     enriched_units = []
-    validation_issues = []
+    units_with_multiple_segments = 0
     
-    for i, unit in enumerate(client_units):
+    for unit in client_units:
         unit_no = unit.get("UnitNo")
-        enriched_unit = dict(unit)  # Copy original
+        enriched_unit = dict(unit)
         
         if unit_no not in unit_chapters_map:
-            # Unit not found in video
-            logger.warning(
-                f"⚠️ Unit {unit_no} ('{unit.get('Title')}') has NO mapped chapters in video!"
-            )
+            logger.warning(f"⚠️ Unit {unit_no} ('{unit.get('Title')}') has NO mapped chapters in video!")
             enriched_unit.update({
                 "Time": "",
                 "EndTime": None,
                 "Duration": None,
                 "SuggestedUnitCount": 0,
+                "Segments": [],
                 "FirstChapter": None,
-                "LastChapter": None
-            })
-            validation_issues.append({
-                "unit_no": unit_no,
-                "issue": "not_found",
-                "message": f"Unit '{unit.get('Title')}' not found in video"
+                "LastChapter": None,
             })
             enriched_units.append(enriched_unit)
             continue
         
-        # Get chapters for this Unit
         chapters = unit_chapters_map[unit_no]
-        first_chapter = chapters[0]
-        last_chapter = chapters[-1]
         
-        # Calculate start time (first chapter of this Unit)
-        start_time = first_chapter["Time"]
-        start_sec = ts_to_seconds_hms(start_time)
+        # Build segments by merging adjacent chapters
+        segments: List[Dict[str, Any]] = []
+        current_segment_start = ts_to_seconds_hms(chapters[0].get("Time", ""))
+        current_segment_end = current_segment_start
+        current_segment_chapters: List[str] = [chapters[0].get("Title", "")]
         
-        # Calculate end time (first chapter of NEXT Unit, or None if last)
-        end_time = None
-        end_sec = None
-        duration_sec = None
+        for i in range(1, len(chapters)):
+            ch_sec = ts_to_seconds_hms(chapters[i].get("Time", ""))
+            if ch_sec < 0:
+                continue
+            
+            gap = ch_sec - current_segment_end
+            
+            if gap <= gap_merge_sec:
+                # Extend current segment
+                current_segment_end = ch_sec
+                current_segment_chapters.append(chapters[i].get("Title", ""))
+            else:
+                # Close current segment, start new one
+                segments.append({
+                    "Start": sec_to_hms(current_segment_start),
+                    "End": sec_to_hms(current_segment_end),
+                    "DurationSec": current_segment_end - current_segment_start,
+                    "ChapterCount": len(current_segment_chapters),
+                })
+                current_segment_start = ch_sec
+                current_segment_end = ch_sec
+                current_segment_chapters = [chapters[i].get("Title", "")]
         
-        if i + 1 < len(client_units):
-            next_unit_no = client_units[i + 1].get("UnitNo")
-            if next_unit_no in unit_chapters_map:
-                next_chapters = unit_chapters_map[next_unit_no]
-                end_time = next_chapters[0]["Time"]
-                end_sec = ts_to_seconds_hms(end_time)
-                duration_sec = end_sec - start_sec
+        # Close last segment
+        segments.append({
+            "Start": sec_to_hms(current_segment_start),
+            "End": sec_to_hms(current_segment_end),
+            "DurationSec": current_segment_end - current_segment_start,
+            "ChapterCount": len(current_segment_chapters),
+        })
+        
+        if len(segments) > 1:
+            units_with_multiple_segments += 1
+        
+        total_active_sec = sum(seg["DurationSec"] for seg in segments)
+        first_start = ts_to_seconds_hms(segments[0]["Start"])
+        last_end = ts_to_seconds_hms(segments[-1]["End"])
+        span_sec = last_end - first_start
         
         enriched_unit.update({
-            "Time": start_time,
-            "EndTime": end_time,
-            "Duration": sec_to_hms(duration_sec) if duration_sec else None,
+            "Time": segments[0]["Start"],  # Client-facing: earliest start
+            "EndTime": segments[-1]["End"],
+            "Duration": sec_to_hms(total_active_sec),
+            "SpanDuration": sec_to_hms(span_sec) if span_sec > 0 else None,
             "SuggestedUnitCount": len(chapters),
-            "FirstChapter": first_chapter["Title"],
-            "LastChapter": last_chapter["Title"]
+            "Segments": segments,
+            "IsContiguous": len(segments) == 1,
+            "FirstChapter": chapters[0].get("Title", ""),
+            "LastChapter": chapters[-1].get("Title", ""),
         })
         
         enriched_units.append(enriched_unit)
         
+        seg_info = f"{len(segments)} segment{'s' if len(segments) > 1 else ''}"
         logger.info(
-            f"✅ Unit {unit_no}: {unit['Title']}\n"
-            f"   → Starts at: {start_time}\n"
-            f"   → Contains: {len(chapters)} chapters\n"
-            f"   → First: {first_chapter['Title']}\n"
-            f"   → Last: {last_chapter['Title']}"
+            f"✅ Unit {unit_no}: {unit.get('Title')}\n"
+            f"   → {seg_info}, {len(chapters)} chapters\n"
+            f"   → Time: {segments[0]['Start']} → {segments[-1]['End']}\n"
+            f"   → Active: {sec_to_hms(total_active_sec)}"
         )
     
-    # Validate logical order
-    timestamps_valid = True
-    for i in range(len(enriched_units) - 1):
-        current = enriched_units[i]
-        next_unit = enriched_units[i + 1]
-        
-        if not current.get("Time") or not next_unit.get("Time"):
-            continue
-        
-        current_sec = ts_to_seconds_hms(current["Time"])
-        next_sec = ts_to_seconds_hms(next_unit["Time"])
-        
-        if current_sec >= next_sec:
-            timestamps_valid = False
-            validation_issues.append({
-                "unit_no": current["UnitNo"],
-                "issue": "order_violation",
-                "message": f"Unit {current['UnitNo']} ({current['Time']}) should come before Unit {next_unit['UnitNo']} ({next_unit['Time']})"
-            })
-            logger.error(
-                f"❌ ORDER VIOLATION: Unit {current['UnitNo']} ({current['Time']}) >= "
-                f"Unit {next_unit['UnitNo']} ({next_unit['Time']})"
-            )
-    
-    # Build diagnostics
+    # Diagnostics (no ORDER VIOLATION for interleaving!)
     diagnostics = {
         "units_provided": True,
         "total_units": len(client_units),
         "units_found": sum(1 for u in enriched_units if u.get("Time")),
         "units_missing": sum(1 for u in enriched_units if not u.get("Time")),
+        "units_with_multiple_segments": units_with_multiple_segments,
         "total_suggested_units": len(suggested_units_structured),
-        "mapped_suggested_units": sum(len(chapters) for chapters in unit_chapters_map.values()),
-        "unmapped_suggested_units": len(unmapped_chapters),
-        "timestamps_valid": timestamps_valid,
-        "validation_issues": validation_issues
+        "mapped_to_client_units": sum(len(chs) for chs in unit_chapters_map.values()),
+        "ext_chapters": ext_chapters,
+        "admin_chapters": admin_chapters,
+        "unmapped_chapters": unmapped_chapters,
+        "validation_passed": True,  # No more ORDER VIOLATION errors
     }
     
-    # Log summary
     logger.info("\n" + "=" * 60)
     logger.info("📍 UNIT TIMESTAMP BACK-CALCULATION SUMMARY")
     logger.info("=" * 60)
     logger.info(f"✅ Units found: {diagnostics['units_found']}/{diagnostics['total_units']}")
-    logger.info(f"⚠️ Units missing: {diagnostics['units_missing']}/{diagnostics['total_units']}")
-    logger.info(f"📊 SuggestedUnits mapped: {diagnostics['mapped_suggested_units']}/{diagnostics['total_suggested_units']}")
-    logger.info(f"📊 SuggestedUnits unmapped: {diagnostics['unmapped_suggested_units']}")
-    logger.info(f"{'✅' if timestamps_valid else '❌'} Timestamp order: {'Valid' if timestamps_valid else 'INVALID'}")
-    
-    if validation_issues:
-        logger.warning(f"\n⚠️ {len(validation_issues)} validation issues found:")
-        for issue in validation_issues:
-            logger.warning(f"   - {issue['message']}")
-    
+    logger.info(f"⚠️ Units missing: {diagnostics['units_missing']}")
+    logger.info(f"🔀 Units with multiple segments: {units_with_multiple_segments}")
+    logger.info(f"📊 Chapters: {diagnostics['mapped_to_client_units']} mapped, "
+                f"{ext_chapters} EXT, {admin_chapters} ADMIN, {unmapped_chapters} unmapped")
     logger.info("=" * 60 + "\n")
     
     return enriched_units, diagnostics
+
+
+# ─── FIX 2: Bigram Quote Validator ───
 def validate_chapters_against_asr(
     suggested_units: List[Dict[str, Any]],
     raw_asr_text: str,
@@ -843,19 +970,54 @@ def validate_chapters_against_asr(
                 window_text += asr_text_line + " "
 
         if window_text:
-            quote_chars = set(quote)
-            overlap = sum(1 for c in quote_chars if c in window_text)
-            ratio = overlap / max(len(quote_chars), 1)
+            # Normalize: strip punctuation and whitespace for comparison
+            def _normalize_for_match(s: str) -> str:
+                return re.sub(r'[\s\u3000，。！？、；：""''（）\[\]【】…—\-\.\,\!\?\;\:\"\'\(\)]+', '', s)
+            
+            norm_quote = _normalize_for_match(quote)
+            norm_window = _normalize_for_match(window_text)
+            
+            # Check 1: Exact substring match (strongest signal)
+            if norm_quote in norm_window:
+                ratio = 1.0
+                match_method = "exact_substr"
+            else:
+                # Check 2: Bigram Jaccard similarity (good for Chinese)
+                def _bigrams(s: str) -> set:
+                    return {s[i:i+2] for i in range(len(s) - 1)} if len(s) >= 2 else {s}
+                
+                q_bigrams = _bigrams(norm_quote)
+                w_bigrams = _bigrams(norm_window)
+                
+                if q_bigrams and w_bigrams:
+                    intersection = q_bigrams & w_bigrams
+                    union = q_bigrams | w_bigrams
+                    ratio = len(intersection) / max(len(union), 1)
+                    match_method = "bigram_jaccard"
+                else:
+                    ratio = 0.0
+                    match_method = "empty"
+            
+            # Dynamic threshold based on quote length
+            if len(norm_quote) < 12:
+                threshold = 0.40  # Short quotes need higher similarity
+            elif len(norm_quote) < 20:
+                threshold = 0.30
+            else:
+                threshold = 0.20  # Longer quotes can tolerate lower Jaccard
         else:
             ratio = 0.0
+            threshold = 0.40
+            match_method = "no_window"
 
-        su["_quote_validated"] = ratio >= 0.4
-        if ratio < 0.4:
+        su["_quote_validated"] = ratio >= threshold
+        if ratio < threshold:
             hallucination_count += 1
             logger.warning(
                 f"⚠️ QUOTE VALIDATION FAILED: {ts} "
                 f"title='{su.get('Title', '')[:40]}' "
-                f"quote='{quote[:30]}...' match={ratio:.2f}"
+                f"quote='{quote[:30]}...' method={match_method} "
+                f"score={ratio:.2f} threshold={threshold:.2f}"
             )
 
         validated.append(su)
@@ -886,15 +1048,16 @@ def validate_chapters_against_asr(
     return validated, diagnostics
 
 
+# ─── FIX 3H: Updated strip_internal_fields ───
 def strip_internal_fields(suggested_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Strip internal fields (trigger_quote, _quote_validated) before client payload.
+    Strip internal fields (trigger_quote, _quote_validated, _tag_reason) before client payload.
     These must NEVER appear in webhook responses or client-facing output.
     """
     if not suggested_units:
         return suggested_units
 
-    INTERNAL_FIELDS = {"trigger_quote", "_quote_validated"}
+    INTERNAL_FIELDS = {"trigger_quote", "_quote_validated", "_tag_reason"}
 
     cleaned = []
     for su in suggested_units:
@@ -905,22 +1068,105 @@ def strip_internal_fields(suggested_units: List[Dict[str, Any]]) -> List[Dict[st
         cleaned.append(clean_su)
 
     return cleaned
+
+
+# ─── FIX 5: Chapter Window Index ───
+def build_chapter_windows(
+    suggested_units_structured: List[Dict[str, Any]],
+    raw_asr_text: str,
+    ocr_context: str = "",
+    pad_before_sec: int = 90,
+    pad_after_sec: int = 30,
+) -> List[Dict[str, Any]]:
+    """
+    Build per-chapter ASR+OCR text windows for downstream QA/notes generation.
     
+    Each window contains the ASR text from [chapter_start - pad_before] to 
+    [next_chapter_start + pad_after], plus any OCR content near that timestamp.
+    """
+    if not suggested_units_structured or not raw_asr_text:
+        return []
+    
+    # Parse ASR into (sec, text) pairs
+    asr_lines: List[Tuple[int, str]] = []
+    for line in raw_asr_text.splitlines():
+        m = ASR_TS_RE.match(line.strip())
+        if m:
+            ts = _normalize_ts(m.group(1))
+            sec = ts_to_seconds_hms(ts)
+            text = line.strip()[m.end():].strip().lstrip(':- ').strip()
+            if sec >= 0 and text:
+                asr_lines.append((sec, text))
+    
+    # Parse OCR if provided (simple timestamp-based)
+    ocr_lines: List[Tuple[int, str]] = []
+    if ocr_context:
+        for line in ocr_context.splitlines():
+            # Match "* HH:MM:SS：text" format
+            m_ocr = re.match(r'\*\s*(\d{2}:\d{2}:\d{2})[：:]\s*(.*)', line.strip())
+            if m_ocr:
+                sec = ts_to_seconds_hms(m_ocr.group(1))
+                text = m_ocr.group(2).strip()
+                if sec >= 0 and text:
+                    ocr_lines.append((sec, text))
+    
+    # Build windows
+    windows: List[Dict[str, Any]] = []
+    
+    for i, su in enumerate(suggested_units_structured):
+        ch_sec = ts_to_seconds_hms(su.get("Time", ""))
+        if ch_sec < 0:
+            continue
+        
+        # Determine window boundaries
+        window_start = max(0, ch_sec - pad_before_sec)
+        if i + 1 < len(suggested_units_structured):
+            next_sec = ts_to_seconds_hms(suggested_units_structured[i + 1].get("Time", ""))
+            if next_sec > 0:
+                window_end = next_sec + pad_after_sec
+            else:
+                window_end = ch_sec + 900  # 15 min default
+        else:
+            window_end = ch_sec + 1800  # Last chapter: 30 min window
+        
+        # Extract ASR text in window
+        asr_snippet = " ".join(
+            text for sec, text in asr_lines 
+            if window_start <= sec <= window_end
+        )
+        
+        # Extract OCR text in window
+        ocr_snippet = " ".join(
+            text for sec, text in ocr_lines
+            if window_start <= sec <= window_end
+        )
+        
+        windows.append({
+            "UnitNo": su.get("UnitNo"),
+            "Time": su.get("Time", ""),
+            "Title": su.get("Title", ""),
+            "ClientUnitNo": su.get("ClientUnitNo"),
+            "StartSec": window_start,
+            "EndSec": window_end,
+            "ASRTokens": count_tokens_llama(asr_snippet),
+            "ASRSnippet": asr_snippet[:5000],  # Cap per window for storage
+            "OCRSnippet": ocr_snippet[:2000] if ocr_snippet else "",
+        })
+    
+    logger.info(f"📖 Built {len(windows)} chapter windows (avg {sum(w['ASRTokens'] for w in windows) // max(len(windows), 1)} tokens/window)")
+    return windows
+
+
+# ─── FIX 3G: Updated suggested_units_to_chapters_dict (EXT/ADMIN aware) ───
 def suggested_units_to_chapters_dict(
     suggested_units: List[Dict[str, Any]],
     *,
     duration_sec: Optional[int] = None,
-    bump_limit_sec: int = 120,  # allow a bit more room than 59s
+    bump_limit_sec: int = 120,
 ) -> Dict[str, str]:
     """
     Convert SuggestedUnits -> chapters dict, preventing timestamp key collisions
     WITHOUT producing non-HH:MM:SS keys (so later validation won't drop them).
-
-    Strategy:
-    - Prefer the original HH:MM:SS.
-    - If already used, bump forward by +1..+bump_limit_sec.
-    - If still used, bump backward by -1..-bump_limit_sec.
-    - If still impossible, drop the duplicate with a warning.
     """
 
     def bump_ts(ts: str, delta: int) -> Optional[str]:
@@ -930,7 +1176,7 @@ def suggested_units_to_chapters_dict(
         bumped = base + delta
         if duration_sec is not None:
             if bumped < 0 or bumped > duration_sec - 1:
-                return None  # <-- don't clamp; reject
+                return None
         return sec_to_hms(bumped)
 
     chapters: Dict[str, str] = {}
@@ -941,7 +1187,14 @@ def suggested_units_to_chapters_dict(
         title = str(su.get("Title") or "").strip()
         cu = su.get("ClientUnitNo")
         cut = su.get("ClientUnitTitle")
-        prefix = f"[單元{cu}：{cut}] " if cu and cut else (f"[單元{cu}] " if cu else "")
+        # Only prefix with unit info for actual client units (positive numbers)
+        if cu is not None and isinstance(cu, int) and cu > 0 and cut:
+            prefix = f"[單元{cu}：{cut}] "
+        elif cu is not None and isinstance(cu, int) and cu > 0:
+            prefix = f"[單元{cu}] "
+        else:
+            # EXT (0), ADMIN (-1), or unmapped → no unit prefix
+            prefix = ""
 
         if not _is_hms(ts) or not title:
             continue
@@ -973,7 +1226,7 @@ def suggested_units_to_chapters_dict(
                     "⚠️ Could not place unique HH:MM:SS timestamp for chapter (ts=%s, title=%s). Dropping.",
                     ts, title[:80]
                 )
-                continue  # drop rather than create invalid key
+                continue
 
         used.add(candidate)
         chapters[candidate] = prefix + title
@@ -990,16 +1243,13 @@ def validate_and_normalize_timestamps(
     Validate and normalize chapter timestamps to ensure:
     1. All timestamps are in HH:MM:SS format
     2. All timestamps are within video duration
-    3. Timestamps are distributed across the video (not just first few minutes)
+    3. Timestamps are distributed across the video
     4. Suspicious clustering is detected and logged
-    
-    Returns: Cleaned and validated chapters dict
     """
     if not chapters:
         return {}
 
     def ts_to_seconds(ts: str) -> int:
-        """Convert HH:MM:SS to seconds. Return -1 if invalid."""
         try:
             parts = ts.split(':')
             if len(parts) == 3:
@@ -1020,15 +1270,13 @@ def validate_and_normalize_timestamps(
     timestamps_in_seconds = []
     
     for ts, title in chapters.items():
-        ts_normalized = _normalize_ts(ts)  # Ensure HH:MM:SS format
+        ts_normalized = _normalize_ts(ts)
         ts_sec = ts_to_seconds(ts_normalized)
         
-        # Check 1: Within video duration
         if ts_sec > duration_sec:
             logger.warning(f"⚠️ [{video_id}] Skipping chapter at {ts_normalized} ({ts_sec}s) - exceeds duration ({duration_sec}s)")
             continue
         
-        # Check 2: Not negative
         if ts_sec < 0:
             logger.warning(f"⚠️ [{video_id}] Skipping chapter at {ts_normalized} - invalid timestamp")
             continue
@@ -1040,7 +1288,6 @@ def validate_and_normalize_timestamps(
         logger.error(f"❌ [{video_id}] No valid chapters after timestamp validation!")
         return {}
     
-    # Check 3: Detect suspicious clustering (all chapters in first 10% of video)
     first_chapter_sec = min(timestamps_in_seconds)
     last_chapter_sec = max(timestamps_in_seconds)
     chapter_span_sec = last_chapter_sec - first_chapter_sec
@@ -1048,29 +1295,24 @@ def validate_and_normalize_timestamps(
     
     logger.info(f"📊 [{video_id}] Chapter span: {sec_to_hms(int(chapter_span_sec))} ({chapter_span_percent:.1f}% of video)")
     
-    # CRITICAL CHECK: If all chapters are in first 10% of video, something is wrong
-    if chapter_span_percent < 10 and duration_sec > 600:  # Only check for videos > 10 min
+    if chapter_span_percent < 10 and duration_sec > 600:
         logger.warning("=" * 70)
         logger.warning(f"⚠️  [{video_id}] SUSPICIOUS CHAPTER CLUSTERING DETECTED!")
         logger.warning(f"⚠️  All {len(validated)} chapters are in first {chapter_span_percent:.1f}% of video")
         logger.warning(f"⚠️  Video duration: {sec_to_hms(int(duration_sec))} ({duration_sec}s)")
         logger.warning(f"⚠️  Chapter range: {sec_to_hms(int(first_chapter_sec))} to {sec_to_hms(int(last_chapter_sec))}")
-        logger.warning(f"⚠️  This likely indicates LLM timestamp format confusion")
         logger.warning("=" * 70)
         
-        # Log first few chapters for debugging
         logger.warning(f"⚠️  Chapters generated:")
         for ts, title in sorted(validated.items(), key=lambda x: ts_to_seconds(x[0]))[:5]:
             logger.warning(f"     {ts} - {title[:60]}")
         if len(validated) > 5:
             logger.warning(f"     ... and {len(validated) - 5} more")
     
-    # Check 4: Detect if too many chapters are within first minute
     chapters_in_first_minute = sum(1 for ts_sec in timestamps_in_seconds if ts_sec < 60)
     if chapters_in_first_minute > len(timestamps_in_seconds) * 0.5:
         logger.warning(f"⚠️ [{video_id}] {chapters_in_first_minute}/{len(timestamps_in_seconds)} chapters in first 60 seconds - possible timestamp error")
     
-    # Summary
     logger.info(f"✅ [{video_id}] Validated {len(validated)}/{len(chapters)} chapters")
     logger.info(f"   First: {sec_to_hms(int(first_chapter_sec))} | Last: {sec_to_hms(int(last_chapter_sec))} | Span: {chapter_span_percent:.1f}%")
     
@@ -1086,16 +1328,10 @@ def globally_balance_chapters(
     """Balance chapters with content-aware merging"""
     
     def extract_module_tag(title: str) -> str:
-        """Extract [module] tag if present"""
         match = re.match(r'\[([^\]]+)\]', title)
         return match.group(1) if match else ""
 
     def ts_to_s(ts: str) -> int:
-        """
-        Convert a timestamp string to seconds.
-        Accepts: "MM:SS" or "HH:MM:SS"
-        Returns: seconds, or -1 if invalid
-        """
         try:
             p = ts.strip().split(":")
             if len(p) == 2:
@@ -1122,11 +1358,7 @@ def globally_balance_chapters(
     if not cands:
         return {}
 
-    # Content-aware deduplication
     dedup = []
-    # ✅ UNIVERSAL FIX: Scale merge threshold with video duration
-    # This prevents over-aggressive merging for long videos
-
     adaptive_min_gap = max(120, min_gap_sec // 2)
     
     logger.info(f"📊 Chapter balancing: {len(chapters)} input chapters, merge threshold = {adaptive_min_gap}s (policy min_gap: {min_gap_sec}s)")
@@ -1138,23 +1370,18 @@ def globally_balance_chapters(
             
         time_gap = s - dedup[-1][0]
         
-        # Merge if same module and close, or very close regardless
         should_merge = False
         prev_module = extract_module_tag(dedup[-1][2])
         curr_module = extract_module_tag(title)
         
-        # ✅ FIXED: Use adaptive threshold instead of hardcoded 120s
         if time_gap < adaptive_min_gap:
             should_merge = True
-    
         elif prev_module and curr_module and prev_module == curr_module:
-            # Same module tag - use min_gap_sec
             should_merge = time_gap < min_gap_sec * 0.7
-        elif time_gap < min_gap_sec // 2:  # Half the min_gap for different modules
+        elif time_gap < min_gap_sec // 2:
             should_merge = True
             
         if should_merge:
-            # Keep the better title (prefer tagged, then longer)
             prev_s, prev_ts, prev_title = dedup[-1]
             if curr_module and not prev_module:
                 dedup[-1] = (prev_s, prev_ts, title)
@@ -1165,13 +1392,11 @@ def globally_balance_chapters(
 
     t_low, t_high = target_range
     
-    # Log the balancing result
     logger.info(f"Chapter balancing: {len(chapters)} → {len(dedup)} (target: {t_low}-{t_high})")
     
     if t_low <= len(dedup) <= t_high:
         return {ts: title for _, ts, title in dedup}
 
-    # Too many chapters: choose representatives from each segment
     if len(dedup) > t_high:
         selected = []
         segment_length = max(1, duration_sec // t_high)
@@ -1180,14 +1405,12 @@ def globally_balance_chapters(
             segment_end = (i + 1) * segment_length if i < t_high - 1 else duration_sec + 1
             segment_chapters = [c for c in dedup if segment_start <= c[0] < segment_end]
             if segment_chapters:
-                # Pick the one closest to segment center
                 segment_center = (segment_start + segment_end) // 2
                 chosen = min(segment_chapters, key=lambda c: abs(c[0] - segment_center))
                 selected.append(chosen)
         selected.sort(key=lambda x: x[0])
         return {ts: title for _, ts, title in selected}
 
-    # Not enough chapters: just cap to max_caps
     return {ts: title for _, ts, title in dedup[:max_caps]}
 
 # ─────────────────────────
@@ -1200,7 +1423,6 @@ def load_ocr_segments(file_obj, filename: str) -> List[Dict]:
       - Wrapped JSON:      { "segments": [ {...}, ... ] }
       - JSON Lines (JSONL): one JSON object per line
       - Plain text (.txt): whole file becomes a single segment at t=0
-    Returns: List[Dict] with keys: start (int), end (int, optional), text (str)
     """
     try:
         data = json.load(file_obj)
@@ -1224,7 +1446,6 @@ def load_ocr_segments(file_obj, filename: str) -> List[Dict]:
     except json.JSONDecodeError:
         pass
 
-    # Try JSONL
     try:
         file_obj.seek(0)
         segments = []
@@ -1250,7 +1471,6 @@ def load_ocr_segments(file_obj, filename: str) -> List[Dict]:
     except Exception:
         pass
 
-    # Plain text fallback
     try:
         file_obj.seek(0)
         txt = file_obj.read().strip()
@@ -1259,7 +1479,6 @@ def load_ocr_segments(file_obj, filename: str) -> List[Dict]:
     return [{"start": 0, "end": 0, "text": txt}] if txt else []
 
 def build_ocr_context_from_segments(ocr_segments: List[Dict]) -> str:
-    """Legacy minimal OCR formatting: timestamped lines with a simple header."""
     if not ocr_segments:
         return ""
     lines = ["# 螢幕/投影片擷取文字（原始）："]
@@ -1281,7 +1500,6 @@ _S2T_FALLBACK_MAP = {
 }
 
 def to_traditional(text: str) -> str:
-    """Convert a string to Traditional Chinese. Uses OpenCC if available; otherwise minimal mapping."""
     if not text:
         return text
     if _opencc is not None:
@@ -1292,14 +1510,12 @@ def to_traditional(text: str) -> str:
     return ''.join(_S2T_FALLBACK_MAP.get(ch, ch) for ch in text)
 
 def ensure_traditional_chapters(chapters: Dict[str, str]) -> Dict[str, str]:
-    """Convert all chapter titles to Traditional Chinese (idempotent if already Traditional)."""
     return {ts: to_traditional(title) for ts, title in chapters.items()}
 
 # ─────────────────────────
 # Client Initialization & LLM call
 # ─────────────────────────
 def initialize_client(service_type: str, **kwargs) -> Any:
-    """Initialize the appropriate LLM client"""
     if service_type == "azure":
         if ChatCompletionsClient is None or AzureKeyCredential is None:
             raise RuntimeError("Azure dependencies are not available in this environment.")
@@ -1334,7 +1550,6 @@ def call_llm(
     temperature: float = 0.2,
     top_p: float = 0.9,
 ) -> Any:
-    """Call LLM API with retry logic"""
     if service_type == "azure":
         return client.complete(
             messages=[
@@ -1361,8 +1576,9 @@ def call_llm(
     else:
         raise ValueError(f"Unknown service type: {service_type}")
 
+
 # ─────────────────────────
-# Prompt builder (ASR first, OCR second, OCR verbatim supported)
+# Prompt builder
 # ─────────────────────────
 
 def build_prompt_body(
@@ -1376,12 +1592,6 @@ def build_prompt_body(
     duration_hms = sec_to_hms(int(duration_sec))
     min_gap_sec, (t_low, t_high), max_caps = chapter_policy(int(duration_sec))
     
-    # Extract first/last REAL ASR timestamps using the same matcher as the rest of the pipeline.
-    # This supports:
-    #   00:00:12: text
-    #   00:00:12 - text
-    #   [00:00:12] text
-    #   00:00:12 text
     timestamps: List[str] = []
     for line in transcript.splitlines():
         m = ASR_TS_RE.match(line)
@@ -1390,10 +1600,8 @@ def build_prompt_body(
     first_ts = first_ts_override or (timestamps[0] if timestamps else "00:00:00")
     last_ts  = last_ts_override  or (timestamps[-1] if timestamps else duration_hms)
 
-
     video_title_context = ""
     if video_title:
-        # Strip common video extensions
         clean_title = re.sub(r'\.(mp4|avi|mov|mkv|webm|flv|m4v)$', '', video_title, flags=re.IGNORECASE)
         video_title_context = f"""
         
@@ -1503,11 +1711,6 @@ def build_prompt_body(
     return prompt
 
 def build_educational_context(section_title: Optional[str], units: Optional[List[Dict]]) -> str:
-    """
-    Build educational context from metadata for prompt enhancement.
-    
-    Returns formatted string with course structure information.
-    """
     if not section_title and not units:
         return ""
     
@@ -1541,71 +1744,191 @@ def build_educational_context(section_title: Optional[str], units: Optional[List
     return "\n".join(context_parts)
 
 
+# ─── FIX 3.0: Unit Descriptor Generation ───
+def generate_unit_descriptors(
+    units: List[Dict],
+    section_title: Optional[str],
+    asr_sample: str,
+    client: Any,
+    config: "ChapterConfig",
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Auto-expand vague client unit titles into rich descriptors for tagging.
+    One lightweight LLM call (~800 tokens, ~$0.001).
+    """
+    if not units or len(units) == 0:
+        return None
+    
+    unit_lines = []
+    for u in units:
+        unit_lines.append(f"  {u.get('UnitNo', '?')}. {u.get('Title', '未命名')}")
+    units_text = "\n".join(unit_lines)
+    
+    section_context = f"課程名稱/段落：{section_title}" if section_title else "（未提供課程名稱）"
+    asr_excerpt = asr_sample[:2000] if asr_sample else "（無逐字稿摘要）"
+    
+    descriptor_prompt = f"""你是教學內容分析專家。以下是一門課程的單元列表。請為每個單元生成描述詞，幫助後續自動分類。
+
+{section_context}
+
+【教學單元】
+{units_text}
+
+【逐字稿摘要（參考用，了解本課程實際內容）】
+{asr_excerpt}
+
+【任務】
+為每個單元生成：
+1. intent：這個單元預計涵蓋什麼內容（1-2句話）
+2. keywords_positive：在逐字稿中聽到這些詞時，很可能正在教這個單元（8-20個詞）
+3. keywords_negative：聽到這些詞時，通常不是這個單元的內容（5-10個詞）
+
+【重要原則】
+- 根據單元標題和課程名稱推斷內容，不要只複製標題文字
+- keywords 要具體（如「三腳架」「穩定器」），不要太泛（如「影片」「教學」）
+- 如果單元標題太模糊無法推斷內容（如「第一章」「重點」），keywords 可以少一些，這是正常的
+- keywords_negative 用來區分相似但不同的單元
+
+【輸出格式（只輸出 JSON）】
+{{
+  "unit_descriptors": [
+    {{
+      "unit_no": 1,
+      "unit_title": "設備",
+      "intent": "介紹影片拍攝所需的硬體設備與器材選擇",
+      "keywords_positive": ["相機", "手機", "鏡頭", "穩定器", "三腳架", "收音", "麥克風", "燈光", "器材", "設備"],
+      "keywords_negative": ["景別", "構圖", "剪輯", "後期", "轉場"]
+    }}
+  ]
+}}
+
+只輸出 JSON，禁止其他文字。
+"""
+    
+    logger.info("🏷️ Generating unit descriptors for evidence-based tagging...")
+    
+    try:
+        t0 = time.time()
+        resp = call_llm(
+            service_type=config.service_type,
+            client=client,
+            system_message=(
+                "你是教學內容分析專家。根據單元標題和課程資訊，生成用於自動分類的描述詞。"
+                "只輸出 JSON，禁止其他文字。"
+            ),
+            user_message=descriptor_prompt,
+            model=config.openai_model if config.service_type == "openai" else config.azure_model,
+            max_tokens=800,
+            temperature=0.2,
+        )
+        
+        elapsed = time.time() - t0
+        resp_text = (resp.choices[0].message.content
+                    if config.service_type == "openai"
+                    else resp.choices[0].message.content)
+        
+        data = safe_load_json(resp_text)
+        
+        if isinstance(data, dict) and "unit_descriptors" in data:
+            descriptors = data["unit_descriptors"]
+            if isinstance(descriptors, list) and len(descriptors) > 0:
+                logger.info(f"✅ Unit descriptors generated in {elapsed:.1f}s for {len(descriptors)} units:")
+                for desc in descriptors:
+                    kw_count = len(desc.get("keywords_positive", []))
+                    logger.info(
+                        f"   Unit {desc.get('unit_no')}: {desc.get('unit_title', '?')} "
+                        f"→ {kw_count} positive keywords, intent: {desc.get('intent', '?')[:60]}"
+                    )
+                return descriptors
+        
+        logger.warning(f"⚠️ Unit descriptor generation returned unexpected format, skipping")
+        return None
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Unit descriptor generation failed: {e}. Tagging will proceed without descriptors.")
+        return None
+
+
+def format_descriptors_for_tagging(descriptors: List[Dict[str, Any]]) -> str:
+    """Format unit descriptors into a text block for the tagging prompt."""
+    if not descriptors:
+        return ""
+    
+    lines = ["【單元描述詞（用於判斷章節歸屬的客觀依據）】"]
+    lines.append("標記章節時，請對照以下描述詞。只有當章節內容匹配多個 positive keywords 時，才歸入該單元。")
+    lines.append("")
+    
+    for desc in descriptors:
+        unit_no = desc.get("unit_no", "?")
+        title = desc.get("unit_title", "?")
+        intent = desc.get("intent", "")
+        kw_pos = desc.get("keywords_positive", [])
+        kw_neg = desc.get("keywords_negative", [])
+        
+        lines.append(f"📌 單元 {unit_no}：{title}")
+        if intent:
+            lines.append(f"   涵蓋範圍：{intent}")
+        if kw_pos:
+            lines.append(f"   ✅ 相關詞彙：{', '.join(kw_pos)}")
+        if kw_neg:
+            lines.append(f"   ❌ 不相關（屬於其他單元）：{', '.join(kw_neg)}")
+        lines.append("")
+    
+    lines.append("⚠️ 如果章節內容不匹配任何單元的 2 個以上 positive keywords，且 intent 不吻合，")
+    lines.append("   必須標記為 0（延伸教學內容）或 -1（非教學內容），不可強行歸入。")
+    
+    return "\n".join(lines)
+
+
 # ─────────────────────────
-# Hierarchical Multi-Pass Generation (NEW)
+# Hierarchical Multi-Pass Generation
 # ─────────────────────────
 
 def should_use_hierarchical(duration: float, transcript_length: int) -> bool:
-    """Determine if hierarchical multi-pass should be used"""
-    # Use hierarchical for longer, content-rich educational videos
-    return (duration >= 1800 and  # 30+ minutes
-            transcript_length >= 5000 and  # Substantial content
-            duration <= 14400)  # Under 4 hours (very long videos might need different handling)
+    return (duration >= 1800 and transcript_length >= 5000 and duration <= 14400)
+
 
 def hierarchical_multipass_generation(
     raw_asr_text: str,
     duration: float,
     ocr_context: str,
     video_title: Optional[str],
-    section_title: Optional[str],      # ← ADD
-    units: Optional[List[Dict]],       # ← ADD
+    section_title: Optional[str],
+    units: Optional[List[Dict]],
     client: Any,
     config: ChapterConfig,
     progress_callback: Optional[Callable[[str, int], None]] = None
 ) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
     """
     Three-pass hierarchical generation for high-quality educational chapters.
-    
-    Strategy:
-    - ASR (Primary): Provides teaching content, explanations, natural timing, and narrative flow
-    - OCR (Supporting): Provides visual structure, precise terminology, and organized summaries
-    
-    Prioritization:
-    - Chapter timing: ASR timestamps (when instructor announces topics)
-    - Chapter titles: ASR content enriched with OCR terminology
-    - Q&A content: ASR explanations supplemented with OCR structured data
-
-    
-    Token Budget:
-    - ASR: 100,000 tokens per pass (primary source)
-    - OCR: 15,000 tokens per pass (supporting detail)
-    - Total: ~115,000 content + ~2,000 instructions = ~117,000 tokens (safe for GPT-4o's 128k context)
-    
     Returns: (raw_llm_text, chapters, metadata)
     """
     
-    # ==================== Token Budget Initialization ====================
-    ASR_LIMIT = 100_000   # ASR transcript limit per pass
-    OCR_LIMIT = 15_000    # OCR context limit per pass
+    ASR_LIMIT = 100_000
+    OCR_LIMIT = 15_000
     
     asr_tokens = count_tokens_llama(raw_asr_text)
     ocr_tokens = count_tokens_llama(ocr_context) if ocr_context else 0
     total_content_tokens = asr_tokens + ocr_tokens
     
     logger.info("=" * 60)
-    logger.info("🎓 HIERARCHICAL MULTI-PASS CHAPTER GENERATION")
+    logger.info("\U0001f393 HIERARCHICAL MULTI-PASS CHAPTER GENERATION")
     logger.info("   Strategy: ASR-primary (timing) + OCR-supporting (detail)")
     logger.info("=" * 60)
-    logger.info(f"📊 Original ASR tokens: {asr_tokens:,} (limit: {ASR_LIMIT:,})")
-    logger.info(f"📊 Original OCR tokens: {ocr_tokens:,} (limit: {OCR_LIMIT:,})")
-    logger.info(f"📊 Total content tokens: {total_content_tokens:,}")
-    logger.info(f"📊 Video duration: {sec_to_hms(int(duration))}")
+    logger.info(f"\U0001f4ca Original ASR tokens: {asr_tokens:,} (limit: {ASR_LIMIT:,})")
+    logger.info(f"\U0001f4ca Original OCR tokens: {ocr_tokens:,} (limit: {OCR_LIMIT:,})")
+    logger.info(f"\U0001f4ca Video duration: {sec_to_hms(int(duration))}")
     
-    # Truncate once, reuse in all passes for consistency
-    asr_text = truncate_text_by_tokens(raw_asr_text, ASR_LIMIT)
+    # FIX 1: Stratified sampling
+    asr_text, sampler_stats = stratified_sample_asr(
+        raw_asr_text, int(duration), token_budget=ASR_LIMIT
+    )
+    logger.info(f"\U0001f9ea ASR Sampler: {sampler_stats.get('method', 'unknown')} — "
+                f"{sampler_stats.get('lines_selected', '?')} lines selected from "
+                f"{sampler_stats.get('buckets_with_data', '?')}/{sampler_stats.get('num_buckets', '?')} buckets")
     ocr_text = truncate_text_by_tokens(ocr_context, OCR_LIMIT) if ocr_context else ""
 
-    asr_ts_sorted = extract_asr_timestamps_sorted(raw_asr_text)  # use RAW, not truncated
+    asr_ts_sorted = extract_asr_timestamps_sorted(raw_asr_text)
     asr_end_ts = asr_ts_sorted[-1] if asr_ts_sorted else sec_to_hms(int(duration))
     asr_end_sec = ts_to_seconds_hms(asr_end_ts)
     if asr_end_sec <= 0:
@@ -1613,33 +1936,21 @@ def hierarchical_multipass_generation(
         asr_end_ts = sec_to_hms(asr_end_sec)
     anchors = pick_anchor_timestamps(asr_ts_sorted, k=14)
 
-    logger.info(f"🧾 ASR time coverage: first={asr_ts_sorted[0] if asr_ts_sorted else 'N/A'} "
+    logger.info(f"\U0001f9fe ASR time coverage: first={asr_ts_sorted[0] if asr_ts_sorted else 'N/A'} "
                 f"last={asr_end_ts} (asr_ts_count={len(asr_ts_sorted)})")
-    logger.info(f"🧷 Anchor timestamps (spread): {anchors}")
+    logger.info(f"\U0001f9f7 Anchor timestamps (spread): {anchors}")
 
-    
     asr_used = count_tokens_llama(asr_text)
     ocr_used = count_tokens_llama(ocr_text)
     content_used = asr_used + ocr_used
-    
     asr_coverage = (asr_used / asr_tokens * 100) if asr_tokens > 0 else 100
     ocr_coverage = (ocr_used / ocr_tokens * 100) if ocr_tokens > 0 else 100
     
-    logger.info(f"✅ Using per pass:")
-    logger.info(f"   • ASR: {asr_used:,} tokens ({asr_coverage:.1f}% of original)")
-    logger.info(f"   • OCR: {ocr_used:,} tokens ({ocr_coverage:.1f}% of original)")
-    logger.info(f"   • Total: {content_used:,} tokens")
+    logger.info(f"✅ Using per pass: ASR={asr_used:,} ({asr_coverage:.1f}%), OCR={ocr_used:,} ({ocr_coverage:.1f}%), Total={content_used:,}")
     
-    if asr_tokens > ASR_LIMIT:
-        logger.warning(f"⚠️ ASR truncated from {asr_tokens:,} to {asr_used:,} tokens")
-    if ocr_tokens > OCR_LIMIT:
-        logger.warning(f"⚠️ OCR truncated from {ocr_tokens:,} to {ocr_used:,} tokens")
-    
-    # ==================== PASS 1: Course Structure Analysis ====================
+    # ==================== PASS 1 ====================
     logger.info("\n" + "-" * 60)
-    logger.info("🔍 PASS 1: Course Structure Analysis")
-    logger.info("   Goal: Identify learning objectives and overall architecture")
-    logger.info("   Approach: Analyze both ASR and OCR equally")
+    logger.info("\U0001f50d PASS 1: Course Structure Analysis")
     logger.info("-" * 60)
     
     if progress_callback:
@@ -1649,16 +1960,14 @@ def hierarchical_multipass_generation(
     if video_title:
         clean_title = re.sub(r'\.(mp4|avi|mov|mkv|webm|flv|m4v)$', '', video_title, flags=re.IGNORECASE)
         video_info = f"課程檔名：{clean_title}\n"
-        logger.info(f"📚 Video title: {clean_title}")
-    
-    # ← ADD THIS LOGGING BLOCK
+
     if section_title or units:
         logger.info("=" * 60)
-        logger.info("📚 EDUCATIONAL METADATA PROVIDED")
+        logger.info("\U0001f4da EDUCATIONAL METADATA PROVIDED")
         if section_title:
-            logger.info(f"   📖 Section: {section_title}")
+            logger.info(f"   \U0001f4d6 Section: {section_title}")
         if units:
-            logger.info(f"   📑 Units: {len(units)} predefined learning units")
+            logger.info(f"   \U0001f4d1 Units: {len(units)} predefined learning units")
             for unit in units:
                 logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
         logger.info("=" * 60)
@@ -1674,60 +1983,36 @@ def hierarchical_multipass_generation(
 3. 有哪些需要熟練的實用技能？
 
 【知識架構分析】
-- 基礎鋪陳：哪些是前提知識或基礎概念？
-- 核心教學：最重要的理論/方法/技術是什麼？
-- 應用延伸：如何將所學應用於實際場景？
-- 總結整合：如何將零散知識系統化？
+- 基礎鋪陳、核心教學、應用延伸、總結整合
 
 【教學方法識別】
 - 理論講解 vs. 實例演示 vs. 操作練習 的比例分佈
-- 是否有問答互動、思考題、重點回顧？
 
-【分析要點】
-- 從講師的教學敘述（ASR）理解教學邏輯和重點
-- 從投影片內容（OCR）識別主要章節結構和專業術語
-- 綜合兩者，建構完整的課程框架
-
-完整逐字稿（講師教學內容與時間軸）：
+完整逐字稿：
 {asr_text}
 
-視覺輔助內容（投影片/螢幕文字，用於確認主題與術語）：
+視覺輔助內容：
 {ocr_text if ocr_text else "無視覺輔助內容"}
 """
     
-    logger.info(f"📤 PASS 1 prompt: ~{count_tokens_llama(structure_prompt):,} tokens")
-    logger.info("🤖 Calling LLM for structure analysis...")
     t0 = time.time()
-    
     try:
         structure_response = call_llm(
-            service_type=config.service_type,
-            client=client,
+            service_type=config.service_type, client=client,
             system_message="你是課程架構分析專家，擅長識別教學影片的整體學習目標和知識體系。你會綜合分析講師講解（ASR）和投影片內容（OCR）來理解課程的完整結構。",
             user_message=structure_prompt,
             model=config.openai_model if config.service_type == "openai" else config.azure_model,
-            max_tokens=1200,
-            temperature=0.3
+            max_tokens=1200, temperature=0.3
         )
-        
-        elapsed = time.time() - t0
-        logger.info(f"✅ PASS 1 completed in {elapsed:.1f}s")
-        
-        structure_text = (structure_response.choices[0].message.content 
-                         if config.service_type == "openai" 
-                         else structure_response.choices[0].message.content)
-        
-        logger.info(f"📝 Structure analysis: {len(structure_text)} characters")
-        
+        structure_text = structure_response.choices[0].message.content
+        logger.info(f"✅ PASS 1 completed in {time.time() - t0:.1f}s ({len(structure_text)} chars)")
     except Exception as e:
         logger.error(f"❌ PASS 1 failed: {e}", exc_info=True)
         raise
     
-    # ==================== PASS 2: Learning Modules Identification ====================
+    # ==================== PASS 2 ====================
     logger.info("\n" + "-" * 60)
-    logger.info("📚 PASS 2: Learning Modules Identification")
-    logger.info("   Goal: Break down course into 7-12 coherent learning units")
-    logger.info("   Approach: ASR-primary (conceptual transitions)")
+    logger.info("\U0001f4da PASS 2: Learning Modules Identification")
     logger.info("-" * 60)
     
     if progress_callback:
@@ -1739,194 +2024,95 @@ def hierarchical_multipass_generation(
 
 現在識別具體的學習模塊（7-12個），每個模塊應滿足：
 1. 有明確的學習目標
-2. 包含完整的教學閉環（講解→範例→練習）
+2. 包含完整的教學閉環
 3. 時長合理（10-30分鐘）
-4. 有清晰的開始和結束標記
 
-【模塊邊界識別策略（重要性排序）】
+【模塊邊界識別策略】
+第一優先：講師的重大主題轉換（ASR）
+第二優先：教學邏輯的結構轉換
+第三優先：視覺結構變化（OCR）
 
-**第一優先：講師的重大主題轉換（ASR - 主要依據）**
-- 明確的章節宣告："接下來進入新的章節/部分"、"第一部分/第二部分"
-- 重大內容轉換："基礎/理論講完了，現在來看..."、"從概念到實踐"
-- 教學方法的重大轉變：理論講解 → 實際操作 → 案例分析
-- 講師的總結與過渡："我們剛才講了...，現在來看..."
-
-**第二優先：教學邏輯的結構轉換（ASR內容分析）**
-- 從簡單到複雜的明顯層級變化
-- 從單一工具/概念到綜合應用
-- 從講解到練習的轉換
-- 階段性總結後開始新主題
-
-**第三優先：視覺結構變化（OCR - 輔助參考）**
-- 投影片的大標題變化（章節編號、大段落標記）
-- 顯著的內容類型切換（理論投影片 → 軟體操作界面 → 實例演示）
-- 用於確認模塊的主題名稱和專業術語
-
-⚠️ 重點提醒：
-- 模塊是大的學習單元，不要被頻繁的小標題變化誤導
-- 單個投影片變化不等於模塊邊界
-- 優先關注講師的語言信號，投影片用於確認主題
-
-完整逐字稿（主要依據 - 包含講師的主題轉換信號）：
+完整逐字稿：
 {asr_text}
 
-視覺輔助內容（次要參考 - 用於確認主題名稱）：
+視覺輔助內容：
 {ocr_text if ocr_text else "無視覺輔助內容"}
 
 請輸出格式：
 模塊名稱 ~ 起始時間戳(HH:MM:SS) ~ 結束時間戳(HH:MM:SS) ~ 核心學習點 ~ 教學方法
-起始時間戳必須是逐字稿中出現過的時間戳之一
-
-範例（注意：時間戳必須是 HH:MM:SS）：
-基礎工具操作 ~ 00:05:24 ~ 00:18:45 ~ 介面認識、基本工具使用 ~ 理論講解+實例演示
-進階設計技巧 ~ 00:18:45 ~ 00:36:10 ~ 色彩管理、輸出設定 ~ 綜合案例+實際操作
 """
     
-    logger.info(f"📤 PASS 2 prompt: ~{count_tokens_llama(modules_prompt):,} tokens")
-    logger.info("🤖 Calling LLM for module identification...")
     t0 = time.time()
-    
     try:
         modules_response = call_llm(
-            service_type=config.service_type,
-            client=client,
-            system_message="你是課程模塊設計師，擅長將教學內容分解為邏輯連貫的學習單元。你主要依據講師的語言信號（ASR）來識別模塊邊界，因為模塊是基於概念轉換而非視覺變化。投影片（OCR）主要用於確認模塊的主題名稱。",
+            service_type=config.service_type, client=client,
+            system_message="你是課程模塊設計師，擅長將教學內容分解為邏輯連貫的學習單元。",
             user_message=modules_prompt,
             model=config.openai_model if config.service_type == "openai" else config.azure_model,
-            max_tokens=1500,
-            temperature=0.2
+            max_tokens=1500, temperature=0.2
         )
-        
-        elapsed = time.time() - t0
-        logger.info(f"✅ PASS 2 completed in {elapsed:.1f}s")
-        
-        modules_text = (modules_response.choices[0].message.content 
-                       if config.service_type == "openai" 
-                       else modules_response.choices[0].message.content)
-        
-        logger.info(f"📝 Modules analysis: {len(modules_text)} characters")
-        
+        modules_text = modules_response.choices[0].message.content
+        logger.info(f"✅ PASS 2 completed in {time.time() - t0:.1f}s ({len(modules_text)} chars)")
     except Exception as e:
         logger.error(f"❌ PASS 2 failed: {e}", exc_info=True)
         raise
 
-    # ==================== VALIDATE CLIENT UNITS (AFTER PASS 2, BEFORE PASS 3) ====================
+    # ==================== VALIDATE CLIENT UNITS ====================
     unit_validation_result = None
-    validated_units = units  # Default: assume valid
-    
+    validated_units = units
+
     if units and isinstance(units, list) and len(units) > 0:
         logger.info("\n" + "=" * 60)
-        logger.info("🔍 VALIDATING CLIENT UNITS (POST-PASS2, PRE-PASS3)")
+        logger.info("\U0001f50d VALIDATING CLIENT UNITS")
         logger.info("=" * 60)
-        
         try:
             from app.qa_generation import validate_units_relevance, UNIT_VALIDATION_THRESHOLD
-            
-            bare_units = [
-                {"UnitNo": u.get("UnitNo"), "Title": u.get("Title")}
-                for u in units
-            ]
-            
-            logger.info(f"Validating {len(bare_units)} client units against video content...")
-            
-            # Build content dict with the SAME KEYS that validate_units_relevance reads
-            # Also extract topic names from modules_text for main_topics list
+            bare_units = [{"UnitNo": u.get("UnitNo"), "Title": u.get("Title")} for u in units]
             _module_topics = []
             for _line in (modules_text or "").splitlines():
                 _line_s = _line.strip()
                 if "~" in _line_s:
                     _parts = _line_s.split("~")
-                    _topic = _parts[0].strip()
-                    _topic = re.sub(r'^模塊\d+[：:]\s*', '', _topic)
+                    _topic = re.sub(r'^模塊\d+[：:]\s*', '', _parts[0].strip())
                     _topic = re.sub(r'^\d+\.\s*', '', _topic)
                     if _topic and len(_topic) >= 2:
                         _module_topics.append(_topic)
-                elif "@" in _line_s:
-                    _parts = _line_s.split("@")
-                    _topic = re.sub(r'^\d+\.\s*', '', _parts[0].strip())
-                    if _topic and len(_topic) >= 2:
-                        _module_topics.append(_topic)
-            
-            content_from_passes = {
-                "main_topics": _module_topics[:8],
-                "key_concepts": [],
-                "technical_terms": [],
-            }
-            
+            content_from_passes = {"main_topics": _module_topics[:8], "key_concepts": [], "technical_terms": []}
             is_valid, score, reason = validate_units_relevance(
-                units=bare_units,
-                content_analysis=content_from_passes,
-                chapters={},
-                video_title=video_title or "",
-                threshold=UNIT_VALIDATION_THRESHOLD,
-                structure_analysis=structure_text,
-                modules_analysis=modules_text,
+                units=bare_units, content_analysis=content_from_passes, chapters={},
+                video_title=video_title or "", threshold=UNIT_VALIDATION_THRESHOLD,
+                structure_analysis=structure_text, modules_analysis=modules_text,
                 section_title=section_title,
             )
-            
-            unit_validation_result = {
-                "is_valid": is_valid,
-                "score": score,
-                "reason": reason,
-                "threshold": UNIT_VALIDATION_THRESHOLD,
-                "units_provided": len(units)
-            }
-            
+            unit_validation_result = {"is_valid": is_valid, "score": score, "reason": reason,
+                                      "threshold": UNIT_VALIDATION_THRESHOLD, "units_provided": len(units)}
             if is_valid:
-                logger.info(f"✅ CLIENT UNITS VALIDATED AND ACCEPTED")
-                logger.info(f"   • Score: {score:.2f} (threshold: {UNIT_VALIDATION_THRESHOLD})")
-                logger.info(f"   • Reason: {reason}")
-                logger.info(f"   • Will include units in PASS 3 prompt")
+                logger.info(f"✅ CLIENT UNITS VALIDATED (score={score:.2f})")
                 validated_units = units
             else:
-                logger.warning(f"❌ CLIENT UNITS REJECTED")
-                logger.warning(f"   • Score: {score:.2f} (threshold: {UNIT_VALIDATION_THRESHOLD})")
-                logger.warning(f"   • Reason: {reason}")
-                logger.warning(f"   • PASS 3 will run WITHOUT client unit context")
-                logger.warning(f"   • Will return AI-generated chapters only")
+                logger.warning(f"❌ CLIENT UNITS REJECTED (score={score:.2f}, reason={reason})")
                 validated_units = None
-            
         except Exception as e:
             logger.error(f"Unit validation error: {e}", exc_info=True)
-            logger.warning("Proceeding without validation (fail-open)")
-            unit_validation_result = {
-                "is_valid": True,
-                "score": 1.0,
-                "reason": f"Validation error: {str(e)[:50]}",
-                "threshold": UNIT_VALIDATION_THRESHOLD,
-                "units_provided": len(units),
-                "error": str(e)
-            }
+            unit_validation_result = {"is_valid": True, "score": 1.0, "reason": f"Validation error: {str(e)[:50]}",
+                                      "threshold": 0.0, "units_provided": len(units), "error": str(e)}
             validated_units = units
-        
         logger.info("=" * 60 + "\n")
-    
-    # ==================== BUILD EDUCATIONAL CONTEXT (CONDITIONAL) ====================
-    # Only include client units in PASS 3 if they passed validation
+
+    # ==================== BUILD EDUCATIONAL CONTEXT ====================
     if validated_units:
         educational_context = build_educational_context(section_title, validated_units)
-        logger.info(f"✅ Educational context included in PASS 3 ({len(validated_units)} validated units)")
     else:
         educational_context = ""
-        if units:
-            logger.info("ℹ️  Educational context EXCLUDED from PASS 3 (units rejected)")
-        else:
-            logger.info("ℹ️  No educational context (no units provided)")
-    # ==================== PASS 3: Detailed Chapter Generation ====================
+
+    # ==================== PASS 3 ====================
     logger.info("\n" + "-" * 60)
-    logger.info("📑 PASS 3: Detailed Chapter Generation")
-    logger.info("   Goal: Create precise chapter timestamps with titles")
-    logger.info("   Approach: Chapters-first, then semantic unit tagging")
+    logger.info("\U0001f4d1 PASS 3: Detailed Chapter Generation")
     logger.info("-" * 60)
     
     if progress_callback:
         progress_callback("generating_detailed_chapters", 80)
     
-    # ────────── STEP 1: Generate chapters freely (no unit constraints) ──────────
-    # Let the LLM find natural chapter boundaries from ASR content.
-    # Unit tagging happens AFTER chapter generation (STEP 2).
-    
-    # Build informational unit context (hints only, not constraining)
     unit_context_hint = ""
     if validated_units and len(validated_units) >= 1:
         unit_names = ", ".join(f"{u['UnitNo']}.{u['Title']}" for u in validated_units)
@@ -1934,190 +2120,134 @@ def hierarchical_multipass_generation(
 【參考：客戶預定教學單元】
 本課程包含以下教學單元主題：{unit_names}
 這些是課程的主要主題，但影片中可能還包含課程介紹、行政事務、休息等非教學內容。
-請專注於從逐字稿中找到自然的內容轉換點，不需要將所有章節強制歸入以上單元。
+請專注於從逐字稿中找到自然的內容轉換點。
 """
-        logger.info(f"📋 Client provided {len(validated_units)} units (used as hints, not constraints)")
-        
-    # ── Policy-driven chapter count with hard minimum ──
+
     _min_gap_sec, (_t_low, _t_high), _max_caps = chapter_policy(int(duration))
-    _hard_min = max(_t_low, int(duration) // 900)  # at least 1 per 15 min
-    _hard_min = max(_hard_min, 8)  # absolute floor
+    _hard_min = max(_t_low, int(duration) // 900)
+    _hard_min = max(_hard_min, 8)
 
     chapters_prompt = f"""
-# 🚨 最重要原則：從逐字稿內容出發，禁止憑空想像
+# \U0001f6a8 最重要原則：從逐字稿內容出發，禁止憑空想像
 
 ## 你的角色
-你是影片章節分割專家。你的唯一任務是在逐字稿中找到自然的主題轉換點，並為每個轉換點建立一個章節。
+你是影片章節分割專家。你的唯一任務是在逐字稿中找到自然的主題轉換點。
 
 ## 絕對禁止
-❌ 根據影片標題或課程名稱猜測章節內容（標題只是參考，不代表影片實際內容）
-❌ 生成通用教科書式的章節（如「影片剪輯基礎」「社交媒體策略」「後期處理與效果」），除非逐字稿中確實有討論這些主題
-❌ 讓章節標題描述逐字稿中完全沒有討論的主題
-❌ 章節數量少於 {_hard_min} 個（本影片 {sec_to_hms(int(duration))} 至少需要 {_hard_min} 個章節）
-❌ 讓任何兩個相鄰章節之間超過 20 分鐘
+❌ 根據影片標題猜測章節內容
+❌ 生成通用教科書式章節
+❌ 章節數量少於 {_hard_min} 個
+❌ 相鄰章節超過 20 分鐘
 
 ## 必須遵守
-✅ 每個章節的 Title 必須反映講師在該時間點「實際說了什麼、做了什麼」
-✅ 每個章節必須附帶一個 trigger_quote（從逐字稿中複製 10-30 字的原文作為內部驗證依據）
-✅ 如果講師在做課堂準備（測試電腦、耳機），標題就是「教室環境準備」而不是「課程介紹」
-✅ 如果有人在講行政事務（出席、請假），標題就是「行政事務說明」而不是「社交媒體策略」
-✅ 如果有休息時間，標記為「課間休息」
-✅ 章節均勻分佈：大約每 10-15 分鐘一個章節，覆蓋從逐字稿開頭到結尾
+✅ 每個章節的 Title 必須反映講師在該時間點「實際說了什麼」
+✅ 每個章節必須附帶 trigger_quote（10-30字原文）
+✅ 章節均勻分佈，約每 10-15 分鐘一個
 
-## trigger_quote 說明
-trigger_quote 是你從逐字稿中複製的原文片段，用於內部驗證章節與逐字稿的對應關係。
-它不會出現在最終的章節標題中。
+## 背景參考
+{structure_text[:600] if structure_text else ""}
 
-範例：
-- 時間 00:48:23，講師說「短影音就是大概多長...黃金秒數大概三到五秒」
-  → trigger_quote: "短影音就是大概多長黃金秒數大概三到五秒"
-  → Title: "短影片概念與黃金秒數"（✅ 準確反映內容）
-
-- 時間 01:49:46，行政人員說「跟大家說一下出席的部分」
-  → trigger_quote: "跟大家說一下出席的部分"
-  → Title: "行政事務：出席與請假說明"（✅ 準確反映內容）
-  → Title: "社交媒體分享策略"（❌ 完全不相關！）
-
-## 背景參考（僅供理解脈絡，不作為章節設計的主要依據）
-⚠️ 以下分析可能包含錯誤。如果與逐字稿實際內容矛盾，以逐字稿為準。
-
-課程結構概要：
-{structure_text[:600] if structure_text else "（無）"}
-
-模塊規劃概要：
-{modules_text[:600] if modules_text else "（無）"}
+{modules_text[:600] if modules_text else ""}
 
 {unit_context_hint}
 
-## 逐字稿（這是唯一的真實來源 — 所有章節必須基於此內容）
+## 逐字稿
 {asr_text}
 
-## 視覺輔助內容（可參考確認專業術語）
-{ocr_text if ocr_text else "（無螢幕內容參考）"}
+## 視覺輔助內容
+{ocr_text if ocr_text else "（無）"}
 
 ## 影片總時長：{sec_to_hms(int(duration))}
 ## 最少章節數：{_hard_min}
 
-## 輸出格式（只輸出 JSON，禁止任何其他文字）
+## 輸出格式（只輸出 JSON）
 
 {PASS3_JSON_SCHEMA}
-
-{{
-  "SuggestedUnits": [
-    {{
-      "UnitNo": 1,
-      "ParentUnitNo": null,
-      "Title": "教室環境準備與電腦設定",
-      "Time": "00:04:10",
-      "trigger_quote": "新同學第一天上課今天是第一次上課的學生"
-    }}
-  ],
-  "CourseSummary": {{
-    "topic": "...",
-    "core_content": "...",
-    "learning_objectives": "...",
-    "target_audience": "...",
-    "difficulty": "..."
-  }}
-}}
-
-最終檢查（生成前逐項確認）：
-1) 每個 Title 是否準確描述該時間點逐字稿的實際內容？（不是猜測的通用主題）
-2) 每個 trigger_quote 是否能在逐字稿中找到？
-3) 章節數量 >= {_hard_min}？
-4) 章節是否均勻覆蓋整段影片（沒有超過 20 分鐘的空白）？
-5) 是否有任何章節標題描述了逐字稿中完全沒有討論的主題？如果有，刪除並重新生成。
 """
     
-    logger.info(f"📤 PASS 3 (chapters-first) prompt: ~{count_tokens_llama(chapters_prompt):,} tokens")
-    logger.info("🤖 Calling LLM for chapter generation (no unit constraints)...")
     t0 = time.time()
-    
     try:
         final_response = call_llm(
-            service_type=config.service_type,
-            client=client,
+            service_type=config.service_type, client=client,
             system_message=(
                 "你是細心的章節設計師。"
-                "章節時間以 ASR 時間戳為準，章節標題可用 OCR 補充專業術語。"
-                "請只輸出一個 JSON 物件，且 JSON 必須包含 SuggestedUnits 與 CourseSummary。"
+                "請只輸出一個 JSON 物件，包含 SuggestedUnits 與 CourseSummary。"
                 "禁止輸出任何其他文字、禁止 ```。"
             ),
             user_message=chapters_prompt,
             model=config.openai_model if config.service_type == "openai" else config.azure_model,
-            max_tokens=3000,
-            temperature=0.1
+            max_tokens=3000, temperature=0.1
         )
-        
-        elapsed = time.time() - t0
-        logger.info(f"✅ PASS 3 (chapters-first) completed in {elapsed:.1f}s")
-        
-        final_text = (final_response.choices[0].message.content 
-                     if config.service_type == "openai" 
-                     else final_response.choices[0].message.content)
-        
-        logger.info(f"📝 Final output: {len(final_text)} characters")
-        
+        final_text = final_response.choices[0].message.content
+        logger.info(f"✅ PASS 3 completed in {time.time() - t0:.1f}s ({len(final_text)} chars)")
     except Exception as e:
         logger.error(f"❌ PASS 3 failed: {e}", exc_info=True)
         raise
     
-    # ────────── Parse chapter results ──────────
+    # Parse results
     data = safe_load_json(final_text)
-
     suggested_units_structured: List[Dict[str, Any]] = []
     course_summary: Dict[str, Any] = {}
 
     if isinstance(data, dict):
-        suggested_units_structured = normalize_suggested_units(
-            data.get("SuggestedUnits"),
-            units=None  # Don't pass units here - we'll tag them in STEP 2
-        )
+        suggested_units_structured = normalize_suggested_units(data.get("SuggestedUnits"), units=validated_units)
         suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
         cs = data.get("CourseSummary")
         if isinstance(cs, dict):
             course_summary = cs
     elif isinstance(data, list):
-        suggested_units_structured = normalize_suggested_units(data, units=None)
+        suggested_units_structured = normalize_suggested_units(data, units=validated_units)
         suggested_units_structured = clean_all_suggested_units(suggested_units_structured)
 
-    # Apply Traditional Chinese to course summary
     if _opencc and course_summary:
         for k, v in list(course_summary.items()):
             if isinstance(v, str):
                 course_summary[k] = to_traditional(v)
 
-    logger.info(f"📊 Generated {len(suggested_units_structured)} chapters (before unit tagging)")
-    # ── Post-generation ASR quote validation (internal only) ──
+    logger.info(f"\U0001f4ca Generated {len(suggested_units_structured)} chapters (before unit tagging)")
+
+    # FIX 2: Quote validation
+    quote_diagnostics = {}
     if suggested_units_structured:
         suggested_units_structured, quote_diagnostics = validate_chapters_against_asr(
             suggested_units_structured, raw_asr_text, tolerance_sec=180
         )
         if quote_diagnostics.get("threshold_exceeded"):
-            logger.warning(
-                f"⚠️ Quote validation threshold exceeded "
-                f"(rate={quote_diagnostics['hallucination_rate']:.0%}). "
-                f"Chapter titles may not reflect actual ASR content."
-            )
-    else:
-        quote_diagnostics = {}
+            logger.warning(f"⚠️ Quote validation threshold exceeded (rate={quote_diagnostics['hallucination_rate']:.0%})")
     
-    # ────────── STEP 2: Semantic unit tagging (if client provided validated units) ──────────
+    # ────────── STEP 2: Semantic unit tagging with FIX 3.0 descriptors ──────────
+    unit_descriptors = None
+    coverage_policy = None
+    
     if validated_units and len(validated_units) >= 1 and suggested_units_structured:
-        logger.info(f"\n🏷️  STEP 2: Semantic unit tagging for {len(suggested_units_structured)} chapters → {len(validated_units)} units")
+        logger.info(f"\n\U0001f3f7️  STEP 2: Semantic unit tagging for {len(suggested_units_structured)} chapters → {len(validated_units)} units")
         
-        # Build a concise chapter list for the tagging prompt
+        # FIX 3.0: Generate unit descriptors for evidence-based tagging
+        # Use a small stratified sample (not prefix slice) so descriptors reflect full lecture
+        descriptor_asr_sample, _ = stratified_sample_asr(
+            raw_asr_text, int(duration), token_budget=3000
+        )
+        unit_descriptors = generate_unit_descriptors(
+            units=validated_units,
+            section_title=section_title,
+            asr_sample=descriptor_asr_sample,
+            client=client,
+            config=config,
+        )
+        descriptors_text = format_descriptors_for_tagging(unit_descriptors) if unit_descriptors else ""
+        
+        # Build chapter list for tagging prompt
         chapter_lines = []
         for ch in suggested_units_structured:
             chapter_lines.append(f"  {ch['UnitNo']}. [{ch['Time']}] {ch['Title']}")
         chapters_list_text = "\n".join(chapter_lines)
         
-        # Build the unit list
         unit_lines = []
         for u in validated_units:
             unit_lines.append(f"  {u['UnitNo']}. {u['Title']}")
         units_list_text = "\n".join(unit_lines)
         
+        # FIX 3A: Updated tagging prompt with EXT/ADMIN + descriptors + matched_keywords
         tagging_prompt = f"""你是教學內容分類專家。以下是一個教學影片的章節列表和客戶定義的教學單元。
 
 【影片章節（已按時間排序）】
@@ -2126,92 +2256,119 @@ trigger_quote 是你從逐字稿中複製的原文片段，用於內部驗證章
 【客戶教學單元】
 {units_list_text}
 
-【任務】
-為每個章節標記最合適的客戶教學單元編號。
+{descriptors_text}
 
-規則：
-1. 根據章節標題的「內容主題」判斷它屬於哪個教學單元
-2. 如果章節是課程介紹、行政事務、休息、設備設定等「非教學內容」，標記為 0（表示不屬於任何單元）
-3. 同一個教學單元的章節不需要連續出現（例如，休息前後可能都在講同一個單元的內容）
-4. 一個教學單元可以有多個章節，也可以沒有任何章節（如果影片中沒有涵蓋該單元的內容）
-5. 每個章節只能屬於一個教學單元（或標記為 0）
+【任務】
+為每個章節標記最合適的類別。
+
+【分類規則（嚴格遵守）】
+1. 只有在章節內容與教學單元有「直接語義關聯」時，才標記為該單元的編號
+2. 標記為 0 = 教學延伸內容（EXT）：影片中有教學價值但不屬於任何客戶單元
+3. 標記為 -1 = 非教學內容（ADMIN）：課程介紹、行政事務、休息、設備設定
+4. 寧可標記為 0 也不要強行歸入不相關的客戶單元
+5. 同一單元可有多個章節，也可沒有任何章節
+6. 每個章節只能歸入一個類別
 
 【輸出格式（只輸出 JSON）】
 {{
   "tags": [
-    {{"chapter": 1, "unit": 0}},
-    {{"chapter": 2, "unit": 1}},
-    {{"chapter": 3, "unit": 1}},
-    {{"chapter": 4, "unit": 2}}
+    {{"chapter": 1, "unit": -1, "matched_keywords": [], "reason": "課前設備測試"}},
+    {{"chapter": 2, "unit": 1, "matched_keywords": ["相機", "穩定器", "三腳架"], "reason": "講解拍攝器材"}},
+    {{"chapter": 3, "unit": 0, "matched_keywords": [], "reason": "剪輯主題不在客戶單元中"}},
+    {{"chapter": 4, "unit": 2, "matched_keywords": ["景別", "構圖", "近景"], "reason": "鏡頭語言屬於景別單元"}}
   ]
 }}
 
-其中 chapter 是章節編號，unit 是客戶教學單元編號（0 表示非教學內容）。
+其中：
+- chapter = 章節編號
+- unit = 客戶教學單元編號（正數）、0（延伸教學內容 EXT）、-1（非教學 ADMIN）
+- matched_keywords = 該章節匹配到的 positive keywords
+- reason = 簡短分類理由（10字內）
+
+⚠️ 硬性規則：如果 matched_keywords 少於 2 個且 intent 不明確吻合 → 必須標記為 0 或 -1
+
 必須為每個章節都提供標記。只輸出 JSON。
 """
         
-        logger.info(f"📤 Tagging prompt: ~{count_tokens_llama(tagging_prompt):,} tokens")
-        logger.info("🤖 Calling LLM for semantic unit tagging...")
+        logger.info(f"\U0001f4e4 Tagging prompt: ~{count_tokens_llama(tagging_prompt):,} tokens")
         t0_tag = time.time()
         
         try:
             tag_response = call_llm(
-                service_type=config.service_type,
-                client=client,
-                system_message=(
-                    "你是教學內容分類專家。根據章節的內容主題判斷它屬於哪個教學單元。"
-                    "非教學內容（行政、休息、介紹等）標記為 0。"
-                    "只輸出 JSON，禁止其他文字。"
-                ),
+                service_type=config.service_type, client=client,
+                system_message="你是教學內容分類專家。根據章節的內容主題判斷它屬於哪個教學單元。非教學內容標記為 -1，延伸內容標記為 0。只輸出 JSON。",
                 user_message=tagging_prompt,
                 model=config.openai_model if config.service_type == "openai" else config.azure_model,
-                max_tokens=1000,
-                temperature=0.0
+                max_tokens=1000, temperature=0.0
             )
-            
             tag_elapsed = time.time() - t0_tag
             logger.info(f"✅ Unit tagging completed in {tag_elapsed:.1f}s")
             
-            tag_text = (tag_response.choices[0].message.content
-                       if config.service_type == "openai"
-                       else tag_response.choices[0].message.content)
-            
+            tag_text = tag_response.choices[0].message.content
             tag_data = safe_load_json(tag_text)
             
-            # Parse tagging results
+            # FIX 3B: Parse tags with EXT/ADMIN distinction + matched_keywords
             if isinstance(tag_data, dict) and "tags" in tag_data:
                 tags_list = tag_data["tags"]
-                
-                # Build lookup: chapter_no -> unit_no
                 valid_unit_nos = {int(u["UnitNo"]) for u in validated_units}
                 valid_unit_titles = {int(u["UnitNo"]): str(u.get("Title", "")).strip() for u in validated_units}
-                tag_map = {}
+                
+                tag_map: Dict[int, Optional[int]] = {}
+                tag_reasons: Dict[int, str] = {}
+                tag_keywords: Dict[int, List[str]] = {}
+                ext_count = 0
+                admin_count = 0
+                
                 for tag_entry in tags_list:
                     if isinstance(tag_entry, dict):
                         ch_no = tag_entry.get("chapter")
                         u_no = tag_entry.get("unit")
+                        reason = str(tag_entry.get("reason", ""))[:30]
+                        matched_kw = tag_entry.get("matched_keywords", [])
+                        if not isinstance(matched_kw, list):
+                            matched_kw = []
                         if ch_no is not None and u_no is not None:
                             try:
                                 ch_no = int(ch_no)
                                 u_no = int(u_no)
                             except (ValueError, TypeError):
                                 continue
+                            tag_reasons[ch_no] = reason
+                            tag_keywords[ch_no] = matched_kw
                             if u_no in valid_unit_nos:
                                 tag_map[ch_no] = u_no
                             elif u_no == 0:
-                                tag_map[ch_no] = None  # Non-teaching content
+                                tag_map[ch_no] = 0
+                                ext_count += 1
+                            elif u_no == -1:
+                                tag_map[ch_no] = -1
+                                admin_count += 1
+                            else:
+                                tag_map[ch_no] = 0
+                                ext_count += 1
                 
-                # Apply tags to chapters
+                # FIX 3C: Apply tags with EXT/ADMIN distinction
                 tagged_count = 0
+                ext_tagged = 0
+                admin_tagged = 0
                 untagged_count = 0
                 for su in suggested_units_structured:
                     ch_no = su.get("UnitNo")
                     if ch_no in tag_map:
                         mapped_unit = tag_map[ch_no]
-                        if mapped_unit is not None:
+                        su["_tag_reason"] = tag_reasons.get(ch_no, "")
+                        if mapped_unit is not None and mapped_unit > 0:
                             su["ClientUnitNo"] = mapped_unit
                             su["ClientUnitTitle"] = valid_unit_titles.get(mapped_unit, "")
                             tagged_count += 1
+                        elif mapped_unit == 0:
+                            su["ClientUnitNo"] = 0
+                            su["ClientUnitTitle"] = "延伸教學內容"
+                            ext_tagged += 1
+                        elif mapped_unit == -1:
+                            su["ClientUnitNo"] = -1
+                            su["ClientUnitTitle"] = None
+                            admin_tagged += 1
                         else:
                             su["ClientUnitNo"] = None
                             su["ClientUnitTitle"] = None
@@ -2221,10 +2378,13 @@ trigger_quote 是你從逐字稿中複製的原文片段，用於內部驗證章
                         su["ClientUnitTitle"] = None
                         untagged_count += 1
                 
-                # Log results
-                logger.info(f"🏷️  Tagging results: {tagged_count} tagged, {untagged_count} untagged (intro/admin/break)")
+                # FIX 3D: Updated logging
+                logger.info(
+                    f"\U0001f3f7️  Tagging results: {tagged_count} → client units, "
+                    f"{ext_tagged} → EXT (educational), {admin_tagged} → ADMIN, "
+                    f"{untagged_count} untagged"
+                )
                 
-                # Per-unit breakdown
                 for vu in validated_units:
                     uno = int(vu["UnitNo"])
                     unit_chapters = [su for su in suggested_units_structured if su.get("ClientUnitNo") == uno]
@@ -2234,57 +2394,72 @@ trigger_quote 是你從逐字稿中複製的原文片段，用於內部驗證章
                         logger.info(f"   Unit {uno} ({vu['Title']}): {len(unit_chapters)} chapters, {first_ts} → {last_ts}")
                     else:
                         logger.warning(f"   Unit {uno} ({vu['Title']}): 0 chapters (not found in video)")
-                
-                # Check for non-contiguous unit assignments (info only)
-                unit_time_ranges = {}
-                for su in suggested_units_structured:
-                    cu = su.get("ClientUnitNo")
-                    if cu is not None:
-                        ch_sec = ts_to_seconds_hms(su.get("Time", ""))
-                        if ch_sec >= 0:
-                            if cu not in unit_time_ranges:
-                                unit_time_ranges[cu] = {"min": ch_sec, "max": ch_sec}
-                            else:
-                                unit_time_ranges[cu]["min"] = min(unit_time_ranges[cu]["min"], ch_sec)
-                                unit_time_ranges[cu]["max"] = max(unit_time_ranges[cu]["max"], ch_sec)
-                
-                # Check for overlapping unit ranges (acceptable, log as info)
-                sorted_units_ranges = sorted(unit_time_ranges.items(), key=lambda x: x[1]["min"])
-                for i in range(len(sorted_units_ranges) - 1):
-                    u1_no, u1_range = sorted_units_ranges[i]
-                    u2_no, u2_range = sorted_units_ranges[i + 1]
-                    if u1_range["max"] > u2_range["min"]:
-                        logger.info(
-                            f"   ℹ️ Unit {u1_no} and Unit {u2_no} time ranges overlap "
-                            f"(Unit {u1_no} ends ~{sec_to_hms(u1_range['max'])}, "
-                            f"Unit {u2_no} starts ~{sec_to_hms(u2_range['min'])}). "
-                            f"This is acceptable for split/interleaved content."
-                        )
-                
             else:
-                logger.warning("⚠️ Unit tagging response did not contain valid 'tags' array, skipping tagging")
+                logger.warning("⚠️ Unit tagging response did not contain valid 'tags' array")
                 
         except Exception as e:
             logger.warning(f"⚠️ Unit tagging LLM call failed: {e}. Chapters will have no unit tags.")
     
-    elif validated_units and len(validated_units) >= 1 and not suggested_units_structured:
+    # FIX 3E: Coverage Policy
+    if validated_units and suggested_units_structured:
+        total_chapters = len(suggested_units_structured)
+        mapped_to_units = sum(1 for su in suggested_units_structured 
+                             if su.get("ClientUnitNo") is not None and su.get("ClientUnitNo", 0) > 0)
+        ext_chapters_count = sum(1 for su in suggested_units_structured if su.get("ClientUnitNo") == 0)
+        admin_chapters_count = sum(1 for su in suggested_units_structured if su.get("ClientUnitNo") == -1)
+        
+        chapter_coverage = mapped_to_units / max(total_chapters, 1)
+        
+        mapped_secs = []
+        for su in suggested_units_structured:
+            if su.get("ClientUnitNo") is not None and su.get("ClientUnitNo", 0) > 0:
+                ch_sec = ts_to_seconds_hms(su.get("Time", ""))
+                if ch_sec >= 0:
+                    mapped_secs.append(ch_sec)
+        
+        time_coverage = (max(mapped_secs) - min(mapped_secs)) / duration if mapped_secs and duration > 0 else 0.0
+        
+        coverage_policy = {
+            "total_chapters": total_chapters,
+            "mapped_to_client_units": mapped_to_units,
+            "ext_chapters": ext_chapters_count,
+            "admin_chapters": admin_chapters_count,
+            "unmapped": total_chapters - mapped_to_units - ext_chapters_count - admin_chapters_count,
+            "chapter_coverage_ratio": round(chapter_coverage, 3),
+            "time_coverage_ratio": round(time_coverage, 3),
+        }
+        
+        if chapter_coverage >= 0.6:
+            coverage_policy["level"] = "high"
+            coverage_policy["recommendation"] = "Unit-first: QA/notes focus on client units"
+        elif chapter_coverage >= 0.3:
+            coverage_policy["level"] = "partial"
+            coverage_policy["recommendation"] = "Mixed: client units + EXT modules"
+        else:
+            coverage_policy["level"] = "low"
+            coverage_policy["recommendation"] = "AI-first: client units barely present"
+        
+        ext_topics = [su.get("Title", "") for su in suggested_units_structured if su.get("ClientUnitNo") == 0]
+        coverage_policy["ext_topics"] = ext_topics
+        
+        logger.info(f"\n\U0001f4ca COVERAGE POLICY:")
+        logger.info(f"   Chapters mapped: {mapped_to_units}/{total_chapters} ({chapter_coverage:.0%})")
+        logger.info(f"   EXT: {ext_chapters_count}, ADMIN: {admin_chapters_count}")
+        logger.info(f"   Level: {coverage_policy['level']} → {coverage_policy['recommendation']}")
+    else:
+        coverage_policy = None
+
+    if validated_units and len(validated_units) >= 1 and not suggested_units_structured:
         logger.warning("⚠️ No chapters generated, skipping unit tagging")
     
-    # ────────── Log final unit mapping stats ──────────
+    # ────────── Log final unit mapping ──────────
     if validated_units and suggested_units_structured:
-        mapped = sum(1 for su in suggested_units_structured if su.get("ClientUnitNo") is not None)
+        mapped = sum(1 for su in suggested_units_structured if su.get("ClientUnitNo") is not None and su.get("ClientUnitNo", 0) > 0)
         total = len(suggested_units_structured)
         if mapped > 0:
-            logger.info(f"✅ Final: {mapped}/{total} chapters mapped to units, {total - mapped} untagged")
-        else:
-            missing = sum(1 for x in suggested_units_structured if x.get("ClientUnitNo") is None)
-            if missing:
-                logger.warning(
-                    f"⚠️ {missing}/{total} SuggestedUnits missing ClientUnitNo "
-                    f"(client provided {len(validated_units)} Units)"
-                )
+            logger.info(f"✅ Final: {mapped}/{total} chapters mapped to units")
     
-    # Initialize variables for coverage retry and back-calculation
+    # Initialize variables
     enriched_units = None
     unit_diagnostics = None
     
@@ -2292,51 +2467,38 @@ trigger_quote 是你從逐字稿中複製的原文片段，用於內部驗證章
     if suggested_units_structured and asr_end_sec > 0:
         cov = chapters_coverage_ratio(suggested_units_structured, asr_end_sec)
         last_ch = suggested_units_structured[-1]["Time"]
-        logger.info(f"📏 PASS3 coverage check: last_chapter={last_ch}, asr_end={asr_end_ts}, ratio={cov:.2f}")
+        logger.info(f"\U0001f4cf PASS3 coverage check: last_chapter={last_ch}, asr_end={asr_end_ts}, ratio={cov:.2f}")
         
         if asr_end_sec >= 3600 and cov < 0.60:
-            logger.warning(
-                f"⚠️ PASS3 chapters end too early (ratio={cov:.2f}). Retrying PASS3 with anchor timestamps..."
-            )
+            logger.warning(f"⚠️ PASS3 chapters end too early (ratio={cov:.2f}). Retrying...")
             retry_hint = f"""
-    【強制覆蓋規則（必須遵守）】
+    【強制覆蓋規則】
     - 逐字稿最後時間戳約為：{asr_end_ts}
-    - 你輸出的最後一個章節 Time 必須 >= {sec_to_hms(max(0, int(asr_end_sec * 0.85)))}（至少覆蓋到後段）
-    - 禁止只生成前段章節；必須涵蓋整段教學（包含後半段/後段）
-    - 以下是逐字稿中分佈於全程的時間戳樣本（必須用來選章節時間點，且要包含後段時間戳）：
+    - 你輸出的最後一個章節 Time 必須 >= {sec_to_hms(max(0, int(asr_end_sec * 0.85)))}
+    - 以下是後段時間戳樣本：
     {", ".join(anchors[-10:] if len(anchors) >= 10 else anchors)}
     """
             chapters_prompt_retry = chapters_prompt + "\n" + retry_hint
             retry_resp = call_llm(
-                service_type=config.service_type,
-                client=client,
-                system_message=(
-                    "你是細心的章節設計師。"
-                    "請只輸出 JSON，禁止任何其他文字。"
-                    "章節 Time 必須對齊 ASR 真實時間戳，且必須覆蓋整段逐字稿到後段。"
-                ),
+                service_type=config.service_type, client=client,
+                system_message="你是細心的章節設計師。請只輸出 JSON。章節必須覆蓋整段逐字稿到後段。",
                 user_message=chapters_prompt_retry,
                 model=config.openai_model if config.service_type == "openai" else config.azure_model,
-                max_tokens=3000,
-                temperature=0.1
+                max_tokens=3000, temperature=0.1
             )
-            final_text_retry = (
-                retry_resp.choices[0].message.content
-                if config.service_type == "openai"
-                else retry_resp.choices[0].message.content
-            )
+            final_text_retry = retry_resp.choices[0].message.content
             data_retry = safe_load_json(final_text_retry)
 
             suggested_retry: List[Dict[str, Any]] = []
             course_summary_retry: Dict[str, Any] = {}
             if isinstance(data_retry, dict):
-                suggested_retry = normalize_suggested_units(data_retry.get("SuggestedUnits"), units=None)
+                suggested_retry = normalize_suggested_units(data_retry.get("SuggestedUnits"), units=validated_units)
                 suggested_retry = clean_all_suggested_units(suggested_retry)
                 cs2 = data_retry.get("CourseSummary")
                 if isinstance(cs2, dict):
                     course_summary_retry = cs2
             elif isinstance(data_retry, list):
-                suggested_retry = normalize_suggested_units(data_retry, units=None)
+                suggested_retry = normalize_suggested_units(data_retry, units=validated_units)
                 suggested_retry = clean_all_suggested_units(suggested_retry)
             
             if suggested_retry:
@@ -2348,88 +2510,42 @@ trigger_quote 是你從逐字稿中複製的原文片段，用於內部驗證章
                         if isinstance(v, str):
                             course_summary[k] = to_traditional(v)
                 final_text = final_text_retry
-                logger.info(f"✅ PASS3 retry succeeded: SuggestedUnits={len(suggested_units_structured)}")
-                
-                # Re-run unit tagging on retry results if we have validated units
-                if validated_units and len(validated_units) >= 1:
-                    logger.info("🔄 Re-running unit tagging on retry results...")
-                    # Note: tagging would use same logic as above; for now back_calculate
-                    # will handle the mapping via existing ClientUnitNo fields
+                logger.info(f"✅ PASS3 retry succeeded: {len(suggested_units_structured)} chapters")
             else:
-                if data_retry is None:
-                    logger.warning("⚠️ PASS3 retry JSON parse failed; keeping first result")
-                else:
-                    logger.warning("⚠️ PASS3 retry JSON parsed but SuggestedUnits empty/invalid; keeping first result")
+                logger.warning("⚠️ PASS3 retry failed; keeping first result")
                     
     # ────────── Build chapters_raw ──────────
     if suggested_units_structured:
         chapters_raw = suggested_units_to_chapters_dict(
-            suggested_units_structured,
-            duration_sec=int(duration),
-            bump_limit_sec=120
+            suggested_units_structured, duration_sec=int(duration), bump_limit_sec=120
         )
-        logger.info(f"📊 Parsed {len(suggested_units_structured)} SuggestedUnits from JSON")
     else:
         logger.warning("⚠️ PASS 3 JSON parse failed; falling back to text chapter parsing")
         chapters_raw = parse_chapters_from_output(final_text)
         course_summary = parse_summary_from_output(final_text)
 
-    # ────────── Back-calculate Unit timestamps ──────────
+    # ────────── Back-calculate Unit timestamps (FIX 4) ──────────
     if validated_units:
         enriched_units, unit_diagnostics = back_calculate_unit_timestamps(
             suggested_units_structured=suggested_units_structured,
             client_units=validated_units
         )
-        logger.info("\n" + "=" * 60)
-        logger.info("📍 UNIT TIMESTAMP BACK-CALCULATION RESULTS")
-        logger.info("=" * 60)
-        if enriched_units:
-            for unit in enriched_units:
-                if unit.get("Time"):
-                    logger.info(
-                        f"✅ Unit {unit['UnitNo']}: {unit['Title']}\n"
-                        f"   → Starts at: {unit['Time']}\n"
-                        f"   → First chapter: {unit.get('FirstChapter', 'N/A')}"
-                    )
-                else:
-                    logger.info(
-                        f"⚠️ Unit {unit['UnitNo']}: {unit['Title']}\n"
-                        f"   → Not found in video!"
-                    )
-        logger.info("=" * 60 + "\n")
     elif units:
-        logger.info("⏭️  Skipping Unit timestamp back-calculation (units rejected by validation)")
-        unit_diagnostics = {
-            "units_provided": True,
-            "validation_passed": False,
-            "units_rejected": True,
-            "message": "Units failed validation - not mapped to timestamps"
-        }
+        logger.info("⏭️  Skipping Unit timestamp back-calculation (units rejected)")
+        unit_diagnostics = {"units_provided": True, "validation_passed": False, "units_rejected": True}
  
     # ────────── Validate and normalize timestamps ──────────
-    chapters = validate_and_normalize_timestamps(
-        chapters_raw,
-        int(duration),
-        video_id="hierarchical_pass3"
-    )
+    chapters = validate_and_normalize_timestamps(chapters_raw, int(duration), video_id="hierarchical_pass3")
     if not chapters:
         logger.error("❌ No valid chapters after timestamp validation, using time-based fallback")
         chapters = create_time_based_fallback(int(duration))
 
-    if course_summary:
-        logger.info(f"✅ Successfully extracted course summary with {len(course_summary)} fields:")
-        for key, value in course_summary.items():
-            display_value = value[:80] + "..." if len(value) > 80 else value
-            logger.info(f"   • {key}: {display_value}")
-    else:
-        logger.warning("⚠️ Course summary extraction failed, using empty dict")
-    
-    # Calculate educational quality score
     quality_score = estimate_educational_quality(chapters, structure_text)
-    logger.info(f"📈 Educational quality score: {quality_score:.2f}")
+    logger.info(f"\U0001f4c8 Educational quality score: {quality_score:.2f}")
     
+    # ==================== FIX 5: Build Chapter Windows ====================
+    chapter_windows = build_chapter_windows(suggested_units_structured, raw_asr_text, ocr_text)
 
-    
     # ==================== Build Metadata ====================
     metadata = {
         'generation_method': 'hierarchical_multi_pass_asr_primary',
@@ -2440,55 +2556,29 @@ trigger_quote 是你從逐字稿中複製的原文片段，用於內部驗證章
         'course_summary': course_summary,
         'content_analysis': course_summary,
         'unit_validation': unit_validation_result,
+        'sampler': sampler_stats,
         'token_usage': {
-            'original': {
-                'asr_tokens': asr_tokens,
-                'ocr_tokens': ocr_tokens,
-                'total_tokens': total_content_tokens
-            },
-            'used_per_pass': {
-                'asr_tokens': asr_used,
-                'ocr_tokens': ocr_used,
-                'total_tokens': content_used
-            },
-            'limits': {
-                'asr_limit': ASR_LIMIT,
-                'ocr_limit': OCR_LIMIT
-            },
-            'coverage': {
-                'asr_coverage': f"{asr_coverage:.1f}%",
-                'ocr_coverage': f"{ocr_coverage:.1f}%"
-            }
+            'original': {'asr_tokens': asr_tokens, 'ocr_tokens': ocr_tokens, 'total_tokens': total_content_tokens},
+            'used_per_pass': {'asr_tokens': asr_used, 'ocr_tokens': ocr_used, 'total_tokens': content_used},
+            'limits': {'asr_limit': ASR_LIMIT, 'ocr_limit': OCR_LIMIT},
+            'coverage': {'asr_coverage': f"{asr_coverage:.1f}%", 'ocr_coverage': f"{ocr_coverage:.1f}%"}
         }
     }
-    # ✅ CRITICAL: expose structured SuggestedUnits to downstream pipeline (tasks.py)
-    # Full version with trigger_quote for internal debugging only
     metadata["_suggested_units_debug"] = suggested_units_structured
-    # Clean version for client payload — NO trigger_quote, NO _quote_validated
     metadata["suggested_units_structured"] = strip_internal_fields(suggested_units_structured)
-    # ✅ NEW: Add enriched units and diagnostics
     metadata["client_units_original"] = units
     metadata["client_units_validated"] = validated_units
     metadata["client_units_with_timestamps"] = enriched_units
     metadata["unit_diagnostics"] = unit_diagnostics
-
-    # ✅ DEBUG: preserve raw PASS3 JSON/text for production debugging
+    metadata["coverage_policy"] = coverage_policy
+    metadata["unit_descriptors"] = unit_descriptors
+    metadata["chapter_windows"] = chapter_windows
     metadata["pass3_raw_json_text"] = final_text
-    metadata["quote_validation"] = quote_diagnostics if 'quote_diagnostics' in dir() else {}
-    logger.info(
-        "🧩 PASS3 SuggestedUnits structured: %d (units_provided=%s)",
-        len(suggested_units_structured),
-        "yes" if units else "no"
-    )
+    metadata["quote_validation"] = quote_diagnostics
 
     logger.info("\n" + "=" * 60)
     logger.info("✅ HIERARCHICAL GENERATION COMPLETE")
-    logger.info("=" * 60)
-    logger.info(f"📊 Chapters generated: {len(chapters)}")
-    logger.info(f"📊 Summary fields: {len(course_summary)}")
-    logger.info(f"📊 Quality score: {quality_score:.2f}")
-    logger.info(f"📊 Strategy: ASR-primary (timing) + OCR-supporting (detail)")
-    logger.info(f"📊 Total content used: {content_used:,} tokens (ASR: {asr_used:,}, OCR: {ocr_used:,})")
+    logger.info(f"\U0001f4ca Chapters: {len(chapters)}, Quality: {quality_score:.2f}")
     logger.info("=" * 60 + "\n")
     
     return final_text, chapters, metadata
@@ -2507,28 +2597,32 @@ def estimate_educational_quality(chapters: Dict[str, str], structure: str) -> fl
     total_titles = len(chapters)
     return min(1.0, indicator_count / max(1, total_titles * 0.7))
 
-# ─────────────────────────
-# Enhanced Main Function with Smart Routing
-# ─────────────────────────
+
+def create_time_based_fallback(duration_sec: int) -> Dict[str, str]:
+    """Create fallback chapters based on time intervals"""
+    fallback_chapters: Dict[str, str] = {}
+    interval = 300  # 5 minutes
+    for i in range(0, int(duration_sec), interval):
+        fallback_chapters[sec_to_hms(i)] = "章節 " + str((i // interval) + 1)
+    logger.info(f"Created {len(fallback_chapters)} time-based fallback chapters")
+    return fallback_chapters
+
 
 def generate_chapters_debug(
     raw_asr_text: str,
     ocr_segments: List[Dict],
     duration: float,
     video_id: str,
-    video_title: Optional[str] = None,  # ADD THIS
-    section_title: Optional[str] = None,  # ← ADD
-    units: Optional[List[Dict]] = None,    # ← ADD
+    video_title: Optional[str] = None,
+    section_title: Optional[str] = None,
+    units: Optional[List[Dict]] = None,
     run_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[str, int], None]] = None,
     *,
     ocr_context_override: Optional[str] = None,
-    # NEW: Add control parameter
-    force_generation_method: Optional[str] = None,  # 'hierarchical' or 'single_pass'
+    force_generation_method: Optional[str] = None,
 ) -> Tuple[str, Dict[str, str], Dict[str, str], Dict[str, Any]]:
-    """
-    Enhanced version with smart routing between hierarchical and single-pass generation
-    """
+    """Enhanced version with smart routing between hierarchical and single-pass generation"""
     if progress_callback:
         progress_callback("initializing", 0)
 
@@ -2539,7 +2633,6 @@ def generate_chapters_debug(
     try:
         logger.info(f"Starting chapter generation for video {video_id} (duration: {duration}s)")
 
-        # Load configuration
         config = ChapterConfig()
         if not validate_config(config):
             logger.warning("Configuration validation failed, using time-based fallback")
@@ -2550,7 +2643,6 @@ def generate_chapters_debug(
         if progress_callback:
             progress_callback("processing_inputs", 10)
 
-        # Build OCR context (existing logic)
         if ocr_context_override is not None:
             ocr_context = ocr_context_override
         else:
@@ -2558,7 +2650,6 @@ def generate_chapters_debug(
 
         min_gap_sec, target_range, max_caps = chapter_policy(int(duration))
         
-        # Save raw inputs
         with open(run_dir / "raw_asr_text.txt", "w", encoding="utf-8") as f:
             f.write(raw_asr_text)
         if ocr_context_override is not None:
@@ -2571,7 +2662,6 @@ def generate_chapters_debug(
         if progress_callback:
             progress_callback("initializing_client", 20)
 
-        # Initialize client (existing logic)
         service_type = config.service_type
         model = config.openai_model if service_type == "openai" else config.azure_model
 
@@ -2589,14 +2679,12 @@ def generate_chapters_debug(
                 base_url=config.openai_base_url,
             )
 
-        # 🎯 NEW: Smart Generation Method Selection
         use_hierarchical = False
         if force_generation_method == 'hierarchical':
             use_hierarchical = True
         elif force_generation_method == 'single_pass':
             use_hierarchical = False
         else:
-            # Auto-detect based on content characteristics
             use_hierarchical = should_use_hierarchical(duration, len(raw_asr_text))
         
         logger.info(f"Using generation method: {'hierarchical_multi_pass' if use_hierarchical else 'single_pass'}")
@@ -2605,20 +2693,18 @@ def generate_chapters_debug(
             if progress_callback:
                 progress_callback("hierarchical_analysis", 30)
             
-            # Use hierarchical multi-pass generation
             raw_llm_text, chapters, metadata = hierarchical_multipass_generation(
                 raw_asr_text=raw_asr_text,
                 duration=duration,
                 ocr_context=ocr_context,
-                video_title=video_title,  # ADD THIS
-                section_title=section_title,      # ← ADD
-                units=units,                       # ← ADD
+                video_title=video_title,
+                section_title=section_title,
+                units=units,
                 client=client,
                 config=config,
                 progress_callback=progress_callback
             )
             
-            # Save hierarchical metadata
             with open(run_dir / "hierarchical_metadata.json", "w", encoding="utf-8") as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
             with open(run_dir / "course_structure.txt", "w", encoding="utf-8") as f:
@@ -2631,29 +2717,21 @@ def generate_chapters_debug(
                 progress_callback("single_pass_processing", 30)
 
             first_ts, last_ts = get_first_last_asr_ts(raw_asr_text, int(duration))
-            # Use original single-pass generation
             prompt_template = build_prompt_body(
                 "", int(duration), ocr_context, video_title,
                 first_ts_override=first_ts,
                 last_ts_override=last_ts,
             )
             template_tokens = count_tokens_llama(prompt_template)
-
-            CONTEXT_BUDGET = 128_000
+            CONTEXT_BUDGET = 110_000  # Safety margin below model's 128k limit
 
             asr_tokens = count_tokens_llama(raw_asr_text)
             if template_tokens + asr_tokens <= CONTEXT_BUDGET:
                 transcript_for_prompt = raw_asr_text
-                logger.info(
-                    f"✅ Using full ASR (template={template_tokens:,}, asr={asr_tokens:,}, budget={CONTEXT_BUDGET:,})"
-                )
             else:
                 max_transcript_tokens = max(0, CONTEXT_BUDGET - template_tokens)
                 transcript_for_prompt = truncate_text_by_tokens(raw_asr_text, max_transcript_tokens)
-                logger.warning(
-                    f"⚠️ Truncating ASR (template={template_tokens:,}, asr={asr_tokens:,}, "
-                    f"budget={CONTEXT_BUDGET:,}, allowed_asr={max_transcript_tokens:,})"
-                )
+
             full_prompt = build_prompt_body(
                 transcript_for_prompt, int(duration), ocr_context, video_title,
                 first_ts_override=first_ts,
@@ -2668,58 +2746,37 @@ def generate_chapters_debug(
 
             enhanced_system_message = (
                 "你是專業的線上課程設計專家，擅長為各種學科創建高品質教育章節結構。"
-                "自動識別課程領域並使用適當專業術語，專注於學習價值和教育連貫性。"
-                "嚴格避免重複模式，創建反映真實教育進程的專業章節標題。"
                 "僅輸出章節清單，每行格式: `HH:MM:SS - 標題`（繁體中文）。"
             )
 
-            logger.info(f"Calling {service_type} API for single-pass chapter generation...")
             t0 = time.time()
             resp = call_llm(
-                service_type=service_type,
-                client=client,
+                service_type=service_type, client=client,
                 system_message=enhanced_system_message,
                 user_message=full_prompt,
                 model=model,
-                max_tokens=2048,
-                temperature=0.2,
-                top_p=0.9,
+                max_tokens=2048, temperature=0.2, top_p=0.9,
             )
             dt = time.time() - t0
             logger.info(f"LLM API call completed in {dt:.2f}s")
 
-            if service_type == "azure":
-                raw_llm_text = resp.choices[0].message.content
-            else:
-                raw_llm_text = resp.choices[0].message.content
+            raw_llm_text = resp.choices[0].message.content
 
-            # Parse chapters
             chapters_raw = parse_chapters_from_output(raw_llm_text)
-
-            # ✅ NEW: Validate and normalize timestamps
-            chapters = validate_and_normalize_timestamps(
-                chapters_raw,
-                int(duration),
-                video_id=video_id
-            )
+            chapters = validate_and_normalize_timestamps(chapters_raw, int(duration), video_id=video_id)
             if not chapters:
-                logger.error("❌ No valid chapters after timestamp validation, using time-based fallback")
                 chapters = create_time_based_fallback(int(duration))
 
-            # Parse structured summary
             course_summary = parse_summary_from_output(raw_llm_text)
-            metadata = {'generation_method': 'single_pass',
-                        'course_summary': course_summary,
-                        }
+            metadata = {'generation_method': 'single_pass', 'course_summary': course_summary}
 
-        # COMMON POST-PROCESSING (existing logic)
+        # COMMON POST-PROCESSING
         if progress_callback:
             progress_callback("parsing_response", 70)
 
         with open(run_dir / "llm_output_raw.txt", "w", encoding="utf-8") as f:
             f.write(raw_llm_text)
 
-        # Apply cleaning and Traditional Chinese conversion
         parsed_raw_clean_trad = ensure_traditional_chapters(clean_chapter_titles(chapters))
 
         with open(run_dir / "parsed_raw_chapters.json", "w", encoding="utf-8") as f:
@@ -2728,7 +2785,6 @@ def generate_chapters_debug(
         if progress_callback:
             progress_callback("balancing_chapters", 80)
 
-        # Balance according to policy
         chapters_final = globally_balance_chapters(
             parsed_raw_clean_trad, int(duration), min_gap_sec, target_range, max_caps
         )
@@ -2738,39 +2794,24 @@ def generate_chapters_debug(
         with open(run_dir / "chapters_final.json", "w", encoding="utf-8") as f:
             json.dump(chapters_final, f, ensure_ascii=False, indent=2)
 
-        # Save generation method info
         with open(run_dir / "generation_method.txt", "w", encoding="utf-8") as f:
             f.write(metadata.get('generation_method', 'unknown'))
 
         if progress_callback:
             progress_callback("completed", 100)
 
-        # Return 4-tuple: (raw_text, parsed_chapters, final_chapters, metadata)
-        return (raw_llm_text, parsed_raw_clean_trad, chapters_final, metadata)  # ← FIXED!
+        return (raw_llm_text, parsed_raw_clean_trad, chapters_final, metadata)
 
     except Exception as e:
         logger.error(f"Chapter generation failed: {e}", exc_info=True)
         fallback = ensure_traditional_chapters(create_time_based_fallback(int(duration)))
-        # Return fallback with empty metadata
         fallback_metadata = {
             'generation_method': 'time_based_fallback',
             'educational_quality_score': 0.0,
             'course_summary': {}
         }
-        return ("", {}, fallback, fallback_metadata)  # ← FIXED!
-        
-# ─────────────────────────
-# MAIN FUNCTIONS
-# ─────────────────────────
+        return ("", {}, fallback, fallback_metadata)
 
-def create_time_based_fallback(duration_sec: int) -> Dict[str, str]:
-    """Create fallback chapters based on time intervals"""
-    fallback_chapters: Dict[str, str] = {}
-    interval = 300  # 5 minutes
-    for i in range(0, int(duration_sec), interval):
-        fallback_chapters[sec_to_hms(i)] = "章節 " + str((i // interval) + 1)
-    logger.info(f"Created {len(fallback_chapters)} time-based fallback chapters")
-    return fallback_chapters
 
 def generate_chapters(
     raw_asr_text: str,
@@ -2778,56 +2819,45 @@ def generate_chapters(
     duration: float,
     video_id: str,
     video_title: Optional[str] = None,
-    section_title: Optional[str] = None,  # ← ADD
-    units: Optional[List[Dict]] = None,    # ← ADD
+    section_title: Optional[str] = None,
+    units: Optional[List[Dict]] = None,
     run_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[str, int], None]] = None,
     *,
     ocr_context_override: Optional[str] = None,
     force_generation_method: Optional[str] = None,
-) -> Tuple[Dict[str, str], Dict[str, Any]]:  # ← FIXED: Return tuple
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
     """
     Generate chapters and return (chapters_dict, metadata).
-    
-    For backward compatibility with old code that expects just chapters dict,
-    you can use: chapters, _ = generate_chapters(...)
-    
-    Returns:
-        Tuple of (chapters_dict, metadata)
     """
-    _raw_text, _parsed_raw, final_chapters, metadata = generate_chapters_debug(  # ← FIXED: Unpack 4 values
+    _raw_text, _parsed_raw, final_chapters, metadata = generate_chapters_debug(
         raw_asr_text=raw_asr_text,
         ocr_segments=ocr_segments,
         duration=duration,
         video_id=video_id,
-        video_title=video_title,  # ← Make sure this is passed
-        section_title=section_title,        # ← ADD
-        units=units,                         # ← ADD
+        video_title=video_title,
+        section_title=section_title,
+        units=units,
         run_dir=run_dir,
         progress_callback=progress_callback,
         ocr_context_override=ocr_context_override,
         force_generation_method=force_generation_method
     )
-    return final_chapters, metadata  # ← FIXED: Return tuple
+    return final_chapters, metadata
+
 
 # ─────────────────────────
 # CLI
 # ─────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Generate video chapters from raw ASR and optional OCR.")
-    parser.add_argument('--asr-file', type=argparse.FileType('r', encoding='utf-8'), required=True,
-                        help='Path to file containing raw ASR text with timestamps.')
-    parser.add_argument('--ocr-file', type=argparse.FileType('r', encoding='utf-8'),
-                        help='Optional path to OCR file. In verbatim mode this is read as raw text.')
-    parser.add_argument('--duration', type=float, required=True,
-                        help='Duration of the video in seconds.')
-    parser.add_argument('--video-id', type=str, required=True,
-                        help='Unique identifier for the video (used for output directory).')
-    parser.add_argument('--output-dir', type=str, default='./chapter_debug',
-                        help='Directory to save debug outputs. Default: ./chapter_debug')
-    parser.add_argument('--debug', action='store_true', help='Print RAW LLM output and parsed chapters too.')
-    parser.add_argument('--ocr-mode', choices=['none', 'verbatim', 'segments'], default='verbatim',
-                        help="How to include OCR: 'none' (omit), 'verbatim' (raw text), or 'segments' (legacy minimal formatting).")
+    parser.add_argument('--asr-file', type=argparse.FileType('r', encoding='utf-8'), required=True)
+    parser.add_argument('--ocr-file', type=argparse.FileType('r', encoding='utf-8'))
+    parser.add_argument('--duration', type=float, required=True)
+    parser.add_argument('--video-id', type=str, required=True)
+    parser.add_argument('--output-dir', type=str, default='./chapter_debug')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--ocr-mode', choices=['none', 'verbatim', 'segments'], default='verbatim')
 
     args = parser.parse_args()
 
@@ -2837,23 +2867,18 @@ def main():
         stream=sys.stdout
     )
 
-    # Read ASR
-    logger.info(f"Reading ASR text from {args.asr_file.name}...")
     raw_asr_text = args.asr_file.read()
     args.asr_file.close()
 
-    # Read OCR according to the chosen mode
     ocr_segments: List[Dict] = []
     ocr_context_override: Optional[str] = None
     if args.ocr_file:
         if args.ocr_mode == 'none':
-            logger.info("OCR mode: none (omit OCR from prompt).")
             try:
                 args.ocr_file.close()
             except Exception:
                 pass
         elif args.ocr_mode == 'verbatim':
-            logger.info(f"OCR mode: verbatim. Reading {args.ocr_file.name} as raw text...")
             try:
                 ocr_context_override = args.ocr_file.read()
             finally:
@@ -2861,32 +2886,23 @@ def main():
                     args.ocr_file.close()
                 except Exception:
                     pass
-            logger.info("OCR loaded verbatim.")
         else:
-            logger.info(f"OCR mode: segments. Reading OCR segments from {args.ocr_file.name}...")
             try:
                 ocr_segments = load_ocr_segments(args.ocr_file, args.ocr_file.name)
                 args.ocr_file.close()
-                logger.info(f"Loaded {len(ocr_segments)} OCR segments")
             except Exception as e:
-                logger.warning(f"OCR file load failed, proceeding without OCR. Detail: {e}")
+                logger.warning(f"OCR file load failed: {e}")
                 try:
                     args.ocr_file.close()
                 except Exception:
                     pass
                 ocr_segments = []
 
-    # Output directory
     run_dir = Path(args.output_dir) / args.video_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Saving debug outputs to: {run_dir}")
 
-    # Simple progress callback
     def cli_progress_callback(stage: str, percent: int):
         logger.info(f"Progress: {percent}% - {stage}")
-
-    # Generate
-    logger.info("Starting chapter generation...")
 
     raw_text, parsed_raw, final_chapters, metadata = generate_chapters_debug(
         raw_asr_text=raw_asr_text,
@@ -2898,14 +2914,13 @@ def main():
         ocr_context_override=ocr_context_override,
     )
     
-    # Console output
     print("\n" + "="*50)
     print("✅ CHAPTER GENERATION COMPLETE")
     print("="*50)
 
     if args.debug:
-        print("\n--- RAW LLM OUTPUT (as returned) ---")
-        print(raw_text if raw_text else "(empty/raw fallback)")
+        print("\n--- RAW LLM OUTPUT ---")
+        print(raw_text if raw_text else "(empty)")
         print("\n--- PARSED (pre-balance) ---")
         for ts, title in parsed_raw.items():
             print(f"{ts} - {title}")
@@ -2914,19 +2929,15 @@ def main():
     for ts, title in final_chapters.items():
         print(f"{ts} - {title}")
 
-    # Save final chapters to a clean file
     output_file = run_dir / "final_chapters.txt"
     with open(output_file, 'w', encoding='utf-8') as f:
         for timestamp, title in final_chapters.items():
             f.write(f"{timestamp} - {title}\n")
-    logger.info(f"Final chapters saved to: {output_file}")
 
-    # Also save a pre-balance view for convenience
     pre_file = run_dir / "parsed_raw_chapters.txt"
     with open(pre_file, 'w', encoding='utf-8') as f:
         for timestamp, title in parsed_raw.items():
             f.write(f"{timestamp} - {title}\n")
-    logger.info(f"Parsed (pre-balance) chapters saved to: {pre_file}")
 
 if __name__ == "__main__":
     main()
