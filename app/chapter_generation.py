@@ -32,7 +32,8 @@ PASS3_JSON_SCHEMA = """
       "UnitNo": 1,
       "ParentUnitNo": null,
       "Title": "章節標題（繁體中文）",
-      "Time": "HH:MM:SS"
+      "Time": "HH:MM:SS",
+      "trigger_quote": "逐字稿中該時間點附近的原文引用（10-30字）"
     }
   ],
   "CourseSummary": {
@@ -572,6 +573,7 @@ def normalize_suggested_units(
             "Time": ts,
             "ClientUnitNo": client_unit_no,
             "ClientUnitTitle": client_unit_title,
+            "trigger_quote": str(su.get("trigger_quote", "")).strip(),
         })
 
     out.sort(key=lambda x: x["Time"])
@@ -792,7 +794,118 @@ def back_calculate_unit_timestamps(
     logger.info("=" * 60 + "\n")
     
     return enriched_units, diagnostics
+def validate_chapters_against_asr(
+    suggested_units: List[Dict[str, Any]],
+    raw_asr_text: str,
+    tolerance_sec: int = 180,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Post-generation validation: check that each chapter's trigger_quote
+    actually exists in the ASR near the claimed timestamp.
+    trigger_quote is INTERNAL only — never sent to client.
+    """
+    if not suggested_units or not raw_asr_text:
+        return suggested_units, {"validated": False, "reason": "empty input"}
 
+    asr_lines: Dict[int, str] = {}
+    for line in raw_asr_text.splitlines():
+        m = ASR_TS_RE.match(line)
+        if m:
+            ts = _normalize_ts(m.group(1))
+            sec = ts_to_seconds_hms(ts)
+            if sec >= 0:
+                text = line[m.end():].strip().lstrip(':- ').strip()
+                if text:
+                    asr_lines[sec] = text
+
+    if not asr_lines:
+        return suggested_units, {"validated": False, "reason": "no ASR timestamps found"}
+
+    validated = []
+    hallucination_count = 0
+    total_with_quotes = 0
+
+    for su in suggested_units:
+        quote = str(su.get("trigger_quote", "")).strip()
+        ts = str(su.get("Time", "")).strip()
+        ch_sec = ts_to_seconds_hms(ts)
+
+        if not quote or len(quote) < 4:
+            su["_quote_validated"] = None
+            validated.append(su)
+            continue
+
+        total_with_quotes += 1
+
+        window_text = ""
+        for asr_sec, asr_text_line in asr_lines.items():
+            if abs(asr_sec - ch_sec) <= tolerance_sec:
+                window_text += asr_text_line + " "
+
+        if window_text:
+            quote_chars = set(quote)
+            overlap = sum(1 for c in quote_chars if c in window_text)
+            ratio = overlap / max(len(quote_chars), 1)
+        else:
+            ratio = 0.0
+
+        su["_quote_validated"] = ratio >= 0.4
+        if ratio < 0.4:
+            hallucination_count += 1
+            logger.warning(
+                f"⚠️ QUOTE VALIDATION FAILED: {ts} "
+                f"title='{su.get('Title', '')[:40]}' "
+                f"quote='{quote[:30]}...' match={ratio:.2f}"
+            )
+
+        validated.append(su)
+
+    hallucination_rate = hallucination_count / max(total_with_quotes, 1)
+
+    diagnostics = {
+        "validated": True,
+        "total_chapters": len(suggested_units),
+        "chapters_with_quotes": total_with_quotes,
+        "quotes_passed": total_with_quotes - hallucination_count,
+        "quotes_failed": hallucination_count,
+        "hallucination_rate": round(hallucination_rate, 3),
+        "threshold_exceeded": hallucination_rate > 0.3,
+    }
+
+    if hallucination_rate > 0.3:
+        logger.warning(
+            f"⚠️ HIGH HALLUCINATION RATE: {hallucination_rate:.0%} "
+            f"({hallucination_count}/{total_with_quotes} chapters failed)"
+        )
+    else:
+        logger.info(
+            f"✅ Quote validation: {total_with_quotes - hallucination_count}/"
+            f"{total_with_quotes} chapters grounded in ASR"
+        )
+
+    return validated, diagnostics
+
+
+def strip_internal_fields(suggested_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Strip internal fields (trigger_quote, _quote_validated) before client payload.
+    These must NEVER appear in webhook responses or client-facing output.
+    """
+    if not suggested_units:
+        return suggested_units
+
+    INTERNAL_FIELDS = {"trigger_quote", "_quote_validated"}
+
+    cleaned = []
+    for su in suggested_units:
+        clean_su = {
+            k: v for k, v in su.items()
+            if k not in INTERNAL_FIELDS and not k.startswith("_")
+        }
+        cleaned.append(clean_su)
+
+    return cleaned
+    
 def suggested_units_to_chapters_dict(
     suggested_units: List[Dict[str, Any]],
     *,
@@ -1824,67 +1937,79 @@ def hierarchical_multipass_generation(
 請專注於從逐字稿中找到自然的內容轉換點，不需要將所有章節強制歸入以上單元。
 """
         logger.info(f"📋 Client provided {len(validated_units)} units (used as hints, not constraints)")
-    
+        
+    # ── Policy-driven chapter count with hard minimum ──
+    _min_gap_sec, (_t_low, _t_high), _max_caps = chapter_policy(int(duration))
+    _hard_min = max(_t_low, int(duration) // 900)  # at least 1 per 15 min
+    _hard_min = max(_hard_min, 8)  # absolute floor
+
     chapters_prompt = f"""
-【課程整體結構】
-{structure_text}
+# 🚨 最重要原則：從逐字稿內容出發，禁止憑空想像
 
-【學習模塊規劃】  
-{modules_text}
+## 你的角色
+你是影片章節分割專家。你的唯一任務是在逐字稿中找到自然的主題轉換點，並為每個轉換點建立一個章節。
 
-{educational_context}
+## 絕對禁止
+❌ 根據影片標題或課程名稱猜測章節內容（標題只是參考，不代表影片實際內容）
+❌ 生成通用教科書式的章節（如「影片剪輯基礎」「社交媒體策略」「後期處理與效果」），除非逐字稿中確實有討論這些主題
+❌ 讓章節標題描述逐字稿中完全沒有討論的主題
+❌ 章節數量少於 {_hard_min} 個（本影片 {sec_to_hms(int(duration))} 至少需要 {_hard_min} 個章節）
+❌ 讓任何兩個相鄰章節之間超過 20 分鐘
+
+## 必須遵守
+✅ 每個章節的 Title 必須反映講師在該時間點「實際說了什麼、做了什麼」
+✅ 每個章節必須附帶一個 trigger_quote（從逐字稿中複製 10-30 字的原文作為內部驗證依據）
+✅ 如果講師在做課堂準備（測試電腦、耳機），標題就是「教室環境準備」而不是「課程介紹」
+✅ 如果有人在講行政事務（出席、請假），標題就是「行政事務說明」而不是「社交媒體策略」
+✅ 如果有休息時間，標記為「課間休息」
+✅ 章節均勻分佈：大約每 10-15 分鐘一個章節，覆蓋從逐字稿開頭到結尾
+
+## trigger_quote 說明
+trigger_quote 是你從逐字稿中複製的原文片段，用於內部驗證章節與逐字稿的對應關係。
+它不會出現在最終的章節標題中。
+
+範例：
+- 時間 00:48:23，講師說「短影音就是大概多長...黃金秒數大概三到五秒」
+  → trigger_quote: "短影音就是大概多長黃金秒數大概三到五秒"
+  → Title: "短影片概念與黃金秒數"（✅ 準確反映內容）
+
+- 時間 01:49:46，行政人員說「跟大家說一下出席的部分」
+  → trigger_quote: "跟大家說一下出席的部分"
+  → Title: "行政事務：出席與請假說明"（✅ 準確反映內容）
+  → Title: "社交媒體分享策略"（❌ 完全不相關！）
+
+## 背景參考（僅供理解脈絡，不作為章節設計的主要依據）
+⚠️ 以下分析可能包含錯誤。如果與逐字稿實際內容矛盾，以逐字稿為準。
+
+課程結構概要：
+{structure_text[:600] if structure_text else "（無）"}
+
+模塊規劃概要：
+{modules_text[:600] if modules_text else "（無）"}
 
 {unit_context_hint}
 
-現在為影片生成具體的章節時間點（總計10-20個章節），並提供課程摘要。
-
-【章節設計原則】
-1. 每個章節代表一個完整的學習子目標（5-10分鐘）
-2. 標記關鍵概念的首次詳細解釋
-3. 標記重要範例或案例分析的開始
-4. 標記練習題或互動環節
-5. 標記重點回顧或總結處
-6. 如果影片開頭有課程介紹、行政事務、設備設定等非教學內容，也應該為其建立章節
-7. 如果影片中有明顯的休息/中場，可以標記為「休息」或「課間休息」
-8. 如果有不同講者（如行政人員）出現，也應建立獨立章節
-
-【章節時間點定位策略（重要性排序）】
-
-**第一優先：ASR語言時間戳（主要依據 - 決定章節開始時間）**
-- 講師的明確主題宣告
-- 教學轉換信號
-- 重要概念的首次詳細解釋開始點
-
-**第二優先：內容邏輯轉換（ASR內容分析）**
-- 從理論講解到實際演示的自然轉換點
-- 新工具/技術的首次詳細介紹
-
-**第三優先：OCR視覺輔助（補充確認）**
-- 確認當前討論的具體主題
-- 提供精確的技術術語
-
-完整逐字稿（含精確時間戳）：
+## 逐字稿（這是唯一的真實來源 — 所有章節必須基於此內容）
 {asr_text}
 
-視覺輔助內容：
-{ocr_text if ocr_text else "無視覺輔助內容"}
+## 視覺輔助內容（可參考確認專業術語）
+{ocr_text if ocr_text else "（無螢幕內容參考）"}
 
-總時長：{sec_to_hms(int(duration))}
+## 影片總時長：{sec_to_hms(int(duration))}
+## 最少章節數：{_hard_min}
 
-【輸出格式要求（重要：只輸出 JSON，不要輸出任何其他文字）】
-請輸出一個 JSON 物件，格式如下：
+## 輸出格式（只輸出 JSON，禁止任何其他文字）
 
 {PASS3_JSON_SCHEMA}
 
-{{ 
+{{
   "SuggestedUnits": [
-    {{ 
+    {{
       "UnitNo": 1,
       "ParentUnitNo": null,
-      "Title": "章節標題（繁體中文）",
-      "Time": "HH:MM:SS",
-      "ClientUnitNo": null,
-      "ClientUnitTitle": null
+      "Title": "教室環境準備與電腦設定",
+      "Time": "00:04:10",
+      "trigger_quote": "新同學第一天上課今天是第一次上課的學生"
     }}
   ],
   "CourseSummary": {{
@@ -1896,12 +2021,12 @@ def hierarchical_multipass_generation(
   }}
 }}
 
-規則：
-1) Time 必須是逐字稿中存在或非常接近（±60 秒內）的 HH:MM:SS
-2) SuggestedUnits 需依 Time 遞增排序
-3) ClientUnitNo 和 ClientUnitTitle 先設為 null（稍後會自動標記）
-4) 只輸出 JSON，禁止多餘解釋
-5) 章節必須覆蓋影片的大部分內容（從開頭到接近結尾）
+最終檢查（生成前逐項確認）：
+1) 每個 Title 是否準確描述該時間點逐字稿的實際內容？（不是猜測的通用主題）
+2) 每個 trigger_quote 是否能在逐字稿中找到？
+3) 章節數量 >= {_hard_min}？
+4) 章節是否均勻覆蓋整段影片（沒有超過 20 分鐘的空白）？
+5) 是否有任何章節標題描述了逐字稿中完全沒有討論的主題？如果有，刪除並重新生成。
 """
     
     logger.info(f"📤 PASS 3 (chapters-first) prompt: ~{count_tokens_llama(chapters_prompt):,} tokens")
@@ -1963,6 +2088,19 @@ def hierarchical_multipass_generation(
                 course_summary[k] = to_traditional(v)
 
     logger.info(f"📊 Generated {len(suggested_units_structured)} chapters (before unit tagging)")
+    # ── Post-generation ASR quote validation (internal only) ──
+    if suggested_units_structured:
+        suggested_units_structured, quote_diagnostics = validate_chapters_against_asr(
+            suggested_units_structured, raw_asr_text, tolerance_sec=180
+        )
+        if quote_diagnostics.get("threshold_exceeded"):
+            logger.warning(
+                f"⚠️ Quote validation threshold exceeded "
+                f"(rate={quote_diagnostics['hallucination_rate']:.0%}). "
+                f"Chapter titles may not reflect actual ASR content."
+            )
+    else:
+        quote_diagnostics = {}
     
     # ────────── STEP 2: Semantic unit tagging (if client provided validated units) ──────────
     if validated_units and len(validated_units) >= 1 and suggested_units_structured:
@@ -2324,7 +2462,10 @@ def hierarchical_multipass_generation(
         }
     }
     # ✅ CRITICAL: expose structured SuggestedUnits to downstream pipeline (tasks.py)
-    metadata["suggested_units_structured"] = suggested_units_structured
+    # Full version with trigger_quote for internal debugging only
+    metadata["_suggested_units_debug"] = suggested_units_structured
+    # Clean version for client payload — NO trigger_quote, NO _quote_validated
+    metadata["suggested_units_structured"] = strip_internal_fields(suggested_units_structured)
     # ✅ NEW: Add enriched units and diagnostics
     metadata["client_units_original"] = units
     metadata["client_units_validated"] = validated_units
@@ -2333,6 +2474,7 @@ def hierarchical_multipass_generation(
 
     # ✅ DEBUG: preserve raw PASS3 JSON/text for production debugging
     metadata["pass3_raw_json_text"] = final_text
+    metadata["quote_validation"] = quote_diagnostics if 'quote_diagnostics' in dir() else {}
     logger.info(
         "🧩 PASS3 SuggestedUnits structured: %d (units_provided=%s)",
         len(suggested_units_structured),
