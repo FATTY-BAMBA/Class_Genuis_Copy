@@ -31,9 +31,10 @@ PASS3_JSON_SCHEMA = """
     {
       "UnitNo": 1,
       "ParentUnitNo": null,
-      "Title": "章節標題（繁體中文）",
-      "Time": "HH:MM:SS",
-      "trigger_quote": "逐字稿中該時間點附近的原文引用（10-30字）"
+      "Title": "章節標題（繁體中文，反映講師實際講了什麼）",
+      "Time": "HH:MM:SS（必須是逐字稿中存在的時間戳）",
+      "trigger_quote": "從逐字稿中該時間點±2分鐘內複製的原文（10-30字）",
+      "asr_keywords": ["關鍵詞1", "關鍵詞2", "關鍵詞3"]
     }
   ],
   "CourseSummary": {
@@ -731,6 +732,11 @@ def normalize_suggested_units(
                 client_unit_no = None
             client_unit_title = unit_title_by_no.get(client_unit_no) if client_unit_no else None
 
+        # Preserve asr_keywords evidence field if present
+        asr_kw = su.get("asr_keywords", [])
+        if not isinstance(asr_kw, list):
+            asr_kw = []
+        
         out.append({
             "UnitNo": 0,  # will renumber
             "ParentUnitNo": parent,
@@ -739,6 +745,7 @@ def normalize_suggested_units(
             "ClientUnitNo": client_unit_no,
             "ClientUnitTitle": client_unit_title,
             "trigger_quote": str(su.get("trigger_quote", "")).strip(),
+            "asr_keywords": asr_kw,
         })
 
     out.sort(key=lambda x: x["Time"])
@@ -920,6 +927,117 @@ def back_calculate_unit_timestamps(
     return enriched_units, diagnostics
 
 
+# ─── FIX 6: Timestamp Snapping to Real ASR Lines ───
+def snap_chapters_to_asr_timestamps(
+    suggested_units: List[Dict[str, Any]],
+    raw_asr_text: str,
+    tolerance_sec: int = 30,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Snap each chapter's Time to the nearest real ASR timestamp.
+    This kills round-number fakes (01:10:00, 01:20:00, 01:30:00).
+    
+    If two chapters snap to the same ASR line, the second one is bumped
+    to the next closest unused ASR timestamp.
+    
+    Returns: (snapped_units, snap_diagnostics)
+    """
+    if not suggested_units or not raw_asr_text:
+        return suggested_units, {"snapped": False, "reason": "empty input"}
+    
+    # Build sorted list of (seconds, timestamp_str) from ASR
+    asr_ts_list: List[Tuple[int, str]] = []
+    seen_secs = set()
+    for line in raw_asr_text.splitlines():
+        m = ASR_TS_RE.match(line.strip())
+        if m:
+            ts = _normalize_ts(m.group(1))
+            sec = ts_to_seconds_hms(ts)
+            if sec >= 0 and sec not in seen_secs:
+                seen_secs.add(sec)
+                asr_ts_list.append((sec, ts))
+    
+    asr_ts_list.sort(key=lambda x: x[0])
+    
+    if not asr_ts_list:
+        return suggested_units, {"snapped": False, "reason": "no ASR timestamps found"}
+    
+    asr_secs = [s for s, _ in asr_ts_list]
+    
+    def _find_nearest(target_sec: int, used: set) -> Optional[Tuple[int, str]]:
+        """Find nearest unused ASR timestamp within tolerance."""
+        best = None
+        best_dist = tolerance_sec + 1
+        for s, ts in asr_ts_list:
+            dist = abs(s - target_sec)
+            if dist < best_dist and s not in used:
+                best = (s, ts)
+                best_dist = dist
+        return best
+    
+    used_secs: set = set()
+    snapped = []
+    snap_count = 0
+    no_snap_count = 0
+    
+    for su in suggested_units:
+        ts_str = str(su.get("Time", "")).strip()
+        ch_sec = ts_to_seconds_hms(ts_str)
+        
+        if ch_sec < 0:
+            snapped.append(su)
+            continue
+        
+        nearest = _find_nearest(ch_sec, used_secs)
+        
+        if nearest:
+            new_sec, new_ts = nearest
+            used_secs.add(new_sec)
+            dist = abs(ch_sec - new_sec)
+            
+            if dist > 0:
+                snap_count += 1
+                logger.debug(
+                    f"📌 Snapped chapter '{su.get('Title', '')[:30]}' "
+                    f"from {ts_str} → {new_ts} (Δ{dist}s)"
+                )
+            
+            su_copy = dict(su)
+            su_copy["Time"] = new_ts
+            su_copy["_original_time"] = ts_str
+            su_copy["_snap_distance_sec"] = dist
+            snapped.append(su_copy)
+        else:
+            # No ASR timestamp within tolerance — keep original but flag it
+            no_snap_count += 1
+            su_copy = dict(su)
+            su_copy["_snap_failed"] = True
+            snapped.append(su_copy)
+            logger.warning(
+                f"⚠️ No ASR timestamp within ±{tolerance_sec}s of {ts_str} "
+                f"for chapter '{su.get('Title', '')[:30]}'"
+            )
+    
+    diagnostics = {
+        "snapped": True,
+        "total_chapters": len(suggested_units),
+        "chapters_snapped": snap_count,
+        "chapters_no_snap_needed": len(suggested_units) - snap_count - no_snap_count,
+        "chapters_snap_failed": no_snap_count,
+        "tolerance_sec": tolerance_sec,
+        "asr_timestamps_available": len(asr_ts_list),
+    }
+    
+    if snap_count > 0:
+        logger.info(
+            f"📌 Timestamp snapping: {snap_count} snapped, "
+            f"{no_snap_count} failed (±{tolerance_sec}s tolerance, "
+            f"{len(asr_ts_list)} ASR timestamps available)"
+        )
+    
+    return snapped, diagnostics
+
+
 # ─── FIX 2: Bigram Quote Validator ───
 def validate_chapters_against_asr(
     suggested_units: List[Dict[str, Any]],
@@ -1057,7 +1175,8 @@ def strip_internal_fields(suggested_units: List[Dict[str, Any]]) -> List[Dict[st
     if not suggested_units:
         return suggested_units
 
-    INTERNAL_FIELDS = {"trigger_quote", "_quote_validated", "_tag_reason"}
+    INTERNAL_FIELDS = {"trigger_quote", "_quote_validated", "_tag_reason", "asr_keywords",
+                       "_original_time", "_snap_distance_sec", "_snap_failed"}
 
     cleaned = []
     for su in suggested_units:
@@ -1956,14 +2075,14 @@ def hierarchical_multipass_generation(
     if progress_callback:
         progress_callback("analyzing_course_structure", 40)
     
-    video_info = ""
-    if video_title:
-        clean_title = re.sub(r'\.(mp4|avi|mov|mkv|webm|flv|m4v)$', '', video_title, flags=re.IGNORECASE)
-        video_info = f"課程檔名：{clean_title}\n"
+    # NOTE: video_title is NOT passed to PASS 1/2/3 to prevent title-based hallucination.
+    # It is only used for unit validation and logging.
 
+    # NOTE: section_title and units are logged but NOT passed to PASS 1/2/3.
+    # They are reserved for the TAGGING step (STEP 2) to prevent syllabus-hallucination.
     if section_title or units:
         logger.info("=" * 60)
-        logger.info("\U0001f4da EDUCATIONAL METADATA PROVIDED")
+        logger.info("\U0001f4da EDUCATIONAL METADATA PROVIDED (reserved for tagging step only)")
         if section_title:
             logger.info(f"   \U0001f4d6 Section: {section_title}")
         if units:
@@ -1973,17 +2092,18 @@ def hierarchical_multipass_generation(
         logger.info("=" * 60)
         
     structure_prompt = f"""
-作為資深教學設計專家，分析這個{sec_to_hms(int(duration))}教學影片的整體架構：
+作為資深教學設計專家，分析這個{sec_to_hms(int(duration))}教學影片逐字稿的整體架構。
 
-{video_info}
+⚠️ 重要：只根據逐字稿中講師「實際說的內容」來分析，不要根據影片標題或課程名稱推測。
 
-【核心學習目標】
-1. 學生完成本課程後應掌握哪些關鍵能力？
-2. 有哪些必須理解的核心理論或概念？
-3. 有哪些需要熟練的實用技能？
+【內容類型識別】
+1. 哪些時段是正式教學內容？（理論講解、技能示範、案例分析）
+2. 哪些時段是行政事務？（點名、設備測試、休息、課堂管理）
+3. 哪些時段是題外話或閒聊？（與課程主題無關的討論）
 
 【知識架構分析】
-- 基礎鋪陳、核心教學、應用延伸、總結整合
+- 講師實際涵蓋了哪些主題？按時間順序列出
+- 各主題的大約時間佔比
 
 【教學方法識別】
 - 理論講解 vs. 實例演示 vs. 操作練習 的比例分佈
@@ -1999,7 +2119,7 @@ def hierarchical_multipass_generation(
     try:
         structure_response = call_llm(
             service_type=config.service_type, client=client,
-            system_message="你是課程架構分析專家，擅長識別教學影片的整體學習目標和知識體系。你會綜合分析講師講解（ASR）和投影片內容（OCR）來理解課程的完整結構。",
+            system_message="你是課程架構分析專家。你只根據逐字稿中講師實際說的內容來分析，絕不根據影片標題或課程名稱推測。你會誠實區分正式教學、行政事務和題外話。",
             user_message=structure_prompt,
             model=config.openai_model if config.service_type == "openai" else config.azure_model,
             max_tokens=1200, temperature=0.3
@@ -2113,43 +2233,55 @@ def hierarchical_multipass_generation(
     if progress_callback:
         progress_callback("generating_detailed_chapters", 80)
     
-    unit_context_hint = ""
-    if validated_units and len(validated_units) >= 1:
-        unit_names = ", ".join(f"{u['UnitNo']}.{u['Title']}" for u in validated_units)
-        unit_context_hint = f"""
-【參考：客戶預定教學單元】
-本課程包含以下教學單元主題：{unit_names}
-這些是課程的主要主題，但影片中可能還包含課程介紹、行政事務、休息等非教學內容。
-請專注於從逐字稿中找到自然的內容轉換點。
-"""
+    # PASS 3: No unit_context_hint — section title and units are reserved for STEP 2 tagging only.
+    # This prevents "syllabus hallucination" where the model generates textbook chapters
+    # instead of describing what the instructor actually said.
 
     _min_gap_sec, (_t_low, _t_high), _max_caps = chapter_policy(int(duration))
     _hard_min = max(_t_low, int(duration) // 900)
     _hard_min = max(_hard_min, 8)
+
+    # Build anchor timestamps hint for PASS 3
+    _anchor_hint = ""
+    if anchors:
+        _anchor_hint = f"""
+## 逐字稿中的實際時間戳樣本（你的 Time 必須接近這些時間戳之一）
+{', '.join(anchors)}
+"""
 
     chapters_prompt = f"""
 # \U0001f6a8 最重要原則：從逐字稿內容出發，禁止憑空想像
 
 ## 你的角色
 你是影片章節分割專家。你的唯一任務是在逐字稿中找到自然的主題轉換點。
+你必須描述講師「實際講了什麼」，而不是你認為講師「應該講什麼」。
 
 ## 絕對禁止
-❌ 根據影片標題猜測章節內容
-❌ 生成通用教科書式章節
+❌ 根據影片標題或課程名稱猜測章節內容
+❌ 生成通用教科書式章節（如「基礎概念」「進階應用」「實作練習」）
 ❌ 章節數量少於 {_hard_min} 個
 ❌ 相鄰章節超過 20 分鐘
+❌ 使用整數分鐘時間戳（如 01:00:00, 01:10:00, 01:20:00）除非逐字稿中確實存在
+❌ 編造 trigger_quote 或 asr_keywords（必須是逐字稿中的原文）
 
 ## 必須遵守
 ✅ 每個章節的 Title 必須反映講師在該時間點「實際說了什麼」
-✅ 每個章節必須附帶 trigger_quote（10-30字原文）
+✅ 每個 Time 必須接近逐字稿中一個真實的時間戳（±30秒內）
+✅ 每個章節必須附帶 trigger_quote（從逐字稿該時間點±2分鐘內複製 10-30 字原文）
+✅ 每個章節必須附帶 asr_keywords（從逐字稿中複製 2-3 個該段出現的關鍵詞）
 ✅ 章節均勻分佈，約每 10-15 分鐘一個
+✅ 行政事務（點名、設備測試、休息）也要建立章節，標題如實描述
 
-## 背景參考
+## 證據規則（EVIDENCE RULE）
+如果你無法從逐字稿中找到支持某個章節的 trigger_quote 和 asr_keywords，
+則 **不要建立該章節**。寧可少一個章節，也不要製造一個虛假的章節。
+
+## 背景參考（僅供理解整體結構，不要用來決定章節標題）
 {structure_text[:600] if structure_text else ""}
 
 {modules_text[:600] if modules_text else ""}
 
-{unit_context_hint}
+{_anchor_hint}
 
 ## 逐字稿
 {asr_text}
@@ -2170,7 +2302,9 @@ def hierarchical_multipass_generation(
         final_response = call_llm(
             service_type=config.service_type, client=client,
             system_message=(
-                "你是細心的章節設計師。"
+                "你是細心的章節設計師。你只根據逐字稿內容生成章節，絕不根據課程名稱猜測。"
+                "每個章節的 Time 必須接近逐字稿中的真實時間戳。"
+                "每個章節必須有來自逐字稿的 trigger_quote 和 asr_keywords 作為證據。"
                 "請只輸出一個 JSON 物件，包含 SuggestedUnits 與 CourseSummary。"
                 "禁止輸出任何其他文字、禁止 ```。"
             ),
@@ -2204,7 +2338,20 @@ def hierarchical_multipass_generation(
             if isinstance(v, str):
                 course_summary[k] = to_traditional(v)
 
-    logger.info(f"\U0001f4ca Generated {len(suggested_units_structured)} chapters (before unit tagging)")
+    logger.info(f"\U0001f4ca Generated {len(suggested_units_structured)} chapters (before snapping & validation)")
+
+    # FIX 6: Timestamp snapping — force chapters to real ASR timestamps
+    snap_diagnostics = {}
+    if suggested_units_structured:
+        suggested_units_structured, snap_diagnostics = snap_chapters_to_asr_timestamps(
+            suggested_units_structured, raw_asr_text, tolerance_sec=30
+        )
+        # If strict snapping missed too many, retry with wider tolerance
+        if snap_diagnostics.get("chapters_snap_failed", 0) > len(suggested_units_structured) * 0.3:
+            logger.warning("⚠️ >30% chapters failed strict snap, retrying with ±90s tolerance")
+            suggested_units_structured, snap_diagnostics = snap_chapters_to_asr_timestamps(
+                suggested_units_structured, raw_asr_text, tolerance_sec=90
+            )
 
     # FIX 2: Quote validation
     quote_diagnostics = {}
@@ -2575,6 +2722,7 @@ def hierarchical_multipass_generation(
     metadata["chapter_windows"] = chapter_windows
     metadata["pass3_raw_json_text"] = final_text
     metadata["quote_validation"] = quote_diagnostics
+    metadata["timestamp_snapping"] = snap_diagnostics
 
     logger.info("\n" + "=" * 60)
     logger.info("✅ HIERARCHICAL GENERATION COMPLETE")
