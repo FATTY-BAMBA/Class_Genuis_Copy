@@ -2067,13 +2067,17 @@ def hierarchical_multipass_generation(
     
     logger.info(f"✅ Using per pass: ASR={asr_used:,} ({asr_coverage:.1f}%), OCR={ocr_used:,} ({ocr_coverage:.1f}%), Total={content_used:,}")
     
-    # ==================== PASS 1 ====================
+    # ==================== PASS 1: TRANSCRIPT MAP ====================
+    # Redesigned: Instead of "analyze the educational structure" (which invites
+    # syllabus hallucination), we ask the model to walk through the transcript
+    # in ~10-minute windows and report WHAT the instructor is actually saying,
+    # with mandatory evidence (exact quotes) per segment.
     logger.info("\n" + "-" * 60)
-    logger.info("\U0001f50d PASS 1: Course Structure Analysis")
+    logger.info("\U0001f50d PASS 1: Transcript Map (evidence-based)")
     logger.info("-" * 60)
     
     if progress_callback:
-        progress_callback("analyzing_course_structure", 40)
+        progress_callback("mapping_transcript_content", 40)
     
     # NOTE: video_title is NOT passed to PASS 1/2/3 to prevent title-based hallucination.
     # It is only used for unit validation and logging.
@@ -2090,89 +2094,152 @@ def hierarchical_multipass_generation(
             for unit in units:
                 logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
         logger.info("=" * 60)
-        
+
+    # Calculate time windows for the transcript map
+    _map_interval = 600  # 10 minutes per segment
+    _num_segments = max(6, int(duration) // _map_interval + 1)
+    _segment_labels = []
+    for i in range(_num_segments):
+        start = sec_to_hms(i * _map_interval)
+        end = sec_to_hms(min((i + 1) * _map_interval, int(duration)))
+        _segment_labels.append(f"  {i+1}. {start} ~ {end}")
+    _segments_text = "\n".join(_segment_labels)
+
     structure_prompt = f"""
-作為資深教學設計專家，分析這個{sec_to_hms(int(duration))}教學影片逐字稿的整體架構。
+你是逐字稿內容記錄員。你的任務是如實記錄講師在每個時段「實際說了什麼」。
 
-⚠️ 重要：只根據逐字稿中講師「實際說的內容」來分析，不要根據影片標題或課程名稱推測。
+⚠️ 嚴格禁止：
+- 禁止根據影片標題或課程名稱推測內容
+- 禁止編造講師沒有說過的話
+- 禁止使用「可能」「大概」「應該」等猜測性詞語
+- 如果某個時段在逐字稿中沒有內容，標記為 BREAK 或 NO_DATA
 
-【內容類型識別】
-1. 哪些時段是正式教學內容？（理論講解、技能示範、案例分析）
-2. 哪些時段是行政事務？（點名、設備測試、休息、課堂管理）
-3. 哪些時段是題外話或閒聊？（與課程主題無關的討論）
+## 影片時長：{sec_to_hms(int(duration))}
 
-【知識架構分析】
-- 講師實際涵蓋了哪些主題？按時間順序列出
-- 各主題的大約時間佔比
+## 需要分析的時段：
+{_segments_text}
 
-【教學方法識別】
-- 理論講解 vs. 實例演示 vs. 操作練習 的比例分佈
+## 任務
+對每個時段，你必須提供：
+1. **type**: TEACHING / ADMIN / TANGENT / BREAK / NO_DATA
+2. **topic**: 講師在該時段實際討論的主題（一句話，基於逐字稿內容）
+3. **evidence**: 從該時段的逐字稿中複製 1-2 句原文（必須是逐字稿中存在的文字）
+4. **keywords**: 從該時段的逐字稿中複製 3-5 個關鍵詞
 
-完整逐字稿：
+## 輸出格式（只輸出 JSON）
+{{
+  "transcript_map": [
+    {{
+      "segment": 1,
+      "time_range": "00:00:00 ~ 00:10:00",
+      "type": "ADMIN",
+      "topic": "講師進行點名並確認新同學的設備",
+      "evidence": "新同學第一天上課,今天是第一次上課的學生",
+      "keywords": ["新同學", "第一天", "上課", "設備"]
+    }}
+  ]
+}}
+
+## 完整逐字稿
 {asr_text}
 
-視覺輔助內容：
-{ocr_text if ocr_text else "無視覺輔助內容"}
+## 視覺輔助內容
+{ocr_text if ocr_text else "（無）"}
+
+只輸出 JSON，禁止其他文字。
 """
     
     t0 = time.time()
     try:
         structure_response = call_llm(
             service_type=config.service_type, client=client,
-            system_message="你是課程架構分析專家。你只根據逐字稿中講師實際說的內容來分析，絕不根據影片標題或課程名稱推測。你會誠實區分正式教學、行政事務和題外話。",
+            system_message=(
+                "你是逐字稿內容記錄員。你只記錄逐字稿中實際出現的內容，絕不推測或編造。"
+                "每個時段必須附帶從逐字稿中複製的原文作為證據。"
+                "只輸出 JSON，禁止其他文字。"
+            ),
             user_message=structure_prompt,
             model=config.openai_model if config.service_type == "openai" else config.azure_model,
-            max_tokens=1200, temperature=0.3
+            max_tokens=2000, temperature=0.1
         )
         structure_text = structure_response.choices[0].message.content
-        logger.info(f"✅ PASS 1 completed in {time.time() - t0:.1f}s ({len(structure_text)} chars)")
+        logger.info(f"✅ PASS 1 (Transcript Map) completed in {time.time() - t0:.1f}s ({len(structure_text)} chars)")
+        
+        # Parse and log the transcript map for diagnostics
+        _map_data = safe_load_json(structure_text)
+        if isinstance(_map_data, dict) and "transcript_map" in _map_data:
+            _tmap = _map_data["transcript_map"]
+            _type_counts = {}
+            for seg in _tmap:
+                stype = seg.get("type", "UNKNOWN")
+                _type_counts[stype] = _type_counts.get(stype, 0) + 1
+            logger.info(f"   📋 Transcript map: {len(_tmap)} segments")
+            logger.info(f"   📊 Content types: {_type_counts}")
+            for seg in _tmap:
+                _ev = str(seg.get("evidence", ""))[:50]
+                logger.info(
+                    f"   {seg.get('segment', '?')}. [{seg.get('time_range', '?')}] "
+                    f"{seg.get('type', '?')}: {seg.get('topic', '?')[:40]} "
+                    f"| evidence: \"{_ev}...\""
+                )
+        else:
+            logger.warning("⚠️ PASS 1 did not return valid transcript_map JSON, using raw text")
+            
     except Exception as e:
         logger.error(f"❌ PASS 1 failed: {e}", exc_info=True)
         raise
     
-    # ==================== PASS 2 ====================
+    # ==================== PASS 2: MODULE GROUPING ====================
+    # Redesigned: Groups adjacent transcript map segments with the same topic
+    # into modules. Uses the factual map as input, not free-form analysis.
     logger.info("\n" + "-" * 60)
-    logger.info("\U0001f4da PASS 2: Learning Modules Identification")
+    logger.info("\U0001f4da PASS 2: Module Grouping (from transcript map)")
     logger.info("-" * 60)
     
     if progress_callback:
         progress_callback("identifying_learning_modules", 60)
     
     modules_prompt = f"""
-基於課程結構分析：
+你是教學內容分組專家。以下是逐字稿的時段分析結果（PASS 1 Transcript Map）。
+
+## PASS 1 分析結果
 {structure_text}
 
-現在識別具體的學習模塊（7-12個），每個模塊應滿足：
-1. 有明確的學習目標
-2. 包含完整的教學閉環
-3. 時長合理（10-30分鐘）
+## 任務
+將相鄰的、主題相同或相關的時段合併為學習模塊。
 
-【模塊邊界識別策略】
-第一優先：講師的重大主題轉換（ASR）
-第二優先：教學邏輯的結構轉換
-第三優先：視覺結構變化（OCR）
+## 規則
+1. 相鄰的 ADMIN 時段合併為一個 ADMIN 模塊
+2. 相鄰的 TEACHING 時段如果討論同一主題，合併為一個模塊
+3. BREAK 時段單獨標記，不與其他模塊合併
+4. 模塊的 topic 描述必須基於 PASS 1 中的 evidence，不可編造新內容
+5. 每個模塊的 keywords 必須來自 PASS 1 中各時段的 keywords
+6. 產生 7-15 個模塊
 
-完整逐字稿：
+## 輸出格式
+模塊名稱 ~ 起始時間戳(HH:MM:SS) ~ 結束時間戳(HH:MM:SS) ~ 內容類型(TEACHING/ADMIN/TANGENT/BREAK) ~ 關鍵詞
+
+## 完整逐字稿（參考用，確認模塊邊界）
 {asr_text}
 
-視覺輔助內容：
-{ocr_text if ocr_text else "無視覺輔助內容"}
-
-請輸出格式：
-模塊名稱 ~ 起始時間戳(HH:MM:SS) ~ 結束時間戳(HH:MM:SS) ~ 核心學習點 ~ 教學方法
+## 視覺輔助內容
+{ocr_text if ocr_text else "（無）"}
 """
     
     t0 = time.time()
     try:
         modules_response = call_llm(
             service_type=config.service_type, client=client,
-            system_message="你是課程模塊設計師，擅長將教學內容分解為邏輯連貫的學習單元。",
+            system_message=(
+                "你是教學內容分組專家。你基於 PASS 1 的逐字稿分析結果來合併相鄰時段。"
+                "你不會編造新的主題或內容，只根據已有的分析結果進行分組。"
+            ),
             user_message=modules_prompt,
             model=config.openai_model if config.service_type == "openai" else config.azure_model,
             max_tokens=1500, temperature=0.2
         )
         modules_text = modules_response.choices[0].message.content
-        logger.info(f"✅ PASS 2 completed in {time.time() - t0:.1f}s ({len(modules_text)} chars)")
+        logger.info(f"✅ PASS 2 (Module Grouping) completed in {time.time() - t0:.1f}s ({len(modules_text)} chars)")
     except Exception as e:
         logger.error(f"❌ PASS 2 failed: {e}", exc_info=True)
         raise
@@ -2276,10 +2343,12 @@ def hierarchical_multipass_generation(
 如果你無法從逐字稿中找到支持某個章節的 trigger_quote 和 asr_keywords，
 則 **不要建立該章節**。寧可少一個章節，也不要製造一個虛假的章節。
 
-## 背景參考（僅供理解整體結構，不要用來決定章節標題）
-{structure_text[:600] if structure_text else ""}
+## 逐字稿地圖（PASS 1 產出 — 幫助你快速定位各時段的內容類型）
+⚠️ 這只是參考。你的章節標題和 trigger_quote 必須來自你自己閱讀逐字稿的結果，不可直接複製下方的 topic 或 evidence。
+{structure_text[:1000] if structure_text else ""}
 
-{modules_text[:600] if modules_text else ""}
+## 模塊分組（PASS 2 產出 — 幫助你理解主題邊界）
+{modules_text[:800] if modules_text else ""}
 
 {_anchor_hint}
 
