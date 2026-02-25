@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -2070,7 +2071,7 @@ def generate_unit_descriptors(
     units_text = "\n".join(unit_lines)
     
     section_context = f"課程名稱/段落：{section_title}" if section_title else "（未提供課程名稱）"
-    asr_excerpt = asr_sample[:2000] if asr_sample else "（無逐字稿摘要）"
+    asr_excerpt = asr_sample[:3000] if asr_sample else "（無逐字稿摘要）"
     
     descriptor_prompt = f"""你是教學內容分析專家。以下是一門課程的單元列表。請為每個單元生成描述詞，幫助後續自動分類。
 
@@ -2079,7 +2080,7 @@ def generate_unit_descriptors(
 【教學單元】
 {units_text}
 
-【逐字稿摘要（參考用，了解本課程實際內容）】
+【逐字稿摘要（參考用，了解本課程實際用語和教學風格）】
 {asr_excerpt}
 
 【任務】
@@ -2087,10 +2088,15 @@ def generate_unit_descriptors(
 1. intent：這個單元預計涵蓋什麼內容（1-2句話）
 2. keywords_positive：在逐字稿中聽到這些詞時，很可能正在教這個單元（8-20個詞）
 3. keywords_negative：聽到這些詞時，通常不是這個單元的內容（5-10個詞）
+4. conversational_phrases：老師在課堂上「口語化」提到這個主題時，可能會用的說法（3-8個短語）
 
 【重要原則】
 - 根據單元標題和課程名稱推斷內容，不要只複製標題文字
 - keywords 要具體（如「三腳架」「穩定器」），不要太泛（如「影片」「教學」）
+- ⚠️ conversational_phrases 極為重要：臺灣老師上課時通常不會使用正式的單元名稱。
+  例如「設備介紹」，老師可能說「我們先來看一下這個怎麼操作」；
+  「案例分析」，老師可能說「我們來看一下這個同學做的」或「這個例子你們看」。
+  請根據逐字稿的語氣風格，生成老師可能會使用的口語說法。
 - 如果單元標題太模糊無法推斷內容（如「第一章」「重點」），keywords 可以少一些，這是正常的
 - keywords_negative 用來區分相似但不同的單元
 
@@ -2099,10 +2105,11 @@ def generate_unit_descriptors(
   "unit_descriptors": [
     {{
       "unit_no": 1,
-      "unit_title": "設備",
-      "intent": "介紹影片拍攝所需的硬體設備與器材選擇",
-      "keywords_positive": ["相機", "手機", "鏡頭", "穩定器", "三腳架", "收音", "麥克風", "燈光", "器材", "設備"],
-      "keywords_negative": ["景別", "構圖", "剪輯", "後期", "轉場"]
+      "unit_title": "設備介紹與操作",
+      "intent": "介紹課程所需的工具、設備及基本操作方式",
+      "keywords_positive": ["工具", "設備", "操作", "安裝", "設定", "介面", "功能", "按鈕"],
+      "keywords_negative": ["理論", "原理", "歷史", "案例分析"],
+      "conversational_phrases": ["我們先來看一下這個怎麼用", "這邊有一個功能要跟大家介紹", "打開來之後你會看到", "同學先幫我把這個打開"]
     }}
   ]
 }}
@@ -2123,7 +2130,7 @@ def generate_unit_descriptors(
             ),
             user_message=descriptor_prompt,
             model=config.openai_model if config.service_type == "openai" else config.azure_model,
-            max_tokens=800,
+            max_tokens=1200,
             temperature=0.2,
         )
         
@@ -2160,7 +2167,8 @@ def format_descriptors_for_tagging(descriptors: List[Dict[str, Any]]) -> str:
         return ""
     
     lines = ["【單元描述詞（用於判斷章節歸屬的客觀依據）】"]
-    lines.append("標記章節時，請對照以下描述詞。只有當章節內容匹配多個 positive keywords 時，才歸入該單元。")
+    lines.append("標記章節時，請對照以下描述詞。")
+    lines.append("判斷方式：匹配 keywords 或 conversational_phrases 加上 intent 吻合即可歸入。")
     lines.append("")
     
     for desc in descriptors:
@@ -2169,18 +2177,23 @@ def format_descriptors_for_tagging(descriptors: List[Dict[str, Any]]) -> str:
         intent = desc.get("intent", "")
         kw_pos = desc.get("keywords_positive", [])
         kw_neg = desc.get("keywords_negative", [])
+        conv_phrases = desc.get("conversational_phrases", [])
         
         lines.append(f"📌 單元 {unit_no}：{title}")
         if intent:
             lines.append(f"   涵蓋範圍：{intent}")
         if kw_pos:
             lines.append(f"   ✅ 相關詞彙：{', '.join(kw_pos)}")
+        if conv_phrases:
+            lines.append(f"   🗣️ 老師可能的口語說法：{' / '.join(conv_phrases)}")
         if kw_neg:
             lines.append(f"   ❌ 不相關（屬於其他單元）：{', '.join(kw_neg)}")
         lines.append("")
     
-    lines.append("⚠️ 如果章節內容不匹配任何單元的 2 個以上 positive keywords，且 intent 不吻合，")
-    lines.append("   必須標記為 0（延伸教學內容）或 -1（非教學內容），不可強行歸入。")
+    lines.append("⚠️ 判斷規則：")
+    lines.append("   - 匹配 2+ positive keywords → 歸入該單元")
+    lines.append("   - 匹配 1+ conversational_phrases 且 intent 吻合 → 也可歸入該單元")
+    lines.append("   - 兩者都不滿足 → 必須標記為 0（延伸教學）或 -1（非教學）")
     
     return "\n".join(lines)
 
@@ -2205,6 +2218,103 @@ def slice_asr_by_time_range(asr_text: str, start_sec: int, end_sec: int) -> str:
             # continuation line (no timestamp) — include if we're in range
             lines_in_range.append(line)
     return "\n".join(lines_in_range)
+
+
+def detect_asr_garbage_lines(asr_text: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Pre-filter ASR text to detect and mark Whisper hallucination lines.
+    
+    Whisper generates garbage during silence/breaks:
+    - Extreme repetition: "人類是神,人類是神,人類是神..." (same phrase 10+ times)
+    - Ultra-long lines with <5% unique characters
+    - Lines marked as garbage are replaced with a noise marker so PASS 1 
+      correctly tags those time windows as BREAK instead of TEACHING.
+    
+    Returns: (cleaned_asr_text, diagnostics)
+    """
+    if not asr_text:
+        return asr_text, {"garbage_lines": 0, "total_lines": 0}
+    
+    cleaned_lines = []
+    garbage_count = 0
+    total_lines = 0
+    garbage_timestamps = []
+    
+    for line in asr_text.splitlines():
+        total_lines += 1
+        
+        # Extract timestamp if present (handles [260.0 - 280.0] and [HH:MM:SS] formats)
+        m = re.match(r'\[([\d.:]+)\s*-\s*([\d.:]+)\]', line)
+        if not m:
+            cleaned_lines.append(line)
+            continue
+        
+        ts_start = m.group(1)
+        ts_end = m.group(2)
+        text_part = line[m.end():].strip()
+        
+        if not text_part or len(text_part) < 20:
+            cleaned_lines.append(line)
+            continue
+        
+        is_garbage = False
+        reason = ""
+        
+        # --- Check 1: Repetition detection ---
+        if len(text_part) > 80:
+            for phrase_len in range(3, min(25, len(text_part) // 4)):
+                phrases = []
+                for i in range(0, len(text_part) - phrase_len + 1, phrase_len):
+                    phrases.append(text_part[i:i+phrase_len])
+                if len(phrases) >= 4:
+                    counts = Counter(phrases)
+                    top_phrase, top_count = counts.most_common(1)[0]
+                    ratio = top_count / len(phrases)
+                    if ratio > 0.45 and top_count >= 4:
+                        is_garbage = True
+                        reason = f"repetition({top_phrase[:10]}..x{top_count})"
+                        break
+        
+        # --- Check 2: Very long line with very low character diversity ---
+        if not is_garbage and len(text_part) > 300:
+            stripped = re.sub(r'[,，。、！？\s]', '', text_part)
+            if len(stripped) > 0:
+                unique_ratio = len(set(stripped)) / len(stripped)
+                if unique_ratio < 0.04:
+                    is_garbage = True
+                    reason = f"low_diversity({unique_ratio:.3f})"
+        
+        # --- Check 3: Extremely long line with repeated seed ---
+        if not is_garbage and len(text_part) > 500:
+            seed = text_part[:30]
+            occurrences = text_part.count(seed)
+            if occurrences >= 3:
+                is_garbage = True
+                reason = f"seed_repeat({seed[:15]}..x{occurrences})"
+        
+        if is_garbage:
+            garbage_count += 1
+            try:
+                garbage_timestamps.append(float(ts_start.split(':')[0]) if ':' in ts_start else float(ts_start))
+            except (ValueError, IndexError):
+                pass
+            cleaned_lines.append(f"[{ts_start} - {ts_end}] （ASR雜訊，非實際語音）")
+            logger.debug(f"   🧹 Garbage at [{ts_start}]: {reason}")
+        else:
+            cleaned_lines.append(line)
+    
+    diagnostics = {
+        "garbage_lines": garbage_count,
+        "total_lines": total_lines,
+        "garbage_ratio": round(garbage_count / max(total_lines, 1), 3),
+        "garbage_timestamps": garbage_timestamps[:20],
+    }
+    
+    if garbage_count > 0:
+        logger.info(f"🧹 ASR garbage detection: {garbage_count}/{total_lines} lines flagged "
+                    f"({diagnostics['garbage_ratio']:.1%})")
+    
+    return "\n".join(cleaned_lines), diagnostics
 
 
 def compute_chunk_plan(duration_sec: float) -> List[Tuple[int, int]]:
@@ -2284,6 +2394,11 @@ def hierarchical_multipass_generation(
                 f"{sampler_stats.get('lines_selected', '?')} lines selected from "
                 f"{sampler_stats.get('buckets_with_data', '?')}/{sampler_stats.get('num_buckets', '?')} buckets")
     ocr_text = truncate_text_by_tokens(ocr_context, OCR_LIMIT) if ocr_context else ""
+
+    # FIX A: Pre-filter ASR garbage (Whisper hallucination during silence/breaks)
+    asr_text, garbage_diagnostics = detect_asr_garbage_lines(asr_text)
+    if garbage_diagnostics["garbage_lines"] > 0:
+        logger.info(f"🧹 ASR pre-filter: {garbage_diagnostics['garbage_lines']} garbage lines neutralized")
 
     asr_ts_sorted = extract_asr_timestamps_sorted(raw_asr_text)
     asr_end_ts = asr_ts_sorted[-1] if asr_ts_sorted else sec_to_hms(int(duration))
@@ -2837,10 +2952,30 @@ asr_verbatim_sentence 必須是從「候選逐字稿原文」或逐字稿中複�
         )
         descriptors_text = format_descriptors_for_tagging(unit_descriptors) if unit_descriptors else ""
         
-        # Build chapter list for tagging prompt
+        # Build chapter list for tagging prompt — now with ASR excerpts for context
         chapter_lines = []
         for ch in suggested_units_structured:
-            chapter_lines.append(f"  {ch['UnitNo']}. [{ch['Time']}] {ch['Title']}")
+            ch_time = ch.get('Time', '')
+            ch_sec = ts_to_seconds_hms(ch_time)
+            
+            # Get a short ASR excerpt near this chapter's timestamp
+            asr_tag_excerpt = ""
+            if raw_asr_text and ch_sec >= 0:
+                excerpt_parts = []
+                for asr_line in raw_asr_text.splitlines():
+                    m_asr = ASR_TS_RE.match(asr_line)
+                    if m_asr:
+                        asr_sec = ts_to_seconds_hms(_normalize_ts(m_asr.group(1)))
+                        if abs(asr_sec - ch_sec) <= 120:  # ±2 min window
+                            text_part = asr_line[m_asr.end():].strip().lstrip(':- ').strip()
+                            if text_part and len(text_part) > 10 and '雜訊' not in text_part:
+                                excerpt_parts.append(text_part[:50])
+                    if len(excerpt_parts) >= 2:
+                        break
+                if excerpt_parts:
+                    asr_tag_excerpt = f" | ASR: {'...'.join(excerpt_parts)}"
+            
+            chapter_lines.append(f"  {ch['UnitNo']}. [{ch['Time']}] {ch['Title']}{asr_tag_excerpt}")
         chapters_list_text = "\n".join(chapter_lines)
         
         unit_lines = []
@@ -2886,7 +3021,10 @@ asr_verbatim_sentence 必須是從「候選逐字稿原文」或逐字稿中複�
 - matched_keywords = 該章節匹配到的 positive keywords
 - reason = 簡短分類理由（10字內）
 
-⚠️ 硬性規則：如果 matched_keywords 少於 2 個且 intent 不明確吻合 → 必須標記為 0 或 -1
+⚠️ 硬性規則：
+- matched_keywords 有 2+ 個 → 可歸入該單元
+- 章節 ASR 內容匹配某單元的 conversational_phrases 且 intent 相符 → 也可歸入
+- 兩者都不滿足 → 必須標記為 0 或 -1
 
 必須為每個章節都提供標記。只輸出 JSON。
 """
