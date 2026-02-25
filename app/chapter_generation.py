@@ -33,7 +33,7 @@ PASS3_JSON_SCHEMA = """
       "ParentUnitNo": null,
       "Title": "章節標題（繁體中文，反映講師實際講了什麼）",
       "Time": "HH:MM:SS（必須是逐字稿中存在的時間戳）",
-      "trigger_quote": "從逐字稿中該時間點±2分鐘內複製的原文（10-30字）",
+      "asr_verbatim_sentence": "從候選逐字稿原文中選擇的完整句子（見下方候選列表）",
       "asr_keywords": ["關鍵詞1", "關鍵詞2", "關鍵詞3"]
     }
   ],
@@ -744,7 +744,7 @@ def normalize_suggested_units(
             "Time": ts,
             "ClientUnitNo": client_unit_no,
             "ClientUnitTitle": client_unit_title,
-            "trigger_quote": str(su.get("trigger_quote", "")).strip(),
+            "trigger_quote": str(su.get("asr_verbatim_sentence", su.get("trigger_quote", ""))).strip(),
             "asr_keywords": asr_kw,
         })
 
@@ -1039,6 +1039,191 @@ def snap_chapters_to_asr_timestamps(
 
 
 # ─── FIX 2: Bigram Quote Validator ───
+def build_candidate_windows_for_chapters(
+    suggested_units: List[Dict[str, Any]],
+    raw_asr_text: str,
+    window_sec: int = 120,
+    max_candidates: int = 15,
+) -> Dict[str, List[str]]:
+    """
+    For each chapter, extract ASR lines within ±window_sec of its timestamp.
+    Returns {timestamp_str: [asr_line_1, asr_line_2, ...]} for use in PASS 3 prompt
+    or repair loop.
+    """
+    asr_lines_by_sec: List[Tuple[int, str]] = []
+    for line in (raw_asr_text or "").splitlines():
+        m = ASR_TS_RE.match(line)
+        if m:
+            ts = _normalize_ts(m.group(1))
+            sec = ts_to_seconds_hms(ts)
+            text = line[m.end():].strip().lstrip(':- ').strip()
+            if sec >= 0 and text and len(text) >= 6:
+                asr_lines_by_sec.append((sec, text))
+
+    windows = {}
+    for su in suggested_units:
+        ts = str(su.get("Time", "")).strip()
+        ch_sec = ts_to_seconds_hms(ts)
+        if ch_sec < 0:
+            continue
+
+        candidates = []
+        for asr_sec, asr_text_line in asr_lines_by_sec:
+            if abs(asr_sec - ch_sec) <= window_sec:
+                candidates.append(asr_text_line)
+        
+        # Deduplicate and limit
+        seen = set()
+        unique_candidates = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                unique_candidates.append(c)
+                if len(unique_candidates) >= max_candidates:
+                    break
+        
+        windows[ts] = unique_candidates
+
+    return windows
+
+
+def build_evidence_windows_text(
+    duration_sec: int,
+    raw_asr_text: str,
+    window_sec: int = 120,
+    max_candidates: int = 12,
+    interval_sec: int = 600,
+) -> str:
+    """
+    Pre-build candidate evidence windows at regular intervals for PASS 3 prompt.
+    Returns formatted text showing ASR lines available near each potential chapter point.
+    """
+    asr_lines_by_sec: List[Tuple[int, str, str]] = []  # (sec, text, timestamp_str)
+    for line in (raw_asr_text or "").splitlines():
+        m = ASR_TS_RE.match(line)
+        if m:
+            ts = _normalize_ts(m.group(1))
+            sec = ts_to_seconds_hms(ts)
+            text = line[m.end():].strip().lstrip(':- ').strip()
+            if sec >= 0 and text and len(text) >= 6:
+                asr_lines_by_sec.append((sec, text, ts))
+
+    blocks = []
+    t = 0
+    while t < duration_sec:
+        center = t + interval_sec // 2
+        candidates = []
+        seen = set()
+        for asr_sec, asr_text_line, asr_ts in asr_lines_by_sec:
+            if abs(asr_sec - center) <= window_sec and asr_text_line not in seen:
+                seen.add(asr_text_line)
+                candidates.append(f"  [{asr_ts}] {asr_text_line}")
+                if len(candidates) >= max_candidates:
+                    break
+        
+        if candidates:
+            start_ts = sec_to_hms(t)
+            end_ts = sec_to_hms(min(t + interval_sec, duration_sec))
+            blocks.append(f"### {start_ts} ~ {end_ts} 附近的逐字稿原文：\n" + "\n".join(candidates))
+        
+        t += interval_sec
+
+    return "\n\n".join(blocks)
+
+
+def repair_failed_quotes(
+    failed_chapters: List[Dict[str, Any]],
+    raw_asr_text: str,
+    client: Any,
+    config: "ChapterConfig",
+    max_repairs: int = 6,
+    window_sec: int = 150,
+    max_candidates: int = 15,
+) -> List[Dict[str, Any]]:
+    """
+    For chapters that failed quote validation, do a targeted micro-repair:
+    present candidate ASR lines and ask the model to pick the best one.
+    Returns updated chapters with repaired quotes.
+    """
+    if not failed_chapters:
+        return failed_chapters
+
+    # Build candidate windows for failed chapters
+    windows = build_candidate_windows_for_chapters(
+        failed_chapters, raw_asr_text, window_sec=window_sec, max_candidates=max_candidates
+    )
+
+    repaired = []
+    repair_count = 0
+
+    for su in failed_chapters:
+        ts = str(su.get("Time", "")).strip()
+        title = str(su.get("Title", "")).strip()
+        candidates = windows.get(ts, [])
+
+        if not candidates or repair_count >= max_repairs:
+            repaired.append(su)
+            continue
+
+        # Build candidate list
+        candidate_list = "\n".join(f"  [{i+1}] {c}" for i, c in enumerate(candidates))
+
+        repair_prompt = f"""你需要為以下章節選擇一句最能代表該章節主題的逐字稿原文。
+
+## 章節
+標題：{title}
+時間：{ts}
+
+## 候選逐字稿原文（從逐字稿中提取，全部都是真實的）
+{candidate_list}
+
+## 規則
+1. 你必須從上方候選列表中選擇一句，完整複製，不可修改任何文字
+2. 選擇最能代表該章節主題的句子
+3. 只輸出被選中的句子本身，不要輸出編號或任何其他文字
+
+## 你的選擇："""
+
+        try:
+            repair_response = call_llm(
+                service_type=config.service_type, client=client,
+                system_message="你從候選列表中選擇一句逐字稿原文。只輸出被選中的句子，不要輸出任何其他文字。",
+                user_message=repair_prompt,
+                model=config.openai_model if config.service_type == "openai" else config.azure_model,
+                max_tokens=200, temperature=0.0
+            )
+            selected = repair_response.choices[0].message.content.strip()
+            
+            # Clean up: remove potential numbering prefix
+            selected = re.sub(r'^\[?\d+\]?\s*', '', selected).strip()
+            selected = selected.strip('"\'').strip()
+            
+            # Verify the selected text is actually from candidates
+            is_valid = False
+            for c in candidates:
+                if selected in c or c in selected:
+                    selected = c  # Use exact candidate text
+                    is_valid = True
+                    break
+            
+            if is_valid:
+                su["trigger_quote"] = selected
+                su["_quote_repaired"] = True
+                logger.info(f"   🔧 Repaired quote for '{title[:30]}' @ {ts}: \"{selected[:40]}...\"")
+            else:
+                logger.warning(f"   ⚠️ Repair failed for '{title[:30]}' @ {ts}: selected text not in candidates")
+                su["_quote_repaired"] = False
+
+            repair_count += 1
+        except Exception as e:
+            logger.warning(f"   ⚠️ Repair LLM call failed for '{title[:30]}': {e}")
+            su["_quote_repaired"] = False
+
+        repaired.append(su)
+
+    return repaired
+
+
 def validate_chapters_against_asr(
     suggested_units: List[Dict[str, Any]],
     raw_asr_text: str,
@@ -1175,7 +1360,8 @@ def strip_internal_fields(suggested_units: List[Dict[str, Any]]) -> List[Dict[st
     if not suggested_units:
         return suggested_units
 
-    INTERNAL_FIELDS = {"trigger_quote", "_quote_validated", "_tag_reason", "asr_keywords",
+    INTERNAL_FIELDS = {"trigger_quote", "asr_verbatim_sentence", "_quote_validated", "_quote_repaired",
+                       "_tag_reason", "asr_keywords",
                        "_original_time", "_snap_distance_sec", "_snap_failed"}
 
     cleaned = []
@@ -2441,6 +2627,16 @@ evidence 寫 "（無逐字稿內容）"，keywords 寫空陣列。絕對不要�
 {', '.join(anchors)}
 """
 
+    # Build candidate evidence windows for PASS 3 — pre-extracted ASR lines at regular intervals
+    _evidence_windows_text = build_evidence_windows_text(
+        duration_sec=int(duration),
+        raw_asr_text=raw_asr_text,
+        window_sec=120,
+        max_candidates=12,
+        interval_sec=600,  # every 10 minutes
+    )
+    logger.info(f"   📋 Built evidence windows: {len(_evidence_windows_text)} chars")
+
     chapters_prompt = f"""
 # \U0001f6a8 最重要原則：從逐字稿內容出發，禁止憑空想像
 
@@ -2454,22 +2650,39 @@ evidence 寫 "（無逐字稿內容）"，keywords 寫空陣列。絕對不要�
 ❌ 章節數量少於 {_hard_min} 個
 ❌ 相鄰章節超過 20 分鐘
 ❌ 使用整數分鐘時間戳（如 01:00:00, 01:10:00, 01:20:00）除非逐字稿中確實存在
-❌ 編造 trigger_quote 或 asr_keywords（必須是逐字稿中的原文）
+❌ 在 asr_verbatim_sentence 中放入關鍵詞列表或章節標題
 
 ## 必須遵守
 ✅ 每個章節的 Title 必須反映講師在該時間點「實際說了什麼」
 ✅ 每個 Time 必須接近逐字稿中一個真實的時間戳（±30秒內）
-✅ 每個章節必須附帶 trigger_quote（從逐字稿該時間點±2分鐘內複製 10-30 字原文）
+✅ 每個章節必須附帶 asr_verbatim_sentence（見下方規則）
 ✅ 每個章節必須附帶 asr_keywords（從逐字稿中複製 2-3 個該段出現的關鍵詞）
 ✅ 章節均勻分佈，約每 10-15 分鐘一個
 ✅ 行政事務（點名、設備測試、休息）也要建立章節，標題如實描述
 
+## ⚠️ asr_verbatim_sentence 規則（極重要）
+asr_verbatim_sentence 必須是從「候選逐字稿原文」或逐字稿中複製的 **完整句子**，至少 10 個字。
+
+✅ 正確示範：
+"穩定器來講的話，是我們在拍攝的過程中"
+"新同學第一天上課,今天是第一次上課的學生"
+"因為你們未來要走自媒體之類的話"
+
+❌ 錯誤示範（會被系統自動拒絕）：
+"穩定器,拍攝,技巧,手機,晃動" ← 這是關鍵詞列表，不是句子
+"拍攝設備與技巧" ← 這是章節標題的複製，不是逐字稿原文
+"拍攝的時候要注意。" ← 太短且模糊
+"拍攝,設備,技巧,智慧型手機,單眼" ← 逗號分隔的詞語不是句子
+
+## 候選逐字稿原文（每個時段的真實 ASR 原文，請從中選擇 asr_verbatim_sentence）
+{_evidence_windows_text}
+
 ## 證據規則（EVIDENCE RULE）
-如果你無法從逐字稿中找到支持某個章節的 trigger_quote 和 asr_keywords，
+如果你無法從逐字稿中找到支持某個章節的 asr_verbatim_sentence，
 則 **不要建立該章節**。寧可少一個章節，也不要製造一個虛假的章節。
 
 ## 逐字稿地圖（PASS 1 產出 — 幫助你快速定位各時段的內容類型）
-⚠️ 這只是參考。你的章節標題和 trigger_quote 必須來自你自己閱讀逐字稿的結果，不可直接複製下方的 topic 或 evidence。
+⚠️ 這只是參考。你的章節標題和 asr_verbatim_sentence 必須來自你自己閱讀逐字稿的結果，不可直接複製下方的 topic 或 evidence。
 {structure_text[:1000] if structure_text else ""}
 
 ## 模塊分組（PASS 2 產出 — 幫助你理解主題邊界）
@@ -2498,7 +2711,8 @@ evidence 寫 "（無逐字稿內容）"，keywords 寫空陣列。絕對不要�
             system_message=(
                 "你是細心的章節設計師。你只根據逐字稿內容生成章節，絕不根據課程名稱猜測。"
                 "每個章節的 Time 必須接近逐字稿中的真實時間戳。"
-                "每個章節必須有來自逐字稿的 trigger_quote 和 asr_keywords 作為證據。"
+                "每個章節的 asr_verbatim_sentence 必須是從逐字稿複製的完整句子（至少10字），"
+                "絕對不可以是關鍵詞列表或章節標題。"
                 "請只輸出一個 JSON 物件，包含 SuggestedUnits 與 CourseSummary。"
                 "禁止輸出任何其他文字、禁止 ```。"
             ),
@@ -2555,6 +2769,52 @@ evidence 寫 "（無逐字稿內容）"，keywords 寫空陣列。絕對不要�
         )
         if quote_diagnostics.get("threshold_exceeded"):
             logger.warning(f"⚠️ Quote validation threshold exceeded (rate={quote_diagnostics['hallucination_rate']:.0%})")
+    
+    # ─── REPAIR LOOP: Fix failed quotes by picking from candidate ASR lines ───
+    repair_diagnostics = {"attempted": 0, "repaired": 0, "still_failed": 0}
+    if suggested_units_structured and quote_diagnostics.get("quotes_failed", 0) > 0:
+        failed_chapters = [su for su in suggested_units_structured if su.get("_quote_validated") is False]
+        if failed_chapters:
+            logger.info(f"\n🔧 REPAIR LOOP: Attempting to fix {len(failed_chapters)} failed quotes")
+            repair_diagnostics["attempted"] = len(failed_chapters)
+            
+            repaired_chapters = repair_failed_quotes(
+                failed_chapters=failed_chapters,
+                raw_asr_text=raw_asr_text,
+                client=client,
+                config=config,
+                max_repairs=6,
+                window_sec=150,
+                max_candidates=15,
+            )
+            
+            # Merge repaired chapters back into the main list
+            repaired_map = {str(su.get("Time", "")): su for su in repaired_chapters if su.get("_quote_repaired")}
+            for i, su in enumerate(suggested_units_structured):
+                ts = str(su.get("Time", ""))
+                if ts in repaired_map:
+                    suggested_units_structured[i] = repaired_map[ts]
+            
+            # Re-validate after repair
+            if repaired_map:
+                logger.info(f"   🔄 Re-validating after {len(repaired_map)} repairs...")
+                suggested_units_structured, quote_diagnostics_2 = validate_chapters_against_asr(
+                    suggested_units_structured, raw_asr_text, tolerance_sec=180
+                )
+                repair_diagnostics["repaired"] = len(repaired_map)
+                repair_diagnostics["still_failed"] = quote_diagnostics_2.get("quotes_failed", 0)
+                
+                logger.info(f"   ✅ After repair: {quote_diagnostics_2.get('quotes_failed', 0)} still failed "
+                           f"(was {quote_diagnostics.get('quotes_failed', 0)})")
+                
+                # Update quote_diagnostics with post-repair numbers
+                quote_diagnostics["pre_repair_failed"] = quote_diagnostics.get("quotes_failed", 0)
+                quote_diagnostics.update(quote_diagnostics_2)
+                quote_diagnostics["repair_attempted"] = repair_diagnostics["attempted"]
+                quote_diagnostics["repair_succeeded"] = repair_diagnostics["repaired"]
+            else:
+                repair_diagnostics["still_failed"] = len(failed_chapters)
+                logger.warning(f"   ⚠️ No repairs succeeded")
     
     # ────────── STEP 2: Semantic unit tagging with FIX 3.0 descriptors ──────────
     unit_descriptors = None
