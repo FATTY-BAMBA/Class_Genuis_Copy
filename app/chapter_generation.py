@@ -2003,6 +2003,58 @@ def format_descriptors_for_tagging(descriptors: List[Dict[str, Any]]) -> str:
 # Hierarchical Multi-Pass Generation
 # ─────────────────────────
 
+def slice_asr_by_time_range(asr_text: str, start_sec: int, end_sec: int) -> str:
+    """
+    Extract ASR lines whose timestamps fall within [start_sec, end_sec).
+    Returns the text block for that time window only.
+    """
+    lines_in_range = []
+    for line in (asr_text or "").splitlines():
+        m = ASR_TS_RE.match(line)
+        if m:
+            t = ts_to_seconds_hms(_normalize_ts(m.group(1)))
+            if start_sec <= t < end_sec:
+                lines_in_range.append(line)
+        elif lines_in_range:
+            # continuation line (no timestamp) — include if we're in range
+            lines_in_range.append(line)
+    return "\n".join(lines_in_range)
+
+
+def compute_chunk_plan(duration_sec: float) -> List[Tuple[int, int]]:
+    """
+    Adaptive chunking strategy based on video duration.
+    Returns list of (start_sec, end_sec) tuples.
+    
+    < 1 hour:  no chunking (1 chunk)
+    1-2 hours: 2 chunks (~30 min each)
+    2-3 hours: 3-4 chunks (~45 min each)
+    3-4 hours: 4-5 chunks
+    4+ hours:  cap at 6 chunks
+    """
+    dur = int(duration_sec)
+    
+    if dur <= 3600:         # < 1 hour
+        num_chunks = 1
+    elif dur <= 7200:       # 1-2 hours
+        num_chunks = 2
+    elif dur <= 10800:      # 2-3 hours
+        num_chunks = 3
+    elif dur <= 14400:      # 3-4 hours
+        num_chunks = 4
+    else:                   # 4+ hours
+        num_chunks = min(6, max(4, dur // 3600 + 1))
+    
+    chunk_duration = dur // num_chunks
+    chunks = []
+    for i in range(num_chunks):
+        start = i * chunk_duration
+        end = (i + 1) * chunk_duration if i < num_chunks - 1 else dur
+        chunks.append((start, end))
+    
+    return chunks
+
+
 def should_use_hierarchical(duration: float, transcript_length: int) -> bool:
     return (duration >= 1800 and transcript_length >= 5000 and duration <= 14400)
 
@@ -2067,11 +2119,11 @@ def hierarchical_multipass_generation(
     
     logger.info(f"✅ Using per pass: ASR={asr_used:,} ({asr_coverage:.1f}%), OCR={ocr_used:,} ({ocr_coverage:.1f}%), Total={content_used:,}")
     
-    # ==================== PASS 1: TRANSCRIPT MAP ====================
-    # Redesigned: Instead of "analyze the educational structure" (which invites
-    # syllabus hallucination), we ask the model to walk through the transcript
-    # in ~10-minute windows and report WHAT the instructor is actually saying,
-    # with mandatory evidence (exact quotes) per segment.
+    # ==================== PASS 1: TRANSCRIPT MAP (ADAPTIVE CHUNKING) ====================
+    # For videos > 1 hour, we split the transcript into chunks and process each
+    # independently. This prevents long-context attention decay where the model
+    # reads the first ~30 min honestly then fabricates evidence for the rest.
+    # Each chunk only sees its own ASR window, forcing honest per-segment reporting.
     logger.info("\n" + "-" * 60)
     logger.info("\U0001f50d PASS 1: Transcript Map (evidence-based)")
     logger.info("-" * 60)
@@ -2095,17 +2147,28 @@ def hierarchical_multipass_generation(
                 logger.info(f"      {unit['UnitNo']}. {unit['Title']}")
         logger.info("=" * 60)
 
-    # Calculate time windows for the transcript map
-    _map_interval = 600  # 10 minutes per segment
-    _num_segments = max(6, int(duration) // _map_interval + 1)
-    _segment_labels = []
-    for i in range(_num_segments):
-        start = sec_to_hms(i * _map_interval)
-        end = sec_to_hms(min((i + 1) * _map_interval, int(duration)))
-        _segment_labels.append(f"  {i+1}. {start} ~ {end}")
-    _segments_text = "\n".join(_segment_labels)
+    # Compute adaptive chunk plan based on duration
+    chunk_plan = compute_chunk_plan(duration)
+    num_chunks = len(chunk_plan)
+    
+    logger.info(f"   📦 Chunk plan: {num_chunks} chunk(s) for {sec_to_hms(int(duration))} video")
+    for ci, (cs, ce) in enumerate(chunk_plan):
+        logger.info(f"      Chunk {ci+1}: {sec_to_hms(cs)} → {sec_to_hms(ce)}")
 
-    structure_prompt = f"""
+    def _build_pass1_prompt_for_chunk(chunk_asr: str, chunk_start_sec: int, chunk_end_sec: int, chunk_idx: int) -> str:
+        """Build PASS 1 prompt for a single chunk of the transcript."""
+        _map_interval = 600  # 10 minutes per segment
+        _segment_labels = []
+        seg_num = 1
+        t = chunk_start_sec
+        while t < chunk_end_sec:
+            seg_end = min(t + _map_interval, chunk_end_sec)
+            _segment_labels.append(f"  {seg_num}. {sec_to_hms(t)} ~ {sec_to_hms(seg_end)}")
+            seg_num += 1
+            t = seg_end
+        _segments_text = "\n".join(_segment_labels)
+
+        return f"""
 你是逐字稿內容記錄員。你的任務是如實記錄講師在每個時段「實際說了什麼」。
 
 ⚠️ 嚴格禁止：
@@ -2114,7 +2177,7 @@ def hierarchical_multipass_generation(
 - 禁止使用「可能」「大概」「應該」等猜測性詞語
 - 如果某個時段在逐字稿中沒有內容，標記為 BREAK 或 NO_DATA
 
-## 影片時長：{sec_to_hms(int(duration))}
+## 你負責的時段範圍：{sec_to_hms(chunk_start_sec)} ~ {sec_to_hms(chunk_end_sec)}
 
 ## 需要分析的時段：
 {_segments_text}
@@ -2126,64 +2189,126 @@ def hierarchical_multipass_generation(
 3. **evidence**: 從該時段的逐字稿中複製 1-2 句原文（必須是逐字稿中存在的文字）
 4. **keywords**: 從該時段的逐字稿中複製 3-5 個關鍵詞
 
+⚠️ 重要：如果某個時段的逐字稿中沒有任何內容（例如休息時間），你必須標記為 BREAK，
+evidence 寫 "（無逐字稿內容）"，keywords 寫空陣列。絕對不要為沒有內容的時段編造文字。
+
 ## 輸出格式（只輸出 JSON）
 {{
   "transcript_map": [
     {{
       "segment": 1,
-      "time_range": "00:00:00 ~ 00:10:00",
-      "type": "ADMIN",
-      "topic": "講師進行點名並確認新同學的設備",
-      "evidence": "新同學第一天上課,今天是第一次上課的學生",
-      "keywords": ["新同學", "第一天", "上課", "設備"]
+      "time_range": "{sec_to_hms(chunk_start_sec)} ~ {sec_to_hms(min(chunk_start_sec + _map_interval, chunk_end_sec))}",
+      "type": "TEACHING",
+      "topic": "講師實際討論的主題",
+      "evidence": "從逐字稿複製的原文",
+      "keywords": ["關鍵詞1", "關鍵詞2", "關鍵詞3"]
     }}
   ]
 }}
 
-## 完整逐字稿
-{asr_text}
-
-## 視覺輔助內容
-{ocr_text if ocr_text else "（無）"}
+## 逐字稿（僅包含你負責的時段 {sec_to_hms(chunk_start_sec)} ~ {sec_to_hms(chunk_end_sec)}）
+{chunk_asr}
 
 只輸出 JSON，禁止其他文字。
 """
-    
+
     t0 = time.time()
+    all_segments = []  # Collect segments from all chunks
+    chunk_results_raw = []  # Raw text per chunk for diagnostics
+    
     try:
-        structure_response = call_llm(
-            service_type=config.service_type, client=client,
-            system_message=(
-                "你是逐字稿內容記錄員。你只記錄逐字稿中實際出現的內容，絕不推測或編造。"
-                "每個時段必須附帶從逐字稿中複製的原文作為證據。"
-                "只輸出 JSON，禁止其他文字。"
-            ),
-            user_message=structure_prompt,
-            model=config.openai_model if config.service_type == "openai" else config.azure_model,
-            max_tokens=2000, temperature=0.1
-        )
-        structure_text = structure_response.choices[0].message.content
-        logger.info(f"✅ PASS 1 (Transcript Map) completed in {time.time() - t0:.1f}s ({len(structure_text)} chars)")
+        for ci, (chunk_start, chunk_end) in enumerate(chunk_plan):
+            # Slice ASR to only this chunk's time window
+            chunk_asr = slice_asr_by_time_range(asr_text, chunk_start, chunk_end)
+            chunk_asr_tokens = count_tokens_llama(chunk_asr) if chunk_asr else 0
+            
+            logger.info(f"   🔄 Chunk {ci+1}/{num_chunks}: {sec_to_hms(chunk_start)} → {sec_to_hms(chunk_end)} "
+                        f"({chunk_asr_tokens:,} ASR tokens)")
+            
+            if not chunk_asr.strip():
+                # No ASR content in this window — create synthetic BREAK segments
+                logger.warning(f"   ⚠️ Chunk {ci+1} has no ASR content — marking as BREAK")
+                _map_interval = 600
+                t = chunk_start
+                while t < chunk_end:
+                    seg_end = min(t + _map_interval, chunk_end)
+                    all_segments.append({
+                        "segment": len(all_segments) + 1,
+                        "time_range": f"{sec_to_hms(t)} ~ {sec_to_hms(seg_end)}",
+                        "type": "BREAK",
+                        "topic": "（無逐字稿內容）",
+                        "evidence": "（無逐字稿內容）",
+                        "keywords": []
+                    })
+                    t = seg_end
+                chunk_results_raw.append("{}")
+                continue
+
+            prompt = _build_pass1_prompt_for_chunk(chunk_asr, chunk_start, chunk_end, ci)
+            
+            # Max tokens scales with chunk size: ~100 tokens per 10-min segment
+            chunk_duration = chunk_end - chunk_start
+            _est_segments = max(3, chunk_duration // 600 + 1)
+            _max_tokens = min(2000, _est_segments * 150 + 200)
+            
+            chunk_response = call_llm(
+                service_type=config.service_type, client=client,
+                system_message=(
+                    "你是逐字稿內容記錄員。你只記錄逐字稿中實際出現的內容，絕不推測或編造。"
+                    "每個時段必須附帶從逐字稿中複製的原文作為證據。"
+                    "如果某時段沒有逐字稿內容，必須標記為 BREAK。"
+                    "只輸出 JSON，禁止其他文字。"
+                ),
+                user_message=prompt,
+                model=config.openai_model if config.service_type == "openai" else config.azure_model,
+                max_tokens=_max_tokens, temperature=0.1
+            )
+            chunk_text = chunk_response.choices[0].message.content
+            chunk_results_raw.append(chunk_text)
+            
+            # Parse chunk result
+            _chunk_data = safe_load_json(chunk_text)
+            if isinstance(_chunk_data, dict) and "transcript_map" in _chunk_data:
+                chunk_segments = _chunk_data["transcript_map"]
+                # Re-number segments globally
+                for seg in chunk_segments:
+                    seg["segment"] = len(all_segments) + 1
+                    all_segments.append(seg)
+                logger.info(f"   ✅ Chunk {ci+1}: {len(chunk_segments)} segments parsed")
+            else:
+                logger.warning(f"   ⚠️ Chunk {ci+1} did not return valid JSON — using raw text")
+                # Store raw text as a single catch-all segment
+                all_segments.append({
+                    "segment": len(all_segments) + 1,
+                    "time_range": f"{sec_to_hms(chunk_start)} ~ {sec_to_hms(chunk_end)}",
+                    "type": "TEACHING",
+                    "topic": f"（Chunk {ci+1} 未能解析 JSON）",
+                    "evidence": chunk_text[:100],
+                    "keywords": []
+                })
         
-        # Parse and log the transcript map for diagnostics
-        _map_data = safe_load_json(structure_text)
-        if isinstance(_map_data, dict) and "transcript_map" in _map_data:
-            _tmap = _map_data["transcript_map"]
-            _type_counts = {}
-            for seg in _tmap:
-                stype = seg.get("type", "UNKNOWN")
-                _type_counts[stype] = _type_counts.get(stype, 0) + 1
-            logger.info(f"   📋 Transcript map: {len(_tmap)} segments")
-            logger.info(f"   📊 Content types: {_type_counts}")
-            for seg in _tmap:
-                _ev = str(seg.get("evidence", ""))[:50]
-                logger.info(
-                    f"   {seg.get('segment', '?')}. [{seg.get('time_range', '?')}] "
-                    f"{seg.get('type', '?')}: {seg.get('topic', '?')[:40]} "
-                    f"| evidence: \"{_ev}...\""
-                )
-        else:
-            logger.warning("⚠️ PASS 1 did not return valid transcript_map JSON, using raw text")
+        # Stitch all segments into final transcript map JSON
+        _stitched_map = {"transcript_map": all_segments}
+        structure_text = json.dumps(_stitched_map, ensure_ascii=False, indent=2)
+        
+        elapsed = time.time() - t0
+        logger.info(f"✅ PASS 1 (Transcript Map) completed in {elapsed:.1f}s "
+                    f"({num_chunks} chunks, {len(all_segments)} total segments, {len(structure_text)} chars)")
+        
+        # Log diagnostics for the stitched map
+        _type_counts = {}
+        for seg in all_segments:
+            stype = seg.get("type", "UNKNOWN")
+            _type_counts[stype] = _type_counts.get(stype, 0) + 1
+        logger.info(f"   📋 Transcript map: {len(all_segments)} segments")
+        logger.info(f"   📊 Content types: {_type_counts}")
+        for seg in all_segments:
+            _ev = str(seg.get("evidence", ""))[:50]
+            logger.info(
+                f"   {seg.get('segment', '?')}. [{seg.get('time_range', '?')}] "
+                f"{seg.get('type', '?')}: {seg.get('topic', '?')[:40]} "
+                f"| evidence: \"{_ev}...\""
+            )
             
     except Exception as e:
         logger.error(f"❌ PASS 1 failed: {e}", exc_info=True)
