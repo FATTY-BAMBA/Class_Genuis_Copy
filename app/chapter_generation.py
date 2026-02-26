@@ -314,6 +314,143 @@ def clean_all_suggested_units(suggested_units: list) -> list:
     ]
     logger.info(f"🧹 Cleaned {len(cleaned)} SuggestedUnit titles")
     return cleaned
+# ─── FIX 1 & 2: Post-process SuggestedUnits for client delivery ───
+
+def filter_admin_from_suggested_units(
+    suggested_units: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    FIX 1: Remove ADMIN units (ClientUnitNo == -1) from client-facing SuggestedUnits.
+    Students don't need chapter markers for attendance, equipment checks, or breaks.
+    
+    Returns: (filtered_units, admin_count_removed)
+    """
+    if not suggested_units:
+        return suggested_units, 0
+    
+    filtered = []
+    removed = 0
+    for su in suggested_units:
+        if su.get("ClientUnitNo") == -1:
+            removed += 1
+            logger.debug(f"   🗑️ Filtered ADMIN unit: {su.get('Title', '')[:40]} @ {su.get('Time', '')}")
+        else:
+            filtered.append(su)
+    
+    # Renumber UnitNo sequentially after filtering
+    for i, su in enumerate(filtered, 1):
+        su["UnitNo"] = i
+    
+    if removed > 0:
+        logger.info(f"🗑️ Filtered {removed} ADMIN units from SuggestedUnits ({len(filtered)} remaining)")
+    
+    return filtered, removed
+
+
+def merge_micro_units(
+    suggested_units: List[Dict[str, Any]],
+    min_gap_sec: int = 180,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    FIX 2: Merge adjacent SuggestedUnits that are less than min_gap_sec apart.
+    Keeps the earlier timestamp and the broader/longer title.
+    
+    Returns: (merged_units, merge_count)
+    """
+    if not suggested_units or len(suggested_units) < 2:
+        return suggested_units, 0
+    
+    # Sort by time first
+    sorted_units = sorted(suggested_units, key=lambda x: ts_to_seconds_hms(x.get("Time", "")))
+    
+    merged: List[Dict[str, Any]] = [sorted_units[0]]
+    merge_count = 0
+    
+    for i in range(1, len(sorted_units)):
+        current = sorted_units[i]
+        prev = merged[-1]
+        
+        prev_sec = ts_to_seconds_hms(prev.get("Time", ""))
+        curr_sec = ts_to_seconds_hms(current.get("Time", ""))
+        
+        if prev_sec < 0 or curr_sec < 0:
+            merged.append(current)
+            continue
+        
+        gap = curr_sec - prev_sec
+        
+        if gap < min_gap_sec:
+            # Merge: keep earlier timestamp, pick the broader title
+            prev_title = prev.get("Title", "")
+            curr_title = current.get("Title", "")
+            
+            # Prefer the title that is more descriptive (longer, unless it's raw ASR)
+            # Also prefer a unit-tagged title over an untagged one
+            prev_has_unit = prev.get("ClientUnitNo") is not None and prev.get("ClientUnitNo", 0) > 0
+            curr_has_unit = current.get("ClientUnitNo") is not None and current.get("ClientUnitNo", 0) > 0
+            
+            if curr_has_unit and not prev_has_unit:
+                # Current has unit tag, prev doesn't — keep current's title but prev's time
+                merged[-1]["Title"] = curr_title
+                merged[-1]["ClientUnitNo"] = current.get("ClientUnitNo")
+                merged[-1]["ClientUnitTitle"] = current.get("ClientUnitTitle")
+            elif len(curr_title) > len(prev_title) * 1.3 and not prev_has_unit:
+                # Current title is significantly longer/more descriptive
+                merged[-1]["Title"] = curr_title
+            # else: keep prev's title (it was first and is fine)
+            
+            merge_count += 1
+            logger.debug(
+                f"   🔗 Merged: '{curr_title[:30]}' ({current.get('Time')}) "
+                f"into '{merged[-1]['Title'][:30]}' ({prev.get('Time')}) — gap={gap}s"
+            )
+        else:
+            merged.append(current)
+    
+    # Renumber
+    for i, su in enumerate(merged, 1):
+        su["UnitNo"] = i
+    
+    if merge_count > 0:
+        logger.info(f"🔗 Merged {merge_count} micro-units (<{min_gap_sec}s apart): "
+                    f"{len(sorted_units)} → {len(merged)} units")
+    
+    return merged, merge_count
+
+
+def postprocess_suggested_units_for_client(
+    suggested_units: List[Dict[str, Any]],
+    min_gap_sec: int = 180,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Apply all post-processing steps to SuggestedUnits before client delivery:
+    1. Filter ADMIN units (Fix 1)
+    2. Merge micro-units < min_gap_sec apart (Fix 2)
+    
+    Returns: (processed_units, postprocess_diagnostics)
+    """
+    if not suggested_units:
+        return suggested_units, {"admin_filtered": 0, "micro_merged": 0, "original_count": 0}
+    
+    original_count = len(suggested_units)
+    
+    # Step 1: Filter ADMIN
+    units_no_admin, admin_removed = filter_admin_from_suggested_units(suggested_units)
+    
+    # Step 2: Merge micro-units
+    units_merged, merge_count = merge_micro_units(units_no_admin, min_gap_sec=min_gap_sec)
+    
+    diagnostics = {
+        "original_count": original_count,
+        "admin_filtered": admin_removed,
+        "micro_merged": merge_count,
+        "final_count": len(units_merged),
+    }
+    
+    logger.info(f"📦 SuggestedUnits post-processing: {original_count} → {len(units_merged)} "
+               f"(filtered {admin_removed} ADMIN, merged {merge_count} micro-units)")
+    
+    return units_merged, diagnostics
 
 def count_tokens_llama(text: str) -> int:
     """Approximate token counting for mixed Chinese/English (≈1 token per CJK char; 1/4 per other chars)"""
@@ -2665,7 +2802,11 @@ evidence 寫 "（無逐字稿內容）"，keywords 寫空陣列。絕對不要�
             max_tokens=1500, temperature=0.2
         )
         modules_text = modules_response.choices[0].message.content
+        # FIX 3: Strip GPT response preamble that leaks into modules_analysis
+        # Pattern: "以下是根據 PASS 1 分析結果合併後的學習模塊：" (appears in 22/28 videos)
+        modules_text = re.sub(r'^以下是根據.*?[：:]\s*\n?', '', modules_text.strip(), count=1)
         logger.info(f"✅ PASS 2 (Module Grouping) completed in {time.time() - t0:.1f}s ({len(modules_text)} chars)")
+        
     except Exception as e:
         logger.error(f"❌ PASS 2 failed: {e}", exc_info=True)
         raise
@@ -3303,8 +3444,14 @@ asr_verbatim_sentence 必須是從「候選逐字稿原文」或逐字稿中複�
             'coverage': {'asr_coverage': f"{asr_coverage:.1f}%", 'ocr_coverage': f"{ocr_coverage:.1f}%"}
         }
     }
-    metadata["_suggested_units_debug"] = suggested_units_structured
-    metadata["suggested_units_structured"] = strip_internal_fields(suggested_units_structured)
+    metadata["_suggested_units_debug"] = suggested_units_structured  # Full unfiltered list for analytics
+    # FIX 1 & 2: Post-process for client delivery (filter ADMIN, merge micro-units)
+    client_suggested_units, postprocess_diag = postprocess_suggested_units_for_client(
+        strip_internal_fields(suggested_units_structured),
+        min_gap_sec=180,  # 3 minutes
+    )
+    metadata["suggested_units_structured"] = client_suggested_units
+    metadata["suggested_units_postprocessing"] = postprocess_diag
     metadata["client_units_original"] = units
     metadata["client_units_validated"] = validated_units
     metadata["client_units_with_timestamps"] = enriched_units
