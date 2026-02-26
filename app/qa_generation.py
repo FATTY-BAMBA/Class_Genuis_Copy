@@ -2263,6 +2263,87 @@ def preprocess_asr_text(raw_asr_text: str, min_chunk_duration: int = 60, max_gap
         return ' '.join(cleaned_lines)
     return '\n\n'.join(chunks)
 
+# ─── ADMIN CONTENT FILTER: Build teaching-only transcript from chapter_windows ───
+
+def build_teaching_transcript_from_windows(
+    hierarchical_metadata: Optional[Dict],
+    raw_asr_text: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Build a teaching-focused transcript using chapter_windows from chapter generation.
+    Filters out ADMIN chapters (ClientUnitNo == -1) so GPT only sees educational content.
+    
+    Falls back to raw_asr_text if chapter_windows are unavailable.
+    
+    Returns: (filtered_transcript, filter_diagnostics)
+    """
+    if not hierarchical_metadata or not hierarchical_metadata.get("chapter_windows"):
+        return raw_asr_text, {"method": "raw_asr_fallback", "reason": "no chapter_windows"}
+    
+    chapter_windows = hierarchical_metadata["chapter_windows"]
+    
+    if not chapter_windows or len(chapter_windows) == 0:
+        return raw_asr_text, {"method": "raw_asr_fallback", "reason": "empty chapter_windows"}
+    
+    teaching_parts = []
+    admin_filtered = 0
+    teaching_kept = 0
+    ext_kept = 0
+    total_tokens_kept = 0
+    total_tokens_filtered = 0
+    
+    for window in chapter_windows:
+        client_unit_no = window.get("ClientUnitNo")
+        snippet = window.get("ASRSnippet", "").strip()
+        title = window.get("Title", "")
+        time_ts = window.get("Time", "")
+        tokens = window.get("ASRTokens", 0)
+        
+        if not snippet:
+            continue
+        
+        if client_unit_no == -1:
+            # ADMIN content — skip entirely
+            admin_filtered += 1
+            total_tokens_filtered += tokens
+            logger.debug(f"   🗑️ Filtered ADMIN window: {title[:40]} @ {time_ts} ({tokens} tokens)")
+            continue
+        
+        # TEACHING (>0) or EXT (0/None) — keep for Q&A
+        if client_unit_no is not None and client_unit_no > 0:
+            teaching_kept += 1
+        else:
+            ext_kept += 1
+        
+        total_tokens_kept += tokens
+        
+        # Add with chapter header for context
+        teaching_parts.append(f"[{time_ts}] {title}\n{snippet}")
+    
+    if not teaching_parts:
+        logger.warning("⚠️ No teaching content in chapter_windows — falling back to raw ASR")
+        return raw_asr_text, {"method": "raw_asr_fallback", "reason": "no teaching windows"}
+    
+    filtered_transcript = "\n\n".join(teaching_parts)
+    
+    diagnostics = {
+        "method": "chapter_windows_filtered",
+        "total_windows": len(chapter_windows),
+        "admin_filtered": admin_filtered,
+        "teaching_kept": teaching_kept,
+        "ext_kept": ext_kept,
+        "tokens_kept": total_tokens_kept,
+        "tokens_filtered": total_tokens_filtered,
+        "noise_reduction_pct": round(total_tokens_filtered / max(total_tokens_kept + total_tokens_filtered, 1) * 100, 1),
+    }
+    
+    logger.info(
+        f"📚 Teaching transcript built: {teaching_kept} teaching + {ext_kept} EXT windows kept, "
+        f"{admin_filtered} ADMIN filtered ({diagnostics['noise_reduction_pct']}% noise removed, "
+        f"{total_tokens_filtered} tokens saved)"
+    )
+    
+    return filtered_transcript, diagnostics
 # ==================== MAIN FUNCTIONS ====================
 def initialize_and_get_client(config: EducationalContentConfig):
     service_type = config.service_type
@@ -2347,7 +2428,15 @@ def generate_educational_content(
 
         report("processing_inputs", progress_callback)
 
-        transcript = (raw_asr_text)
+        # ─── ADMIN FILTER: Use chapter_windows to build teaching-only transcript ───
+        teaching_transcript, content_filter_diag = build_teaching_transcript_from_windows(
+            hierarchical_metadata, raw_asr_text
+        )
+        transcript = teaching_transcript
+        
+        logger.info(f"📚 Content filter: {content_filter_diag.get('method', 'unknown')} "
+                    f"— {content_filter_diag.get('admin_filtered', 0)} ADMIN windows removed")
+        
         if ocr_text_override is not None:
             ocr_context = ocr_text_override
         elif isinstance(ocr_segments, str):
