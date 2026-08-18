@@ -26,4 +26,7 @@ segments/
 # Ignore all environment files containing secrets
 *.env
 nference.env
-app/*.env
+app/*.env.env
+*.env
+__pycache__/
+*.log
